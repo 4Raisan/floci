@@ -4810,13 +4810,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public VpcCidrBlockAssociation associateVpcCidrBlock(String region, String vpcId, String cidrBlock) {
         ensureDefaultResources(region);
-        Vpc vpc = getRequiredVpc(region, vpcId);
-
-        VpcCidrBlockAssociation assoc = new VpcCidrBlockAssociation(
-                "vpc-cidr-assoc-" + randomHex(8), cidrBlock);
-        vpc.getCidrBlockAssociationSet().add(assoc);
-        vpcs.put(key(region, vpcId), vpc);
-        return assoc;
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (lockFor(key(region, vpcId))) {
+                Vpc vpc = getRequiredVpc(region, vpcId);
+                VpcCidrBlockAssociation assoc = new VpcCidrBlockAssociation(
+                        "vpc-cidr-assoc-" + randomHex(8), cidrBlock);
+                vpc.getCidrBlockAssociationSet().add(assoc);
+                vpcs.put(key(region, vpcId), vpc);
+                return assoc;
+            }
+        }
     }
 
     /**
@@ -4826,11 +4829,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public VpcIpv6CidrBlockAssociation associateAmazonProvidedIpv6CidrBlock(String region, String vpcId) {
         ensureDefaultResources(region);
-        Vpc vpc = getRequiredVpc(region, vpcId);
-        VpcIpv6CidrBlockAssociation assoc = amazonProvidedIpv6Association(region);
-        vpc.getIpv6CidrBlockAssociationSet().add(assoc);
-        vpcs.put(key(region, vpcId), vpc);
-        return assoc;
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (lockFor(key(region, vpcId))) {
+                Vpc vpc = getRequiredVpc(region, vpcId);
+                VpcIpv6CidrBlockAssociation assoc = amazonProvidedIpv6Association(region);
+                vpc.getIpv6CidrBlockAssociationSet().add(assoc);
+                vpcs.put(key(region, vpcId), vpc);
+                return assoc;
+            }
+        }
     }
 
     /**
@@ -4851,13 +4858,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public void disassociateVpcCidrBlock(String region, String associationId) {
         ensureDefaultResources(region);
-        for (Vpc vpc : vpcs.scan(k -> true)) {
-            if (vpc.getRegion().equals(region)) {
-                vpc.getCidrBlockAssociationSet().removeIf(a -> a.getAssociationId().equals(associationId));
-                // The same operation disassociates either family; AWS takes one association id and
-                // does not ask which set it belongs to.
-                vpc.getIpv6CidrBlockAssociationSet().removeIf(a -> a.getAssociationId().equals(associationId));
-                vpcs.put(key(region, vpc.getVpcId()), vpc);
+        synchronized (attachmentTopologyLock(region)) {
+            for (Vpc vpc : vpcs.scan(k -> true)) {
+                if (vpc.getRegion().equals(region)) {
+                    synchronized (lockFor(key(region, vpc.getVpcId()))) {
+                        vpc.getCidrBlockAssociationSet().removeIf(a -> a.getAssociationId().equals(associationId));
+                        // The same operation disassociates either family; AWS takes one association id and
+                        // does not ask which set it belongs to.
+                        vpc.getIpv6CidrBlockAssociationSet().removeIf(a -> a.getAssociationId().equals(associationId));
+                        vpcs.put(key(region, vpc.getVpcId()), vpc);
+                    }
+                }
             }
         }
     }
@@ -5655,8 +5666,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // overlapping creates in flight together both pass the scan before either is stored.
         // The topology lock, outermost, keeps DeleteVpc from removing the VPC in between.
         synchronized (attachmentTopologyLock(region)) {
-            getRequiredVpc(region, vpcId);
+            Vpc currentVpc = getRequiredVpc(region, vpcId);
             synchronized (lockFor(key(region, vpcId))) {
+                rejectSubnetCidrOutsideVpc(currentVpc, cidrBlock);
                 rejectConflictingSubnetCidr(region, vpcId, cidrBlock);
                 subnets.put(key(region, subnetId), subnet);
             }
@@ -5675,6 +5687,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             networkAcls.put(key(region, defaultAcl.getNetworkAclId()), defaultAcl);
         }
         return subnet;
+    }
+
+    private void rejectSubnetCidrOutsideVpc(Vpc vpc, String cidrBlock) {
+        if (cidrBlock == null) {
+            return; // IPv6-only subnets have no IPv4 range to check.
+        }
+        boolean contained = Ipv4Cidrs.isIpv4(cidrBlock)
+                && ((Ipv4Cidrs.isIpv4(vpc.getCidrBlock()) && Ipv4Cidrs.contains(vpc.getCidrBlock(), cidrBlock))
+                || vpc.getCidrBlockAssociationSet().stream()
+                        .filter(association -> "associated".equalsIgnoreCase(association.getCidrBlockState()))
+                        .map(VpcCidrBlockAssociation::getCidrBlock)
+                        .filter(Ipv4Cidrs::isIpv4)
+                        .anyMatch(block -> Ipv4Cidrs.contains(block, cidrBlock)));
+        if (!contained) {
+            throw new AwsException("InvalidSubnet.Range", "The CIDR '" + cidrBlock + "' is invalid.", 400);
+        }
     }
 
     /**
