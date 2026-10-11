@@ -10635,11 +10635,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .findFirst();
     }
 
+    /**
+     * Launches Spot instances with separately retained execution text and API encoding.
+     *
+     * @param userData decoded execution text, including decompressed text for gzip payloads
+     * @param encodedUserData original validated base64 payload corresponding to {@code userData};
+     *                        it takes precedence in descriptions and IMDS byte retrieval. Null
+     *                        retains the legacy UTF-8 text fallback; empty represents zero bytes.
+     */
     public List<SpotInstanceRequest> requestSpotInstances(String region, String spotPrice, Integer instanceCount,
                                                          String type, String productDescription, String imageId, String instanceType,
                                                          String keyName, String subnetId, List<String> securityGroupIds,
                                                          String userData, String iamInstanceProfileArn,
-                                                         List<Tag> spotRequestTags, List<Tag> instanceTags) {
+                                                         List<Tag> spotRequestTags, List<Tag> instanceTags, String encodedUserData) {
         ensureDefaultResources(region);
 
         int count = instanceCount != null ? instanceCount : 1;
@@ -10651,7 +10659,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             String spotRequestId = "sir-" + randomHex(8);
 
             Reservation reservation = runInstances(region, imageId, instanceType, 1, 1, keyName,
-                    securityGroupIds, subnetId, null, instanceTags, userData, iamInstanceProfileArn);
+                    securityGroupIds, subnetId, null, instanceTags, userData, iamInstanceProfileArn,
+                    /* associatePublicIp */ null, /* networkInterfaceId */ null,
+                    /* networkInterfaceDeviceIndex */ 0, /* availabilityZone */ null,
+                    /* metadataOptions */ null, /* creditSpecificationCpuCredits */ null, encodedUserData);
 
             Instance launchedInstance = reservation.getInstances().get(0);
 
@@ -10661,6 +10672,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             spec.setKeyName(launchedInstance.getKeyName());
             spec.setSubnetId(launchedInstance.getSubnetId());
             spec.setUserData(userData);
+            spec.setEncodedUserData(encodedUserData);
             spec.setIamInstanceProfileArn(iamInstanceProfileArn);
 
             if (launchedInstance.getSecurityGroups() != null) {
