@@ -4658,6 +4658,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                          boolean amazonProvidedIpv6CidrBlock, String instanceTenancy) {
         // AWS stores the CIDR in canonical form: "100.68.0.18/18" becomes "100.68.0.0/18".
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
+        rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
         ensureDefaultResources(region);
         String vpcId = "vpc-" + randomHex(8);
         Vpc vpc = new Vpc();
@@ -4864,6 +4865,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public VpcCidrBlockAssociation associateVpcCidrBlock(String region, String vpcId, String cidrBlock) {
+        rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
         ensureDefaultResources(region);
         synchronized (attachmentTopologyLock(region)) {
             synchronized (lockFor(key(region, vpcId))) {
@@ -5684,7 +5686,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             + "IPv6 CIDR block. VPC " + vpcId + " has none.", 400);
         }
 
-        rejectOutOfRangeSubnetPrefix(cidrBlock);
+        rejectOutOfRangePrefix(cidrBlock, "InvalidSubnet.Range");
 
         String zoneName = resolveSubnetZoneName(region, availabilityZone, availabilityZoneId);
 
@@ -5749,19 +5751,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
-     * The VPC User Guide limits an IPv4 subnet to a prefix between /16 and /28 ("The allowed IPv4
-     * CIDR block size for a subnet is between a /28 netmask and /16 netmask."), and AWS answers
-     * anything else with InvalidSubnet.Range. Requests with no IPv4 CIDR, or one that does not parse, are left to the
-     * checks that already handle them.
+     * The VPC User Guide limits an IPv4 VPC block, primary or secondary, and an IPv4 subnet to a
+     * prefix between /16 and /28 ("The allowed block size is between a /28 netmask and /16
+     * netmask."), and AWS answers anything else with InvalidVpc.Range or InvalidSubnet.Range, which
+     * the caller passes as {@code errorCode}. Requests with no IPv4 CIDR, or one that does not parse,
+     * are left to the checks that already handle them.
      */
-    private void rejectOutOfRangeSubnetPrefix(String cidrBlock) {
+    private void rejectOutOfRangePrefix(String cidrBlock, String errorCode) {
         int[] range = cidrRange(cidrBlock);
         if (range == null) {
             return;
         }
         int prefix = range[1];
         if (prefix < 16 || prefix > 28) {
-            throw new AwsException("InvalidSubnet.Range", "The CIDR '" + cidrBlock + "' is invalid.", 400);
+            throw new AwsException(errorCode, "The CIDR '" + cidrBlock + "' is invalid.", 400);
         }
     }
 
