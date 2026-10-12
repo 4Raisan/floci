@@ -5625,6 +5625,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             + "IPv6 CIDR block. VPC " + vpcId + " has none.", 400);
         }
 
+        rejectOutOfRangeSubnetPrefix(cidrBlock);
+
         String zoneName = resolveSubnetZoneName(region, availabilityZone, availabilityZoneId);
 
         String subnetId = "subnet-" + randomHex(8);
@@ -5683,6 +5685,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .filter(Ipv4Cidrs::isIpv4)
                         .anyMatch(block -> Ipv4Cidrs.contains(block, cidrBlock)));
         if (!contained) {
+            throw new AwsException("InvalidSubnet.Range", "The CIDR '" + cidrBlock + "' is invalid.", 400);
+        }
+    }
+
+    /**
+     * The VPC User Guide limits an IPv4 subnet to a prefix between /16 and /28 ("The allowed IPv4
+     * CIDR block size for a subnet is between a /28 netmask and /16 netmask."), and AWS answers
+     * anything else with InvalidSubnet.Range. Requests with no IPv4 CIDR, or one that does not parse, are left to the
+     * checks that already handle them.
+     */
+    private void rejectOutOfRangeSubnetPrefix(String cidrBlock) {
+        int[] range = cidrRange(cidrBlock);
+        if (range == null) {
+            return;
+        }
+        int prefix = range[1];
+        if (prefix < 16 || prefix > 28) {
             throw new AwsException("InvalidSubnet.Range", "The CIDR '" + cidrBlock + "' is invalid.", 400);
         }
     }
