@@ -614,8 +614,7 @@ public class CognitoJsonHandler {
                 : request.path("MessageAction").asText(null);
         Map<String, String> validationData = new HashMap<>();
         request.path("ValidationData").forEach(a -> validationData.put(a.path("Name").asText(), a.path("Value").asText()));
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
 
         CognitoUser user = service.adminCreateUser(
                 request.path("UserPoolId").asText(),
@@ -884,8 +883,7 @@ public class CognitoJsonHandler {
     private Response handleInitiateAuth(JsonNode request) {
         Map<String, String> params = new HashMap<>();
         request.path("AuthParameters").fields().forEachRemaining(e -> params.put(e.getKey(), e.getValue().asText()));
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
 
         Map<String, Object> result = service.initiateAuth(
                 request.path("ClientId").asText(),
@@ -899,8 +897,7 @@ public class CognitoJsonHandler {
     private Response handleAdminInitiateAuth(JsonNode request) {
         Map<String, String> params = new HashMap<>();
         request.path("AuthParameters").fields().forEachRemaining(e -> params.put(e.getKey(), e.getValue().asText()));
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
 
         Map<String, Object> result = service.adminInitiateAuth(
                 request.path("UserPoolId").asText(),
@@ -915,8 +912,7 @@ public class CognitoJsonHandler {
     private Response handleRespondToAuthChallenge(JsonNode request) {
         Map<String, String> responses = new HashMap<>();
         request.path("ChallengeResponses").fields().forEachRemaining(e -> responses.put(e.getKey(), e.getValue().asText()));
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
 
         Map<String, Object> result = service.respondToAuthChallenge(
                 request.path("ClientId").asText(),
@@ -931,8 +927,7 @@ public class CognitoJsonHandler {
     private Response handleAdminRespondToAuthChallenge(JsonNode request) {
         Map<String, String> responses = new HashMap<>();
         request.path("ChallengeResponses").fields().forEachRemaining(e -> responses.put(e.getKey(), e.getValue().asText()));
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
 
         Map<String, Object> result = service.adminRespondToAuthChallenge(
                 request.path("UserPoolId").asText(),
@@ -984,8 +979,7 @@ public class CognitoJsonHandler {
     }
 
     private Response handleConfirmSignUp(JsonNode request) {
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
         service.confirmSignUp(
                 request.path("ClientId").asText(),
                 request.path("Username").asText(),
@@ -1009,8 +1003,7 @@ public class CognitoJsonHandler {
     }
 
     private Response handleAdminConfirmSignUp(JsonNode request) {
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
         service.adminConfirmSignUp(
                 request.path("UserPoolId").asText(),
                 request.path("Username").asText(),
@@ -1042,8 +1035,7 @@ public class CognitoJsonHandler {
     }
 
     private Response handleConfirmForgotPassword(JsonNode request) {
-        Map<String, String> clientMetadata = new HashMap<>();
-        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = clientMetadata(request);
         service.confirmForgotPassword(
                 request.path("ClientId").asText(),
                 request.path("Username").asText(),
@@ -1321,6 +1313,11 @@ public class CognitoJsonHandler {
         node.put("LastModifiedDate", provider.getLastModifiedDate());
         node.put("CreationDate", provider.getCreationDate());
         return node;
+    }
+
+    private Map<String, String> clientMetadata(JsonNode request) {
+        Map<String, String> metadata = readStringMap(request, "ClientMetadata");
+        return metadata != null ? metadata : new HashMap<>();
     }
 
     private Map<String, String> readStringMap(JsonNode request, String member) {
