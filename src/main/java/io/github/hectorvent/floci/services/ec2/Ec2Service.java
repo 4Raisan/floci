@@ -4475,10 +4475,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (options == null) {
             return;
         }
-        requireMetadataOptionValue("HttpTokens", options.getHttpTokens(), "optional", "required");
-        requireMetadataOptionValue("HttpEndpoint", options.getHttpEndpoint(), "enabled", "disabled");
-        requireMetadataOptionValue("HttpProtocolIpv6", options.getHttpProtocolIpv6(), "enabled", "disabled");
-        requireMetadataOptionValue("InstanceMetadataTags", options.getInstanceMetadataTags(), "enabled", "disabled");
+        requireParameterValue("HttpTokens", options.getHttpTokens(), "optional", "required");
+        requireParameterValue("HttpEndpoint", options.getHttpEndpoint(), "enabled", "disabled");
+        requireParameterValue("HttpProtocolIpv6", options.getHttpProtocolIpv6(), "enabled", "disabled");
+        requireParameterValue("InstanceMetadataTags", options.getInstanceMetadataTags(), "enabled", "disabled");
         Integer hopLimit = options.getHttpPutResponseHopLimit();
         if (hopLimit != null && (hopLimit < 1 || hopLimit > 64)) {
             throw new AwsException("InvalidParameterValue",
@@ -4487,7 +4487,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    private static void requireMetadataOptionValue(String parameter, String value, String... allowed) {
+    /** Rejects a value outside an enumerated parameter's allowed set with EC2's InvalidParameterValue. */
+    private static void requireParameterValue(String parameter, String value, String... allowed) {
         if (value == null || List.of(allowed).contains(value)) {
             return;
         }
@@ -4630,6 +4631,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
                          boolean amazonProvidedIpv6CidrBlock) {
+        return createVpc(region, requestedCidrBlock, isDefault, amazonProvidedIpv6CidrBlock, null);
+    }
+
+    /**
+     * CreateVpc takes {@code default} or {@code dedicated} only: "The host value cannot be used with
+     * this parameter" (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateVpc.html).
+     */
+    private static String requireVpcTenancy(String instanceTenancy) {
+        // Only an absent parameter defaults; a present blank is not one of the enum values.
+        String tenancy = instanceTenancy == null ? "default" : instanceTenancy;
+        requireParameterValue("instanceTenancy", tenancy, "default", "dedicated");
+        return tenancy;
+    }
+
+    /**
+     * @param instanceTenancy {@code default} or {@code dedicated} as CreateVpc's
+     *                        InstanceTenancy parameter; null means {@code default}.
+     */
+    public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
+                         boolean amazonProvidedIpv6CidrBlock, String instanceTenancy) {
         // AWS stores the CIDR in canonical form: "100.68.0.18/18" becomes "100.68.0.0/18".
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         ensureDefaultResources(region);
@@ -4639,6 +4660,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vpc.setCidrBlock(cidrBlock);
         vpc.setState("available");
         vpc.setDefault(isDefault);
+        vpc.setInstanceTenancy(requireVpcTenancy(instanceTenancy));
         vpc.setOwnerId(callerAccountId());
         vpc.setRegion(region);
         vpc.getCidrBlockAssociationSet().add(
@@ -4796,6 +4818,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             case "enableDnsHostnames"                  -> vpc.setEnableDnsHostnames(Boolean.parseBoolean(value));
             case "enableNetworkAddressUsageMetrics"    -> vpc.setEnableNetworkAddressUsageMetrics(Boolean.parseBoolean(value));
         }
+        vpcs.put(key(region, vpcId), vpc);
+    }
+
+    /**
+     * ModifyVpcTenancy: only {@code dedicated} to {@code default} is allowed, as on AWS
+     * (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyVpcTenancy.html).
+     */
+    public void modifyVpcTenancy(String region, String vpcId, String instanceTenancy) {
+        ensureDefaultResources(region);
+        Vpc vpc = getRequiredVpc(region, vpcId);
+        if (!"default".equals(instanceTenancy)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + instanceTenancy + ") for parameter instanceTenancy is invalid. "
+                            + "Only 'default' is supported.", 400);
+        }
+        if (!"dedicated".equals(vpc.getInstanceTenancy())) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + instanceTenancy + ") for parameter instanceTenancy is invalid. "
+                            + "The instance tenancy of a VPC can only be changed from 'dedicated' to 'default'.", 400);
+        }
+        vpc.setInstanceTenancy(instanceTenancy);
         vpcs.put(key(region, vpcId), vpc);
     }
 
