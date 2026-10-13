@@ -9273,6 +9273,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         Address addr = getRequiredAddress(region, allocationId);
 
+        if (addr.getAssociationId() != null) {
+            disassociateAddress(region, addr.getAssociationId());
+        }
         addr.setInstanceId(instanceId);
         addr.setAssociationId("eipassoc-" + randomHex(17));
         pointAddressAtInstance(addr, region, instanceId);
@@ -9324,6 +9327,37 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (inst.getNetworkInterfaces() != null && !inst.getNetworkInterfaces().isEmpty()) {
             addr.setNetworkInterfaceId(inst.getNetworkInterfaces().get(0).getNetworkInterfaceId());
         }
+        updateStoredAddressAssociation(addr);
+    }
+
+    private void updateStoredAddressAssociation(Address address) {
+        if (address.getNetworkInterfaceId() == null) {
+            return;
+        }
+        String interfaceKey = key(address.getRegion(), address.getNetworkInterfaceId());
+        networkInterfaces.get(interfaceKey).ifPresent(ni -> {
+            for (NetworkInterfacePrivateIpAddress ip : ni.getPrivateIpAddresses()) {
+                if (!ip.isPrimary()) {
+                    continue;
+                }
+                if (address.getAssociationId() != null) {
+                    ip.setAssociation(networkInterfaceAssociation(address, ni.getOwnerId()));
+                } else if (ip.getAssociation() != null
+                        && address.getAllocationId().equals(ip.getAssociation().getAllocationId())) {
+                    ip.setAssociation(null);
+                }
+            }
+            networkInterfaces.put(interfaceKey, ni);
+        });
+    }
+
+    private static NetworkInterfaceAssociation networkInterfaceAssociation(Address address, String ownerId) {
+        NetworkInterfaceAssociation association = new NetworkInterfaceAssociation();
+        association.setPublicIp(address.getPublicIp());
+        association.setAllocationId(address.getAllocationId());
+        association.setAssociationId(address.getAssociationId());
+        association.setIpOwnerId(ownerId);
+        return association;
     }
 
     private Address getRequiredAddress(String region, String allocationId) {
@@ -9340,6 +9374,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (addr.getRegion().equals(region) && associationId.equals(addr.getAssociationId())) {
                 addr.setInstanceId(null);
                 addr.setAssociationId(null);
+                updateStoredAddressAssociation(addr);
                 addr.setNetworkInterfaceId(null);
                 addr.setPrivateIpAddress(null);
                 // Hand the allocation back its allocated address: with no instance behind it,
@@ -9355,10 +9390,32 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public void releaseAddress(String region, String allocationId) {
         ensureDefaultResources(region);
-        if (addresses.get(key(region, allocationId)).isEmpty()) {
-            throw new AwsException("InvalidAllocationID.NotFound", "The allocation ID '" + allocationId + "' does not exist", 400);
+        Address address = getRequiredAddress(region, allocationId);
+        if (address.getAssociationId() != null) {
+            NetworkInterface ni = networkInterfaces.get(key(region, address.getNetworkInterfaceId())).orElse(null);
+            String vpcId = ni != null ? ni.getVpcId()
+                    : getRequiredInstance(region, address.getInstanceId()).getVpcId();
+            if (!getRequiredVpc(region, vpcId).isDefault()) {
+                throw new AwsException("InvalidIPAddress.InUse",
+                        "Address " + address.getPublicIp() + " is in use.", 400);
+            }
+            disassociateAddress(region, address.getAssociationId());
         }
         addresses.delete(key(region, allocationId));
+    }
+
+    private void releaseInterfaceAddresses(String region, String networkInterfaceId, boolean deleted) {
+        for (Address address : addresses.scan(k -> k.startsWith(region + "::"))) {
+            if (!networkInterfaceId.equals(address.getNetworkInterfaceId())) {
+                continue;
+            }
+            if (deleted) {
+                disassociateAddress(region, address.getAssociationId());
+            } else {
+                address.setInstanceId(null);
+                addresses.put(key(region, address.getAllocationId()), address);
+            }
+        }
     }
 
     public List<Address> describeAddresses(String region, List<String> allocationIds, Map<String, List<String>> filters) {
@@ -9913,6 +9970,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 case "requester-managed" -> matchesValue(values, String.valueOf(ni.isRequesterManaged()));
                 case "attachment.instance-id" -> ni.getAttachment() != null
                         && matchesValue(values, ni.getAttachment().getInstanceId());
+                case "association.ip-owner-id" -> ni.getPrivateIpAddresses().stream()
+                        .anyMatch(ip -> ip.isPrimary() && ip.getAssociation() != null
+                                && ip.getAssociation().getIpOwnerId() != null
+                                && matchesValue(values, ip.getAssociation().getIpOwnerId()));
+                case "association.public-ip" -> ni.getPrivateIpAddresses().stream()
+                        .anyMatch(ip -> ip.isPrimary() && ip.getAssociation() != null
+                                && ip.getAssociation().getPublicIp() != null
+                                && matchesValue(values, ip.getAssociation().getPublicIp()));
                 case "private-ip-address" ->
                     matchesValue(values, ni.getPrivateIpAddress()) ||
                     ni.getPrivateIpAddresses().stream()
@@ -10538,14 +10603,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 primaryIp.setPrivateDnsName(eni.getPrivateDnsName());
                 primaryIp.setPrimary(true);
                 // Look up EIP association for this instance
-                addressForInstance(inst.getInstanceId()).ifPresent(addr -> {
-                    NetworkInterfaceAssociation assoc = new NetworkInterfaceAssociation();
-                    assoc.setPublicIp(addr.getPublicIp());
-                    assoc.setAllocationId(addr.getAllocationId());
-                    assoc.setAssociationId(addr.getAssociationId());
-                    assoc.setIpOwnerId(eni.getOwnerId());
-                    primaryIp.setAssociation(assoc);
-                });
+                addressForInstance(inst.getInstanceId()).ifPresent(addr ->
+                        primaryIp.setAssociation(networkInterfaceAssociation(addr, eni.getOwnerId())));
                 ni.getPrivateIpAddresses().add(primaryIp);
 
                 // Phase 4: apply filters
@@ -10749,6 +10808,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("InvalidParameterValue",
                     "Network interface '" + networkInterfaceId + "' is currently in use", 400);
         }
+        releaseInterfaceAddresses(region, networkInterfaceId, true);
         networkInterfaces.delete(key(region, networkInterfaceId));
     }
 
@@ -10901,17 +10961,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private void releaseStandaloneInterfacesOnTermination(String region, Instance inst) {
         for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
             NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
+            NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
+            boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
+            releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
+            inst.getNetworkInterfaces().remove(e);
             if (ni == null) {
                 continue;
             }
-            NetworkInterfaceAttachment att = ni.getAttachment();
-            // Either way the instance stops carrying it. A deleted interface obviously cannot stay
-            // on the record, and a released one must not either: once it is attached to something
-            // else, two instance records would claim it and DescribeInstances has no rule that
-            // picks the live one.
-            inst.getNetworkInterfaces().removeIf(
-                    carried -> ni.getNetworkInterfaceId().equals(carried.getNetworkInterfaceId()));
-            if (att != null && att.isDeleteOnTermination()) {
+            if (deleted) {
                 networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
                 continue;
             }
