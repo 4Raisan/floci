@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.CloudFrontEdgeDomain;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
@@ -112,10 +113,10 @@ public class CognitoService implements ResourceProvider {
     // JVM-local stripes bound lock memory without retaining one lock for every user key.
     private static final int USER_LOCK_STRIPES = 512;
     /**
-     * The commercial CloudFront suffix for the test constructors; CDI wires
-     * {@code floci.services.cloudfront.domain-suffix}.
+     * No configured CloudFront suffix, for the test constructors: the suffix then follows the
+     * request's partition. CDI wires {@code floci.services.cloudfront.domain-suffix}.
      */
-    private static final String DEFAULT_CLOUDFRONT_DOMAIN_SUFFIX = "cloudfront.net"; // partition-literal: test-shaped constructor default
+    private static final String UNCONFIGURED_CLOUDFRONT_DOMAIN_SUFFIX = null;
 
     private static final Logger LOG = Logger.getLogger(CognitoService.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -219,7 +220,7 @@ public class CognitoService implements ResourceProvider {
                 storageFactory.create("cognito", "cognito-revoked-tokens.json",
                         new TypeReference<Map<String, RevokedTokenInfo>>() {}),
                 trimTrailingSlash(emulatorConfig.effectiveBaseUrl()),
-                emulatorConfig.services().cloudfront().domainSuffix(),
+                emulatorConfig.services().cloudfront().domainSuffix().orElse(null),
                 regionResolver,
                 lambdaService,
                 acmService,
@@ -242,7 +243,7 @@ public class CognitoService implements ResourceProvider {
                    LambdaService lambdaService,
                    AcmService acmService) {
         this(poolStore, clientStore, resourceServerStore, userStore, groupStore, revokedTokenStore, baseUrl,
-                DEFAULT_CLOUDFRONT_DOMAIN_SUFFIX, regionResolver, lambdaService, acmService);
+                UNCONFIGURED_CLOUDFRONT_DOMAIN_SUFFIX, regionResolver, lambdaService, acmService);
     }
 
     CognitoService(StorageBackend<String, UserPool> poolStore,
@@ -259,7 +260,7 @@ public class CognitoService implements ResourceProvider {
             CognitoMessageDispatcher messageDispatcher,
             TlsCertificateManager certificateManager) {
         this(poolStore, clientStore, resourceServerStore, domainStore, identityProviderStore, userStore,
-                groupStore, revokedTokenStore, baseUrl, DEFAULT_CLOUDFRONT_DOMAIN_SUFFIX, regionResolver,
+                groupStore, revokedTokenStore, baseUrl, UNCONFIGURED_CLOUDFRONT_DOMAIN_SUFFIX, regionResolver,
                 lambdaService, acmService, verificationCodeService, messageDispatcher, certificateManager);
     }
 
@@ -1934,8 +1935,10 @@ public class CognitoService implements ResourceProvider {
         return AwsArnUtils.Arn.global(partition, "cloudfront", userPoolDomain.getAwsAccountId(), "distribution/" + id).toString();
     }
 
+    /** A distribution name on the configured CloudFront suffix, or the request partition's when none is. */
     private String generateCloudFrontDomain() {
-        return UUID.randomUUID().toString().replace("-", "").substring(0, 14) + "." + cloudFrontDomainSuffix;
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 14) + "."
+                + CloudFrontEdgeDomain.domainSuffix(cloudFrontDomainSuffix, regionResolver.getPartition());
     }
 
     private String generateDomainVersion() {
