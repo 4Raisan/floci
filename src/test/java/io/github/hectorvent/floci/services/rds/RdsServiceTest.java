@@ -2993,6 +2993,23 @@ class RdsServiceTest {
     }
 
     @Test
+    void describeOrderableDbInstanceOptionsListsAuroraEngines() {
+        List<String> auroraClasses = List.of("db.t3.medium", "db.t4g.medium", "db.r5.large", "db.r6g.large");
+
+        List<Map<String, String>> mysql = rdsService.describeOrderableDbInstanceOptions("aurora-mysql", null, null);
+        List<Map<String, String>> postgres = rdsService.describeOrderableDbInstanceOptions("aurora-postgresql", null, null);
+
+        assertEquals(auroraClasses, mysql.stream().map(o -> o.get("dbInstanceClass")).toList());
+        assertTrue(mysql.stream().allMatch(o -> "aurora-mysql".equals(o.get("engine"))
+                && "8.0.mysql_aurora.3.05.2".equals(o.get("engineVersion"))));
+        assertEquals(auroraClasses, postgres.stream().map(o -> o.get("dbInstanceClass")).toList());
+        assertTrue(postgres.stream().allMatch(o -> "aurora-postgresql".equals(o.get("engine"))
+                && "16.3".equals(o.get("engineVersion"))));
+        assertEquals(1, rdsService.describeOrderableDbInstanceOptions(
+                "aurora-postgresql", "16.3", "db.r6g.large").size());
+    }
+
+    @Test
     void deleteDbClusterFailsWhenMembersRemain() {
         DbCluster cluster = rdsService.createDbCluster("cluster1", "postgres", "13",
                 "admin", "password", "dbname", false, null, null, null, false);

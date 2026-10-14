@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.Ec2UserDataDecoder;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
@@ -375,7 +376,8 @@ public class AutoScalingReconciler {
                         launchSource.iamInstanceProfile(),
                         launchSource.associatePublicIpAddress(), null, 0, null, null, null,
                         launchSource.encodedUserData() != null ? launchSource.encodedUserData()
-                                : encodeLegacyUserData(launchSource.userData()));
+                                : encodeLegacyUserData(launchSource.userData()),
+                        false, null, null, launchSource.blockDeviceMappings());
 
                 for (Instance ec2Inst : reservation.getInstances()) {
                     AsgInstance asgInst = new AsgInstance();
@@ -695,7 +697,8 @@ public class AutoScalingReconciler {
                     // Forwarded as-is: an explicit false has to beat a public
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
-                    lc.getAssociatePublicIpAddress());
+                    lc.getAssociatePublicIpAddress(),
+                    null);
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -723,7 +726,8 @@ public class AutoScalingReconciler {
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
                     resolvedVersion,
-                    null);
+                    null,
+                    version.getData().getBlockDeviceMappings());
         }
 
         MixedInstancesPolicy.LaunchTemplateSpecification specification =
@@ -757,7 +761,8 @@ public class AutoScalingReconciler {
                                 : specification.getLaunchTemplateId(),
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
-                        null);
+                        null,
+                        version.getData().getBlockDeviceMappings());
             }
         }
 
@@ -868,7 +873,8 @@ public class AutoScalingReconciler {
             String launchTemplateId,
             String launchTemplateName,
             String launchTemplateVersion,
-            Boolean associatePublicIpAddress) {}
+            Boolean associatePublicIpAddress,
+            List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings) {}
 
     // Override for describeAutoScalingGroups with null region (all regions)
     // The service only filters by region when non-null; null means all.
