@@ -233,8 +233,48 @@ class IamPolicyQuotaRollbackTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"User, false", "Group, false", "Role, false",
+            "User, true", "Group, true", "Role, true"})
+    void compensationRefusesAnotherWritersRoundTrip(String kind, boolean deletion) {
+        create(kind, "first");
+        put(kind, "first", "shared", policy(500));
+        InlinePolicyChange change = deletion ? remove(kind, "first", "shared")
+                : update(kind, "first", "shared", policy(200));
+        put(kind, "first", "shared", policy(300));
+        if (deletion) {
+            delete(kind, "first", "shared");
+        } else {
+            put(kind, "first", "shared", policy(200));
+        }
+        AwsException error = assertThrows(AwsException.class, () -> change.rollback().run());
+        assertEquals("ConcurrentModification", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        if (deletion) {
+            assertEquals("NoSuchEntity", assertThrows(AwsException.class,
+                    () -> get(kind, "first", "shared")).getErrorCode());
+        } else {
+            assertEquals(policy(200), get(kind, "first", "shared"));
+        }
+    }
+
+    @ParameterizedTest
     @CsvSource({"User", "Group", "Role"})
-    void nestedReverseCompensationRestoresTheOriginalDocuments(String kind) {
+    void equalDocumentWriteStillTakesOwnership(String kind) {
+        create(kind, "first");
+        put(kind, "first", "shared", policy(500));
+        InlinePolicyChange change = update(kind, "first", "shared", policy(200));
+        put(kind, "first", "shared", policy(200));
+        AwsException error = assertThrows(AwsException.class, () -> change.rollback().run());
+        assertEquals("ConcurrentModification", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals("Cannot restore inline policy shared on first"
+                + " because its rollback ownership or state changed after the update.", error.getMessage());
+        assertEquals(policy(200), get(kind, "first", "shared"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"User", "Group", "Role"})
+    void nestedReverseCompensationRestoresItsPredecessorOwnership(String kind) {
         create(kind, "first");
         put(kind, "first", "shared", policy(500));
         InlinePolicyChange removed = remove(kind, "first", "shared");
@@ -248,6 +288,18 @@ class IamPolicyQuotaRollbackTest {
         assertEquals(policy(200), get(kind, "first", "unrelated"));
         assertEquals("ConcurrentModification", assertThrows(AwsException.class,
                 () -> written.rollback().run()).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"User", "Group", "Role"})
+    void equalDocumentCompensationCannotRunTwice(String kind) {
+        create(kind, "first");
+        put(kind, "first", "shared", policy(200));
+        InlinePolicyChange change = update(kind, "first", "shared", policy(200));
+        change.rollback().run();
+        assertEquals("ConcurrentModification", assertThrows(AwsException.class,
+                () -> change.rollback().run()).getErrorCode());
+        assertEquals(policy(200), get(kind, "first", "shared"));
     }
 
     @ParameterizedTest
