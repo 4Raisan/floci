@@ -416,6 +416,19 @@ before provisioning:
   tags, bucket names) from Parameter Store.
 - `AWS::SSM::Parameter::Value<List<String>>` and `AWS::SSM::Parameter::Name` typed parameters are
   **not yet** resolved — they are passed through as their literal input.
+- **A declared parameter needs a value.** One that the request gives no value and the template no
+  `Default` fails `CreateStack`, `UpdateStack` and `CreateChangeSet` with `ValidationError`
+  `Parameters: [Env] must have values`, naming each such parameter, before anything changes. An
+  empty value counts as a value. An update does not carry values over: set `UsePreviousValue` to
+  keep the deployed one. `UsePreviousValue` on a parameter that has no deployed value passes none.
+  The values are checked before the template's dependency checks (a cycle, an unresolved
+  dependency, a malformed condition), which read them, so a template with a cycle and a missing
+  value gets this error. A request for a stack that does not exist, cannot be updated, or already
+  exists gets that stack error instead of this one; a dependency error still comes before the
+  stack error. The same check
+  refuses `CreateStackSet` and `UpdateStackSet`, and fails a nested stack's resource whose
+  `Parameters` leave a child parameter without a value. A parameter that an `AWS::Include` defines
+  is not checked, nor is any parameter in a section that carries an `AWS::Include` of its own.
 
 The `AWS::SSM::Parameter` **resource** type exposes `Value`, `Type`, `Name`, and `Arn` attributes through
 `Ref` / `Fn::GetAtt` so downstream resources can consume a parameter the same stack creates.
@@ -480,6 +493,17 @@ Template `Conditions` are evaluated before provisioning. A resource whose `Condi
 **false is skipped** — it is never provisioned, does not appear in `DescribeStackResources`, and its
 `Ref` / `Fn::GetAtt` are not required to resolve. This matches CloudFormation and is required for the
 condition-heavy templates CDK and LZA emit.
+
+The operands of `Fn::Equals` are resolved as resource property values are, so `Ref` to a parameter
+or a pseudo parameter (`AWS::StackName` and `AWS::StackId` included) and `Fn::FindInMap`, the
+functions CloudFormation supports there, work inside a condition. The dependency check a create runs
+before the stack exists sees the `AWS::StackId` the stack is then given. An operand Floci cannot
+resolve compares as an empty string. `AWS::NotificationARNs` is the empty list everywhere, as
+Floci keeps no notification ARNs. `Fn::ImportValue` is not allowed in a condition, as in CloudFormation: `CreateStack`,
+`UpdateStack` and `CreateChangeSet` refuse such a template, with the message `Template error: Cannot
+use Fn::ImportValue in Conditions.` A SAM template's change set fails with that reason instead, and
+so does the stack when CreateStack or UpdateStack executes it; an `AWS::Include` template fails when
+it is executed.
 
 ## Custom Resources and the CDK Provider Framework
 
