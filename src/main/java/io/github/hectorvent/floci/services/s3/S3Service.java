@@ -3881,8 +3881,7 @@ public class S3Service implements Resettable, ResourceProvider {
         return withMultipartOperationLock(bucket, uploadId, () -> {
             MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
             if (partNumber < 1 || partNumber > 10000) {
-                throw new AwsException("InvalidArgument",
-                        "Part number must be between 1 and 10000.", 400);
+                throw PartRange.invalidPartNumber(Integer.toString(partNumber));
             }
             validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
 
@@ -3936,8 +3935,7 @@ public class S3Service implements Resettable, ResourceProvider {
         ChecksumAlgorithm declared = withMultipartOperationLock(bucket, uploadId, () -> {
             MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
             if (partNumber < 1 || partNumber > 10000) {
-                throw new AwsException("InvalidArgument",
-                        "Part number must be between 1 and 10000.", 400);
+                throw PartRange.invalidPartNumber(Integer.toString(partNumber));
             }
             validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
             return upload.getChecksumAlgorithm();
