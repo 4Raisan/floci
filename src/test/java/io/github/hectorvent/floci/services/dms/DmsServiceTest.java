@@ -194,6 +194,19 @@ class DmsServiceTest {
     }
 
     @Test
+    void describeRejectsMalformedMarkerNamingMarker() {
+        AwsException groups = assertThrows(AwsException.class,
+                () -> service.describeReplicationSubnetGroups(pageRequest(20, "!!!"), REGION));
+        assertEquals("InvalidParameterValueException", groups.getErrorCode());
+        assertEquals("Invalid Marker.", groups.getMessage());
+
+        AwsException endpoints = assertThrows(AwsException.class,
+                () -> service.describeEndpoints(pageRequest(20, "!!!"), REGION));
+        assertEquals("InvalidParameterValueException", endpoints.getErrorCode());
+        assertEquals("Invalid Marker.", endpoints.getMessage());
+    }
+
+    @Test
     void describeDefaultsToOneHundredRecordsPerPage() {
         createGroups(25);
 

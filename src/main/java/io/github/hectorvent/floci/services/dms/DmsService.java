@@ -380,7 +380,7 @@ public class DmsService implements Resettable {
         }
         return Pagination.paginate(matching, ReplicationSubnetGroup::getReplicationSubnetGroupIdentifier,
                 maxRecords, marker, DEFAULT_MAX_RECORDS, MAXIMUM_MAX_RECORDS,
-                "InvalidParameterValueException");
+                "InvalidParameterValueException", "Marker");
     }
 
     public synchronized void deleteReplicationSubnetGroup(JsonNode request, String region) {
@@ -495,7 +495,8 @@ public class DmsService implements Resettable {
                     "No " + kind.label() + " found matching provided filters.", 400);
         }
         return Pagination.paginate(matching, resource -> member(resource, kind.idMember()),
-                maxRecords, marker, DEFAULT_MAX_RECORDS, MAXIMUM_MAX_RECORDS, "InvalidParameterValueException");
+                maxRecords, marker, DEFAULT_MAX_RECORDS, MAXIMUM_MAX_RECORDS, "InvalidParameterValueException",
+                "Marker");
     }
 
     private void rename(Kind kind, String region, Found found, ObjectNode attributes, JsonNode request) {
