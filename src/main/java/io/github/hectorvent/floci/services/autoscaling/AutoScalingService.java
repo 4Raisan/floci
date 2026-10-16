@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.autoscaling;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
@@ -557,6 +559,44 @@ public class AutoScalingService {
         tagKeys.forEach(asg.getTagPropagateAtLaunch()::remove);
         groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
     }
+
+    // AWS: values inside one filter are ORed, separate filters are ANDed; only these four
+    // filter names exist. Ordered by (group, key); NextToken is the last pair returned, so tags
+    // added or removed between pages neither skip nor repeat an entry. Values match exactly
+    // (the Filter model says they are case-sensitive).
+    public PaginatedResult<TagDescription> describeTags(String region, List<Map.Entry<String, List<String>>> filters,
+                                                         Integer maxRecords, String nextToken) {
+        for (Map.Entry<String, List<String>> filter : filters) {
+            if (!Set.of("auto-scaling-group", "key", "value", "propagate-at-launch").contains(filter.getKey())) {
+                throw new AwsException("ValidationError", "Filter name '" + filter.getKey() + "' is not valid.", 400);
+            }
+        }
+        int limit = maxRecords != null ? Math.min(Math.max(maxRecords, 1), 100) : 50;
+        List<TagDescription> matches = groups.values().stream()
+                .filter(Objects::nonNull) // group deleted between key snapshot and value read
+                .filter(g -> region.equals(g.getRegion()))
+                .flatMap(g -> g.getTags().entrySet().stream()
+                        .map(t -> new TagDescription(g.getAutoScalingGroupName(), t.getKey(), t.getValue(),
+                                g.getTagPropagateAtLaunch().getOrDefault(t.getKey(), false))))
+                .filter(t -> matchesFilter(filters, "auto-scaling-group", t.resourceId())
+                        && matchesFilter(filters, "key", t.key())
+                        && matchesFilter(filters, "value", t.value())
+                        && matchesFilter(filters, "propagate-at-launch", String.valueOf(t.propagateAtLaunch())))
+                .collect(Collectors.toList());
+        // "\0" sorts below every other character, so the cursor orders as the (group, key) pair.
+        return Pagination.paginate(matches,
+                t -> t.resourceId() + "\0" + t.key(), limit, nextToken, "autoscaling-tags",
+                token -> new AwsException("InvalidNextToken", "The NextToken value is not valid.", 400));
+    }
+
+    // Every filter of this name must match (a repeated name is a second filter, ANDed).
+    private static boolean matchesFilter(List<Map.Entry<String, List<String>>> filters, String name, String actual) {
+        return filters.stream()
+                .filter(f -> f.getKey().equals(name) && !f.getValue().isEmpty())
+                .allMatch(f -> f.getValue().contains(actual));
+    }
+
+    public record TagDescription(String resourceId, String key, String value, boolean propagateAtLaunch) {}
 
     private AutoScalingGroup requireTaggableGroup(String region, String resourceId, String resourceType) {
         if (!"auto-scaling-group".equals(resourceType)) {

@@ -929,11 +929,14 @@ class AutoScalingServiceTest {
         groups.putAll(service.groups);
         service.groups = groups;
         service.attachInstances(REGION, "test-asg", List.of("i-live"));
+        service.createOrUpdateTags(REGION, "test-asg", "auto-scaling-group", Map.of("k", "v"), Map.of());
 
         assertFalse(service.describeAutoScalingGroups(null, null).contains(null));
         assertEquals(List.of("test-asg"), service.describeAutoScalingGroups(REGION, null).stream()
                 .map(AutoScalingGroup::getAutoScalingGroupName).toList());
         assertEquals(1, service.describeAutoScalingInstances(REGION, null).size());
+        assertEquals(List.of("k"), service.describeTags(REGION, List.of(), null, null).items().stream()
+                .map(AutoScalingService.TagDescription::key).toList());
 
         service.setInstanceHealth(REGION, "i-live", "Unhealthy", false);
         service.terminateInstanceInAutoScalingGroup(REGION, "i-live", false);
