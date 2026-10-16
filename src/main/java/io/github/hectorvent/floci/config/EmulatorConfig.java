@@ -3509,6 +3509,15 @@ public interface EmulatorConfig {
     }
 
     interface InitHooksConfig {
+        /**
+         * Root of the Floci-native hook directories ({@code boot.d}, {@code start.d}, {@code ready.d},
+         * {@code stop.d}, {@code shutdown.d}). The image mounts them under the default; a binary on
+         * the host points this at a directory of its own. The LocalStack-compat tree under
+         * {@code /etc/localstack/init} is always read as well.
+         */
+        @WithDefault("/etc/floci/init")
+        String dir();
+
         @WithDefault("/bin/sh")
         String shellExecutable();
 
