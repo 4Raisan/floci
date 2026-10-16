@@ -393,6 +393,13 @@ public class ContainerLifecycleManager {
                         .withNetworkId(spec.networkMode())
                         .exec();
                 LOG.debugv("Connected container {0} to network {1}", containerId, spec.networkMode());
+            } catch (NotFoundException e) {
+                // Docker answers 404 when the network does not exist, which fails a container that
+                // joins at creation, or when the container is already gone. Either way it cannot
+                // reach its network, so fail the start instead of leaving it on the default bridge.
+                // Docker's message says which of the two was missing.
+                throw new IllegalStateException("Could not connect container " + containerId
+                        + " to Docker network " + spec.networkMode() + ": " + e.getMessage(), e);
             } catch (Exception e) {
                 LOG.warnv("Could not connect container {0} to network {1}: {2}",
                         containerId, spec.networkMode(), e.getMessage());
