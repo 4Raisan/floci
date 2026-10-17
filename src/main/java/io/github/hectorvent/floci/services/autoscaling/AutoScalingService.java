@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.Ec2UserDataDecoder;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -30,8 +31,9 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class AutoScalingService {
 
+    private static final String FULLY_FORMED_LAUNCH_TEMPLATE = "You must use a valid fully-formed launch template. ";
     static final String MISSING_LAUNCH_TEMPLATE_IMAGE_ID_MESSAGE =
-            "You must use a valid fully-formed launch template. The request must contain the parameter ImageId";
+            FULLY_FORMED_LAUNCH_TEMPLATE + "The request must contain the parameter ImageId";
     static final String INVALID_LAUNCH_TEMPLATE_MESSAGE =
             "The specified launch template does not exist.";
     static final String INVALID_LAUNCH_CONFIGURATION_PARAMETERS_MESSAGE =
@@ -213,6 +215,7 @@ public class AutoScalingService {
             }
         }
         Ec2UserDataDecoder.decode(userData);
+        resolveLaunchConfigurationProfile(iamInstanceProfile);
         LaunchConfiguration lc = new LaunchConfiguration();
         lc.setLaunchConfigurationName(name);
         lc.setLaunchConfigurationArn(
@@ -234,6 +237,26 @@ public class AutoScalingService {
         lc.setRegion(region);
         launchConfigs.put(key, lc);
         return lc;
+    }
+
+    String resolveLaunchConfigurationProfile(String profile) {
+        if (isBlank(profile)) {
+            return null;
+        }
+        boolean arn = AwsArnUtils.isArn(profile);
+        String name = arn ? profile.substring(profile.lastIndexOf('/') + 1) : profile;
+        try {
+            String resolved = ec2Service.resolveIamInstanceProfileName(name);
+            if (arn && !profile.equals(resolved)) {
+                throw new AwsException("ValidationError", "Invalid IamInstanceProfile: " + profile, 400);
+            }
+            return resolved;
+        } catch (AwsException error) {
+            if (!"InvalidParameterValue".equals(error.getErrorCode())) {
+                throw error;
+            }
+            throw new AwsException("ValidationError", "Invalid IamInstanceProfile: " + profile, 400);
+        }
     }
 
     public List<LaunchConfiguration> describeLaunchConfigurations(String region, List<String> names) {
@@ -1617,8 +1640,19 @@ public class AutoScalingService {
         if (launchTemplateVersions.isEmpty()) {
             throw invalidLaunchTemplate();
         }
-        if (isBlank(launchTemplateVersions.getFirst().getData().getImageId())) {
+        LaunchTemplateData data = launchTemplateVersions.getFirst().getData();
+        if (isBlank(data.getImageId())) {
             throw missingLaunchTemplateImageId();
+        }
+        // EC2 stores a template naming both profile selectors; the group's launch would fail, so
+        // the group is refused up front, as AWS does.
+        if (data.getIamInstanceProfile() != null) {
+            try {
+                Ec2Service.validateLaunchProfileSelectors(data.getIamInstanceProfile().getName(),
+                        data.getIamInstanceProfile().getArn());
+            } catch (AwsException invalid) {
+                throw new AwsException("ValidationError", FULLY_FORMED_LAUNCH_TEMPLATE + invalid.getMessage(), 400);
+            }
         }
     }
 

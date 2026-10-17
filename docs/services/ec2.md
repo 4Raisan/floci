@@ -118,6 +118,11 @@ CloudFormation `AWS::EC2::VPCEndpoint` resolves `IpAddressType` on create and up
 
 Floci runs an IMDS-compatible HTTP server on port `9169` of the host. Each launched container receives the environment variable `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing to this server.
 
+`iam/info` returns the ARN and ID that IAM holds for the attached profile, and 404 when that
+profile is missing, has no role or does not match the attached ARN. An EKS cluster node, whose
+profile Floci synthesizes, reports the synthesized ARN and a stable ID instead while IAM holds no
+such profile.
+
 Both IMDSv1 (no token) and IMDSv2 (token-based) flows are supported:
 
 ```bash
@@ -754,6 +759,20 @@ prefix lists, `EnaSrdSpecification`, `PrimaryIpv6` and `EnaQueueCount` are likew
 | AssociateIamInstanceProfile | Attaches a profile, named by `IamInstanceProfile.Arn` or `IamInstanceProfile.Name`, to an instance that has none; a second association answers `IncorrectState`. |
 | ReplaceIamInstanceProfileAssociation | Swaps the profile behind an existing association id; an unknown id answers `InvalidAssociationID.NotFound`. |
 | DisassociateIamInstanceProfile | Detaches the profile behind an association id. |
+
+Launches and association changes resolve both names and ARNs against IAM in the
+caller's account. Unknown profiles and foreign-account ARNs fail with
+`InvalidParameterValue` before allocation or association changes. A RunInstances launch
+that names both a profile name and an ARN, directly or through its launch template, and a
+CreateFleet launch through such a template, fail with `InvalidParameterCombination`;
+association replacement uses the ARN when both are provided. Launch templates reject
+malformed profile ARNs at creation with `InvalidIamInstanceProfileArn.Malformed` but, as
+on AWS, store a name and ARN pair as given; the pair fails when something uses the
+template, and Auto Scaling refuses a group over it.
+EC2 stores and returns IAM's profile ID, including for launch-template, EC2 Fleet and
+Auto Scaling instances. Persisted instances from older versions omit the unknown ID until the
+profile is reassociated; looking up the ARN could misidentify a deleted and recreated
+profile.
 
 ### Network Interfaces
 
