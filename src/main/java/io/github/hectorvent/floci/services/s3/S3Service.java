@@ -120,6 +120,8 @@ public class S3Service implements Resettable, ResourceProvider {
     private static final String LEGACY_ACCESS_KEY_ID = "test";
     private static final String S3_XML_SCHEMA_ERROR =
             "The XML you provided was not well-formed or did not validate against our published schema.";
+    private static final Set<String> OBJECT_OWNERSHIP_VALUES = Set.of(
+            "BucketOwnerEnforced", "BucketOwnerPreferred", "ObjectWriter");
     private static final Set<String> SUPPORTED_SERVER_SIDE_ENCRYPTION_VALUES = Set.of("AES256", "aws:kms", "aws:kms:dsse", "aws:fsx");
     private static final String SSE_C_ALGORITHM = "AES256";
     private static final int SSE_C_KEY_BYTES = 32;
@@ -465,7 +467,35 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public Bucket createBucket(String bucketName, String region) {
+        return createBucket(bucketName, region, null, null, null, null, null, null, null);
+    }
+
+    public Bucket createBucket(String bucketName, String region, String requestedOwnership,
+                               String cannedAcl, String grantRead, String grantWrite,
+                               String grantFullControl, String grantReadAcp, String grantWriteAcp) {
         requirePathSafeBucketName(bucketName);
+        String ownership = requestedOwnership == null ? "BucketOwnerEnforced" : requestedOwnership;
+        if (!OBJECT_OWNERSHIP_VALUES.contains(ownership)) {
+            throw new AwsException("InvalidArgument", "Invalid x-amz-object-ownership value: " + ownership, 400);
+        }
+        if (!isBlank(cannedAcl) && (!isBlank(grantRead) || !isBlank(grantWrite)
+                || !isBlank(grantFullControl) || !isBlank(grantReadAcp) || !isBlank(grantWriteAcp))) {
+            throw new AwsException("InvalidRequest", "Specifying both Canned ACLs and Header Grants is not allowed", 400);
+        }
+        String requestedAcl = resolveObjectAclXml(cannedAcl, grantRead, grantWrite,
+                grantFullControl, grantReadAcp, grantWriteAcp);
+        if ("BucketOwnerEnforced".equals(ownership)
+                && (!isBlank(grantRead) || !isBlank(grantWrite) || !isBlank(grantReadAcp)
+                || !isBlank(grantWriteAcp)
+                || (!isBlank(grantFullControl) && !isOnlyOwnerFullControlGrant(ownerId(), grantFullControl))
+                || S3AclPublicAccessEvaluator.aclGrantsNonOwner(requestedAcl, ownerId()))) {
+            throw new AwsException("InvalidBucketAclWithObjectOwnership",
+                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting", 400);
+        }
+        if (S3AclPublicAccessEvaluator.aclIsPublic(requestedAcl)) {
+            throw new AwsException("InvalidBucketAclWithBlockPublicAccessError",
+                    "Bucket cannot have public ACLs set with BlockPublicAccess enabled", 400);
+        }
         var existing = bucketStore.get(bucketName);
         if (existing.isPresent()) {
             Bucket bucket = existing.get();
@@ -479,9 +509,21 @@ public class S3Service implements Resettable, ResourceProvider {
 
         Bucket bucket = new Bucket(bucketName);
         bucket.setRegion(region);
+        bucket.setOwnershipControlsConfiguration(ownershipControlsXml(ownership));
+        bucket.setAcl(requestedAcl);
         bucketStore.put(bucketName, bucket);
         LOG.infov("Created bucket: {0} in region: {1}", bucketName, region);
         return bucket;
+    }
+
+    private static String ownershipControlsXml(String ownership) {
+        return new XmlBuilder()
+                .start("OwnershipControls", AwsNamespaces.S3)
+                .start("Rule")
+                .elem("ObjectOwnership", ownership)
+                .end("Rule")
+                .end("OwnershipControls")
+                .build();
     }
 
     private static boolean isDefaultS3Region(String region) {
@@ -5688,8 +5730,7 @@ public class S3Service implements Resettable, ResourceProvider {
         if (rule.count("ObjectOwnership") != 1 || ownership == null) {
             throw new AwsException("MalformedXML", S3_XML_SCHEMA_ERROR, 400);
         }
-        if (!Set.of("BucketOwnerPreferred", "ObjectWriter", "BucketOwnerEnforced")
-                .contains(ownership.text())) {
+        if (!OBJECT_OWNERSHIP_VALUES.contains(ownership.text())) {
             throw new AwsException("MalformedXML", S3_XML_SCHEMA_ERROR, 400);
         }
     }
