@@ -11,6 +11,7 @@ import software.amazon.awssdk.services.redshiftserverless.RedshiftServerlessClie
 import software.amazon.awssdk.services.redshiftserverless.model.ConflictException;
 import software.amazon.awssdk.services.redshiftserverless.model.EndpointAccess;
 import software.amazon.awssdk.services.redshiftserverless.model.GetCredentialsResponse;
+import software.amazon.awssdk.services.redshiftserverless.model.InvalidPaginationException;
 import software.amazon.awssdk.services.redshiftserverless.model.Namespace;
 import software.amazon.awssdk.services.redshiftserverless.model.NamespaceStatus;
 import software.amazon.awssdk.services.redshiftserverless.model.ResourceNotFoundException;
@@ -368,6 +369,39 @@ class RedshiftServerlessTest {
                         .customDomainName("db.example.com"));
             } finally {
                 deleteWorkgroupBestEffort(client, workgroupName);
+                deleteBestEffort(client, namespaceName);
+            }
+        }
+    }
+
+    @Test
+    void snapshotCopyDestinationCanChangeOnlyAfterDeletion() {
+        assumeFalse(TestFixtures.isRealAws(), "Asserts metadata-only snapshot copying");
+        try (RedshiftServerlessClient client = TestFixtures.redshiftServerlessClient()) {
+            String namespaceName = "floci-compat-copy-ns";
+            try {
+                client.createNamespace(request -> request.namespaceName(namespaceName).adminUsername("admin"));
+                String copyId = client.createSnapshotCopyConfiguration(request -> request
+                        .namespaceName(namespaceName).destinationRegion("us-west-2"))
+                        .snapshotCopyConfiguration().snapshotCopyConfigurationId();
+                assertThatThrownBy(() -> client.createSnapshotCopyConfiguration(request -> request
+                        .namespaceName(namespaceName).destinationRegion("eu-west-1")))
+                        .isInstanceOf(ConflictException.class);
+                client.deleteSnapshotCopyConfiguration(request -> request.snapshotCopyConfigurationId(copyId));
+                String replacementId = client.createSnapshotCopyConfiguration(request -> request
+                        .namespaceName(namespaceName).destinationRegion("eu-west-1"))
+                        .snapshotCopyConfiguration().snapshotCopyConfigurationId();
+                assertThat(client.listSnapshotCopyConfigurations(request -> request.namespaceName(namespaceName))
+                        .snapshotCopyConfigurations()).extracting(configuration -> configuration.destinationRegion())
+                        .containsExactly("eu-west-1");
+                assertThatThrownBy(() -> client.listSnapshotCopyConfigurations(request -> request
+                        .namespaceName(namespaceName).maxResults(0)))
+                        .isInstanceOf(ValidationException.class);
+                assertThatThrownBy(() -> client.listSnapshotCopyConfigurations(request -> request
+                        .namespaceName(namespaceName).nextToken("bad-token")))
+                        .isInstanceOf(InvalidPaginationException.class);
+                client.deleteSnapshotCopyConfiguration(request -> request.snapshotCopyConfigurationId(replacementId));
+            } finally {
                 deleteBestEffort(client, namespaceName);
             }
         }
