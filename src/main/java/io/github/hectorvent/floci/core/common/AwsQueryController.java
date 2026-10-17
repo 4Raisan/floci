@@ -202,6 +202,8 @@ public class AwsQueryController {
             "CreateTags", "DeleteTags", "DescribeTags",
             "CreateInternetGateway", "DescribeInternetGateways", "DeleteInternetGateway",
             "AttachInternetGateway", "DetachInternetGateway",
+            "CreateEgressOnlyInternetGateway", "DescribeEgressOnlyInternetGateways",
+            "DeleteEgressOnlyInternetGateway",
             "CreateRouteTable", "DescribeRouteTables", "DeleteRouteTable",
             "AssociateRouteTable", "DisassociateRouteTable", "CreateRoute", "ReplaceRoute", "DeleteRoute",
             "CreateNetworkAcl", "DescribeNetworkAcls", "DeleteNetworkAcl",
