@@ -30,12 +30,8 @@ import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.Lau
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.jboss.logging.Logger;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -91,6 +87,7 @@ public class ContainerLifecycleManager {
     private final ImageCacheService imageCacheService;
     private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
+    private final long archiveRetryBackoffMillis;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -103,10 +100,20 @@ public class ContainerLifecycleManager {
                                      ImageCacheService imageCacheService,
                                      ContainerDetector containerDetector,
                                      EmulatorConfig config) {
+        this(dockerClient, imageCacheService, containerDetector, config,
+                RetryingTarCopier.DEFAULT_BACKOFF_MS);
+    }
+
+    ContainerLifecycleManager(DockerClient dockerClient,
+                              ImageCacheService imageCacheService,
+                              ContainerDetector containerDetector,
+                              EmulatorConfig config,
+                              long archiveRetryBackoffMillis) {
         this.dockerClient = dockerClient;
         this.imageCacheService = imageCacheService;
         this.containerDetector = containerDetector;
         this.config = config;
+        this.archiveRetryBackoffMillis = archiveRetryBackoffMillis;
     }
 
     /**
@@ -331,18 +338,9 @@ public class ContainerLifecycleManager {
     private boolean copyCaBundle(String containerId, Path bundle) {
         try {
             byte[] content = Files.readAllBytes(bundle);
-            ByteArrayOutputStream archive = new ByteArrayOutputStream(content.length + 1024);
-            try (TarArchiveOutputStream tar = new TarArchiveOutputStream(archive)) {
-                TarArchiveEntry entry = new TarArchiveEntry(ContainerCaBundle.FILE_NAME);
-                entry.setSize(content.length);
-                tar.putArchiveEntry(entry);
-                tar.write(content);
-                tar.closeArchiveEntry();
-            }
-            dockerClient.copyArchiveToContainerCmd(containerId)
-                    .withRemotePath(ContainerCaBundle.CONTAINER_DIR)
-                    .withTarInputStream(new ByteArrayInputStream(archive.toByteArray()))
-                    .exec();
+            RetryingTarCopier.copyBytes(dockerClient, containerId, ContainerCaBundle.CONTAINER_DIR,
+                    ContainerCaBundle.FILE_NAME, content, 0644,
+                    RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, archiveRetryBackoffMillis);
             LOG.debugv("Copied the CA bundle into container {0} at {1}", containerId, ContainerCaBundle.CONTAINER_PATH);
             return true;
         } catch (Exception e) {
