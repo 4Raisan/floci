@@ -3006,4 +3006,35 @@ class LambdaServiceTest {
                 principalOrgId.getMessage());
         assertEquals("ValidationException", eventSourceToken.getErrorCode());
     }
+
+    @Test
+    void loggingSettingsAreWhatLambdaStoresForALoggingConfig() {
+        assertEquals(new LambdaService.LoggingSettings("Text", null, null, null),
+                LambdaService.loggingSettings(Map.of(), false));
+        assertEquals(new LambdaService.LoggingSettings("JSON", null, null, null),
+                LambdaService.loggingSettings(Map.of(), true));
+        assertEquals(new LambdaService.LoggingSettings("Text", null, null, "/shared/app"),
+                LambdaService.loggingSettings(Map.of("ApplicationLogLevel", "WARN", "LogGroup", "/shared/app"), false));
+        assertEquals(new LambdaService.LoggingSettings("JSON", "WARN", null, null),
+                LambdaService.loggingSettings(Map.of("LogFormat", "JSON", "ApplicationLogLevel", "WARN",
+                        "LogGroup", ""), false));
+    }
+
+    @Test
+    void loggingSettingsRefuseAnInvalidLevelEvenUnderText() {
+        AwsException refused = assertThrows(AwsException.class, () -> LambdaService.loggingSettings(
+                Map.of("LogFormat", "Text", "ApplicationLogLevel", "LOUD"), false));
+
+        assertEquals("ValidationException", refused.getErrorCode());
+    }
+
+    @Test
+    void aFunctionsLoggingSettingsFillInItsDefaultFormat() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("orders");
+        fn.setLogGroup("/shared/app");
+
+        assertEquals(new LambdaService.LoggingSettings("Text", null, null, "/shared/app"),
+                LambdaService.loggingSettings(fn));
+    }
 }
