@@ -2360,7 +2360,7 @@ public class CloudFormationService implements ResourceProvider {
             Set<String> attemptedResourceIds) {
         LOG.warnv("Stack {0} resource {1} failed: {2}", stack.getStackName(),
                 failedResource.getLogicalId(), failedResource.getStatusReason());
-        rollbackFailedExecution(stack, region, isCreate, failedResource.getStatusReason(), previousState,
+        rollbackFailedExecution(stack, region, isCreate, rollbackReason(isCreate, failedResource), previousState,
                 attemptedResourceIds);
     }
 
@@ -2401,6 +2401,57 @@ public class CloudFormationService implements ResourceProvider {
             return;
         }
         persistStack(stack);
+    }
+
+    /**
+     * The stack's reason for rolling back: a summary naming the failed resource, whose own message
+     * stays on its own event. A resource an update adds failed to create, and only a create
+     * rollback says the rollback was requested, the default OnFailure counting as the request.
+     */
+    private static String rollbackReason(boolean isCreate, StackResource failedResource) {
+        String operation = "UPDATE_FAILED".equals(failedResource.getStatus()) ? "update" : "create";
+        String summary = "The following resource(s) failed to " + operation + ": ["
+                + failedResource.getLogicalId() + "].";
+        return isCreate ? summary + " Rollback requested by user." : summary;
+    }
+
+    /**
+     * The stack's reason, or, while that is still the rollback summary, the failed resource's own
+     * message, which is what a stack set instance reports as the cause.
+     */
+    static String failureCause(Stack stack) {
+        String reason = stack.getStatusReason();
+        List<StackEvent> events = stack.eventsSnapshot();
+        int rollbackStart = events.size() - 1;
+        while (rollbackStart >= 0 && !isStackEvent(stack, events.get(rollbackStart), ROLLBACK_STARTS)) {
+            if (isStackEvent(stack, events.get(rollbackStart), OPERATION_STARTS)) {
+                return reason;
+            }
+            rollbackStart--;
+        }
+        if (rollbackStart < 0 || !Objects.equals(reason, events.get(rollbackStart).getResourceStatusReason())) {
+            return reason;
+        }
+        for (int i = rollbackStart - 1; i >= 0; i--) {
+            StackEvent event = events.get(i);
+            if (isOwnEvent(stack, event)) {
+                return reason;
+            }
+            if ("CREATE_FAILED".equals(event.getResourceStatus()) || "UPDATE_FAILED".equals(event.getResourceStatus())) {
+                return event.getResourceStatusReason();
+            }
+        }
+        return reason;
+    }
+
+    private static boolean isStackEvent(Stack stack, StackEvent event, Set<String> statuses) {
+        return isOwnEvent(stack, event) && statuses.contains(event.getResourceStatus());
+    }
+
+    /** The stack's own event: a resource may share the stack's name, but never its stack ID. */
+    private static boolean isOwnEvent(Stack stack, StackEvent event) {
+        return stack.getStackName().equals(event.getLogicalResourceId())
+                && Objects.equals(stack.getStackId(), event.getPhysicalResourceId());
     }
 
     private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack, String region) {
@@ -3611,6 +3662,10 @@ public class CloudFormationService implements ResourceProvider {
         return normalizedHost.length() > normalizedSuffix.length() + 1
                 && normalizedHost.endsWith("." + normalizedSuffix);
     }
+
+    private static final Set<String> ROLLBACK_STARTS = Set.of("ROLLBACK_IN_PROGRESS", "UPDATE_ROLLBACK_IN_PROGRESS");
+
+    private static final Set<String> OPERATION_STARTS = Set.of("CREATE_IN_PROGRESS", "UPDATE_IN_PROGRESS");
 
     /**
      * Terminal statuses under which {@link #executeTemplate} actually finished creating or
