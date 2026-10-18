@@ -49,6 +49,12 @@
 
 `SendCommand` supports the `AWS-RunShellScript` document. For EC2 instances launched by Floci in real Docker mode, Floci creates the command invocation, returns the command response, and then runs the script asynchronously inside the target instance container. Callers observe completion through `GetCommandInvocation`. `stdout`, `stderr`, response code, start time, and end time are recorded on the invocation.
 
+For public `SendCommand`, set `TimeoutSeconds` to a delivery/start allowance from 30 to
+2,592,000 seconds. The default is 3,600 seconds. Floci does not automatically expire
+commands waiting for an agent, so a command that is never delivered can remain pending
+indefinitely. The document's execution allowance and internal CodeDeploy hook budgets
+are separate.
+
 If the target is not a Floci EC2 container, or if the document is not supported for direct execution, Floci falls back to the SSM agent polling flow. In that mode, `SendCommand` queues an ec2messages payload and the invocation completes after an agent calls `SendReply`.
 
 Background execution retains the issuing account and region. Agent queues and message correlations
