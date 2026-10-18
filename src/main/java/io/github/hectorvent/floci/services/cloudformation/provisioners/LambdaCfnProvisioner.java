@@ -818,14 +818,27 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
         return values;
     }
 
+    /**
+     * The object property {@code source}, or {@code defaultValue} when the template leaves it out,
+     * {@code Ref: AWS::NoValue} directly or through {@code Fn::If} included. Any other value is
+     * refused before the function is touched, with the message CloudFormation's property validation
+     * gives (measured in eu-west-1, 2026-10-18), where a number or a boolean reads as a String too.
+     */
     private Map<String, Object> resolveMapOrDefault(JsonNode props, String source,
                                                     CloudFormationTemplateEngine engine,
                                                     Map<String, Object> defaultValue) {
         if (props == null || !props.has(source) || props.get(source).isNull()) {
             return defaultValue;
         }
-        JsonNode resolved = engine.resolveNode(props.get(source));
-        return resolved != null && resolved.isObject() ? jsonObjectToMap(resolved) : defaultValue;
+        JsonNode resolved = engine.resolveNodeOmittingNoValue(props.get(source));
+        if (resolved == null || resolved.isNull() || resolved.isMissingNode()) {
+            return defaultValue;
+        }
+        if (!resolved.isObject()) {
+            throw new AwsException("ValidationError", "Property [" + source + "] expected type: JSONObject, found: "
+                    + (resolved.isArray() ? "JSONArray" : "String"), 400);
+        }
+        return jsonObjectToMap(resolved);
     }
 
     private static Map<String, Object> mapWithNullValue(String key) {
