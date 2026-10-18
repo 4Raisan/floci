@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -71,11 +72,12 @@ final class DynamoDbAccessPathValidator {
             return;
         }
         if ("ALL_ATTRIBUTES".equals(select)) {
-            throw validationException("Select type ALL_ATTRIBUTES is not supported for global secondary index "
+            throw validationException("One or more parameter values were invalid: "
+                    + "Select type ALL_ATTRIBUTES is not supported for global secondary index "
                     + accessPath.indexName() + " because its projection type is not ALL");
         }
 
-        Set<String> requestedAttributes = new HashSet<>();
+        Set<String> requestedAttributes = new LinkedHashSet<>();
         if (projectionExpression != null) {
             requestedAttributes.addAll(ProjectionEvaluator.topLevelAttributes(
                     projectionExpression, expressionAttributeNames));
@@ -87,10 +89,13 @@ final class DynamoDbAccessPathValidator {
         Set<String> projectedAttributes = accessPath.projectedAttributeNames(table);
         requestedAttributes.removeAll(projectedAttributes);
         if (!requestedAttributes.isEmpty()) {
-            throw validationException("One or more parameter values were invalid: Global secondary index "
-                    + accessPath.indexName() + " does not project "
-                    + String.join(", ", requestedAttributes.stream().sorted().toList()));
+            throw unprojectedGsiAttributes(accessPath.indexName(), requestedAttributes);
         }
+    }
+
+    static AwsException unprojectedGsiAttributes(String indexName, Collection<String> attributes) {
+        return validationException("One or more parameter values were invalid: Global secondary index "
+                + indexName + " does not project [" + String.join(", ", attributes) + "]");
     }
 
     private static void rejectWithSelect(String parameter, boolean present, String select) {
