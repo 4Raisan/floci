@@ -1,12 +1,15 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 import software.amazon.awssdk.services.cloudformation.model.OperationEvent;
 import software.amazon.awssdk.services.cloudformation.model.StackEvent;
+import software.amazon.awssdk.services.lambda.LambdaClient;
+import software.amazon.awssdk.services.lambda.model.Architecture;
 
 import java.time.Duration;
 import java.util.List;
@@ -14,7 +17,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * An object property of AWS::Lambda::Function that is not an object, through the CloudFormation SDK
+ * A property of AWS::Lambda::Function of the wrong JSON type, through the CloudFormation SDK
  * client. Measured on AWS (eu-west-1, 2026-10-18): the stack fails before the function is touched,
  * "Property [VpcConfig] expected type: JSONObject, found: String" ("found: JSONArray" for a list).
  * AWS reports it from its pre-deployment validation, read through DescribeEvents; Floci, which
@@ -27,6 +30,8 @@ class CloudFormationLambdaObjectPropertyTest {
     private static final Duration DEPLOY_TIMEOUT = Duration.ofSeconds(30);
     private static final String STRING_STACK = TestFixtures.uniqueName("compat-cfn-object-string");
     private static final String LIST_STACK = TestFixtures.uniqueName("compat-cfn-object-list");
+    private static final String LAYERS_STACK = TestFixtures.uniqueName("compat-cfn-layers-object");
+    private static final String DELIMITED_STACK = TestFixtures.uniqueName("compat-cfn-comma-delimited");
 
     private static CloudFormationClient cfn;
 
@@ -41,6 +46,8 @@ class CloudFormationLambdaObjectPropertyTest {
             // DeleteStack answers for a stack that is gone too, so a failure here is a real one.
             cfn.deleteStack(request -> request.stackName(STRING_STACK));
             cfn.deleteStack(request -> request.stackName(LIST_STACK));
+            cfn.deleteStack(request -> request.stackName(LAYERS_STACK));
+            cfn.deleteStack(request -> request.stackName(DELIMITED_STACK));
             cfn.close();
         }
     }
@@ -58,6 +65,50 @@ class CloudFormationLambdaObjectPropertyTest {
         assertThat(TestFixtures.awaitStackTerminal(cfn, LIST_STACK, DEPLOY_TIMEOUT)).isEqualTo("ROLLBACK_COMPLETE");
         assertThat(reasons(LIST_STACK)).anyMatch(reason ->
                 reason.contains("Property [DeadLetterConfig] expected type: JSONObject, found: JSONArray"));
+    }
+
+    @Test
+    @DisplayName("a list property that is an object fails the stack")
+    void aListPropertyThatIsAnObjectFailsTheStack() throws InterruptedException {
+        cfn.createStack(request -> request.stackName(LAYERS_STACK).templateBody(template("\"Layers\": {\"a\": \"b\"}")));
+        assertThat(TestFixtures.awaitStackTerminal(cfn, LAYERS_STACK, DEPLOY_TIMEOUT)).isEqualTo("ROLLBACK_COMPLETE");
+        assertThat(reasons(LAYERS_STACK)).anyMatch(reason ->
+                reason.contains("Property [Layers] expected type: JSONArray, found: JSONObject"));
+    }
+
+    /**
+     * Measured on AWS (eu-west-1, 2026-10-18): a {@code Ref} to a {@code CommaDelimitedList}
+     * parameter is a list, so the stack is created and the function has it.
+     */
+    @Test
+    @DisplayName("a list property from a CommaDelimitedList parameter is a list")
+    void aListPropertyFromACommaDelimitedListIsAList() throws InterruptedException {
+        Assumptions.assumeFalse(TestFixtures.isRealAws(), "the function needs a real execution role on AWS");
+        cfn.createStack(request -> request.stackName(DELIMITED_STACK).templateBody("""
+                {
+                  "Parameters": {"Archs": {"Type": "CommaDelimitedList", "Default": "arm64"}},
+                  "Resources": {
+                    "Fn": {
+                      "Type": "AWS::Lambda::Function",
+                      "Properties": {
+                        "Runtime": "python3.14",
+                        "Handler": "index.handler",
+                        "Role": "%s",
+                        "Code": {"ZipFile": "def handler(e, c): return 'ok'"},
+                        "Architectures": {"Ref": "Archs"}
+                      }
+                    }
+                  }
+                }
+                """.formatted(ROLE)));
+        assertThat(TestFixtures.awaitStackTerminal(cfn, DELIMITED_STACK, DEPLOY_TIMEOUT)).isEqualTo("CREATE_COMPLETE");
+
+        String function = cfn.describeStackResource(request -> request.stackName(DELIMITED_STACK)
+                .logicalResourceId("Fn")).stackResourceDetail().physicalResourceId();
+        try (LambdaClient lambda = TestFixtures.lambdaClient()) {
+            assertThat(lambda.getFunctionConfiguration(request -> request.functionName(function)).architectures())
+                    .containsExactly(Architecture.ARM64);
+        }
     }
 
     private static List<String> reasons(String stackName) {

@@ -6,7 +6,17 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -62,7 +72,8 @@ class CloudFormationLambdaObjectPropertyIntegrationTest {
 
     /**
      * Measured on AWS (eu-west-1, 2026-10-18): {@code Ref: AWS::NoValue}, directly or chosen by
-     * {@code Fn::If}, leaves the property out, and the stack is created.
+     * {@code Fn::If}, leaves the property out, object and list properties alike, and the stack is
+     * created.
      */
     @Test
     void aPropertyLeftOutWithNoValueIsNotRefused() {
@@ -91,6 +102,161 @@ class CloudFormationLambdaObjectPropertyIntegrationTest {
                 }
                 """);
         assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(conditional, CFN_AUTH).status());
+
+        String lists = stackName("novalue-lists");
+        submit("CreateStack", lists, template(",\"Layers\": {\"Ref\": \"AWS::NoValue\"}, "
+                + "\"Architectures\": {\"Ref\": \"AWS::NoValue\"}, \"Environment\": {\"Ref\": \"AWS::NoValue\"}, "
+                + "\"ImageConfig\": {\"Ref\": \"AWS::NoValue\"}"));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(lists, CFN_AUTH).status());
+
+        String conditionalList = stackName("novalue-if-list");
+        submit("CreateStack", conditionalList, """
+                {
+                  "Conditions": {"Never": {"Fn::Equals": ["a", "b"]}},
+                  "Resources": {
+                    "Fn": {
+                      "Type": "AWS::Lambda::Function",
+                      "Properties": {
+                        "Runtime": "python3.14",
+                        "Handler": "index.handler",
+                        "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                        "Code": {"ZipFile": "def handler(e, c): return 'ok'"},
+                        "FileSystemConfigs": {"Fn::If": ["Never", [{"LocalMountPath": "/mnt/x",
+                            "Arn": "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0"}],
+                            {"Ref": "AWS::NoValue"}]}
+                      }
+                    }
+                  }
+                }
+                """);
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(conditionalList, CFN_AUTH).status());
+    }
+
+    /**
+     * Measured on AWS (eu-west-1, 2026-10-18): a {@code Ref} to a {@code CommaDelimitedList}
+     * parameter and {@code Fn::Split} are lists, so the stack is created with them; the engine
+     * resolves such a {@code Ref} to the comma-joined text, which is not a value of the wrong type.
+     */
+    @Test
+    void aListPropertyFromACommaDelimitedListOrFnSplitIsAList() throws IOException {
+        String layerArn = publishLayer();
+
+        String delimited = stackName("comma-delimited");
+        submit("CreateStack", delimited, """
+                {
+                  "Parameters": {
+                    "LayerArns": {"Type": "CommaDelimitedList", "Default": "%s"},
+                    "Archs": {"Type": "CommaDelimitedList", "Default": "arm64"}
+                  },
+                  "Resources": {
+                    "Fn": {
+                      "Type": "AWS::Lambda::Function",
+                      "Properties": {
+                        "Runtime": "python3.14",
+                        "Handler": "index.handler",
+                        "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                        "Code": {"ZipFile": "def handler(e, c): return 'ok'"},
+                        "Layers": {"Ref": "LayerArns"},
+                        "Architectures": {"Ref": "Archs"}
+                      }
+                    }
+                  },
+                  "Outputs": {"Name": {"Value": {"Ref": "Fn"}}}
+                }
+                """.formatted(layerArn));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(delimited, CFN_AUTH).status());
+        given().when().get(LAMBDA + functionName(delimited) + "/configuration")
+            .then().statusCode(200)
+            .body("Layers.Arn", contains(layerArn))
+            .body("Architectures", contains("arm64"));
+
+        String split = stackName("fn-split");
+        submit("CreateStack", split, """
+                {
+                  "Parameters": {"LayerArn": {"Type": "String", "Default": "%s"}},
+                  "Resources": {
+                    "Fn": {
+                      "Type": "AWS::Lambda::Function",
+                      "Properties": {
+                        "Runtime": "python3.14",
+                        "Handler": "index.handler",
+                        "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                        "Code": {"ZipFile": "def handler(e, c): return 'ok'"},
+                        "Layers": {"Fn::Split": [",", {"Ref": "LayerArn"}]}
+                      }
+                    }
+                  },
+                  "Outputs": {"Name": {"Value": {"Ref": "Fn"}}}
+                }
+                """.formatted(layerArn));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(split, CFN_AUTH).status());
+        given().when().get(LAMBDA + functionName(split) + "/configuration")
+            .then().statusCode(200)
+            .body("Layers.Arn", contains(layerArn));
+    }
+
+    /**
+     * The other readers of the function and of its layers refuse a value of the wrong type the same
+     * way, each with the message measured for it on AWS (eu-west-1, 2026-10-18).
+     */
+    @Test
+    void everyOtherPropertyOfTheWrongTypeFailsTheCreate() {
+        Map<String, String> functionProperties = new LinkedHashMap<>();
+        functionProperties.put(",\"Environment\": [\"x\"]",
+                "Property [Environment] expected type: JSONObject, found: JSONArray");
+        functionProperties.put(",\"Environment\": {\"Variables\": \"x\"}",
+                "Property [Variables] expected type: JSONObject, found: String");
+        functionProperties.put(",\"ImageConfig\": \"x\"",
+                "Property [ImageConfig] expected type: JSONObject, found: String");
+        functionProperties.put(",\"Layers\": {\"a\": \"b\"}",
+                "Property [Layers] expected type: JSONArray, found: JSONObject");
+        functionProperties.put(",\"Layers\": 5",
+                "Property [Layers] expected type: JSONArray, found: String");
+        functionProperties.put(",\"Architectures\": \"x86_64\"",
+                "Property [Architectures] expected type: JSONArray, found: String");
+        functionProperties.put(",\"FileSystemConfigs\": \"x\"",
+                "Property [FileSystemConfigs] expected type: JSONArray, found: String");
+        functionProperties.forEach((property, reason) -> {
+            String stack = stackName("type");
+            submit("CreateStack", stack, template(property));
+            assertEquals("ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status(), property);
+            assertEventReason(stack, reason);
+        });
+
+        Map<String, String> layerProperties = Map.of(
+                "\"CompatibleRuntimes\": \"python3.14\"",
+                "Property [CompatibleRuntimes] expected type: JSONArray, found: String",
+                "\"CompatibleArchitectures\": {\"a\": \"b\"}",
+                "Property [CompatibleArchitectures] expected type: JSONArray, found: JSONObject");
+        layerProperties.forEach((property, reason) -> {
+            String stack = stackName("layer-type");
+            submit("CreateStack", stack, """
+                    {"Resources": {"L": {"Type": "AWS::Lambda::LayerVersion", "Properties": {
+                      "Content": {"S3Bucket": "none", "S3Key": "none.zip"}, %s}}}}
+                    """.formatted(property));
+            assertEquals("ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status(), property);
+            assertEventReason(stack, reason);
+        });
+    }
+
+    private String publishLayer() throws IOException {
+        String layerName = "cfn-lambda-list-" + Long.toString(System.nanoTime(), 36);
+        ByteArrayOutputStream zip = new ByteArrayOutputStream();
+        try (ZipOutputStream entries = new ZipOutputStream(zip)) {
+            entries.putNextEntry(new ZipEntry("python/shared.py"));
+            entries.write("VALUE = 1".getBytes(StandardCharsets.UTF_8));
+            entries.closeEntry();
+        }
+        String arn = given()
+            .contentType("application/json")
+            .body("{\"Content\": {\"ZipFile\": \"" + Base64.getEncoder().encodeToString(zip.toByteArray()) + "\"}}")
+        .when()
+            .post("/2018-10-31/layers/" + layerName + "/versions")
+        .then()
+            .statusCode(201)
+            .extract().path("LayerVersionArn");
+        cleanup.register(() -> given().when().delete("/2018-10-31/layers/" + layerName + "/versions/1"));
+        return arn;
     }
 
     private String stackName(String purpose) {

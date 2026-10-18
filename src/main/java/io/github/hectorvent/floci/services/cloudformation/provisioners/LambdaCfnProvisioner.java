@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -774,71 +775,107 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private Map<String, String> resolveLambdaEnvironment(JsonNode props, CloudFormationTemplateEngine engine) {
-        if (props == null || !props.has("Environment") || props.get("Environment").isNull()) {
+        JsonNode envNode = resolveTyped(props, "Environment", JsonNodeType.OBJECT, engine);
+        JsonNode variables = envNode == null ? null : envNode.get("Variables");
+        if (variables == null || variables.isNull() || variables.isMissingNode()) {
             return Map.of();
         }
-        JsonNode envNode = engine.resolveNode(props.get("Environment"));
-        if (envNode == null || !envNode.has("Variables") || !envNode.get("Variables").isObject()) {
-            return Map.of();
-        }
+        requireType("Variables", variables, JsonNodeType.OBJECT);
         Map<String, String> vars = new HashMap<>();
-        envNode.get("Variables").fields()
-                .forEachRemaining(e -> vars.put(e.getKey(), e.getValue().asText()));
+        variables.fields().forEachRemaining(e -> vars.put(e.getKey(), e.getValue().asText()));
         return vars;
     }
 
     private List<String> resolveStringListOrEmpty(JsonNode props, String source,
                                                   CloudFormationTemplateEngine engine) {
+        List<String> values = resolveStringList(props, source, engine);
+        return values == null ? List.of() : values;
+    }
+
+    /**
+     * The list-of-strings property {@code source}, or null when the template leaves it out,
+     * {@code Ref: AWS::NoValue} directly or through {@code Fn::If} included. A literal of another
+     * type is refused (see {@link #requireType}). An intrinsic is read through
+     * {@link CloudFormationTemplateEngine#resolveStringList}, as CloudFormation reads a {@code Ref}
+     * to a {@code CommaDelimitedList} parameter, which the engine resolves to the comma-joined text,
+     * and {@code Fn::Split} (measured, eu-west-1, 2026-10-18).
+     */
+    private static List<String> resolveStringList(JsonNode props, String source,
+                                                  CloudFormationTemplateEngine engine) {
         if (props == null || !props.has(source) || props.get(source).isNull()) {
-            return List.of();
+            return null;
         }
-        JsonNode resolved = engine.resolveNode(props.get(source));
-        if (resolved == null || !resolved.isArray()) {
-            return List.of();
+        JsonNode raw = props.get(source);
+        if (raw.isValueNode()) {
+            requireType(source, raw, JsonNodeType.ARRAY);
         }
-        List<String> values = new ArrayList<>();
-        resolved.forEach(v -> values.add(v.asText()));
-        return values;
+        if (raw.isObject()) {
+            JsonNode resolved = engine.resolveNodeOmittingNoValue(raw);
+            if (resolved == null || resolved.isNull() || resolved.isMissingNode()) {
+                return null;
+            }
+            if (resolved.isObject()) {
+                requireType(source, resolved, JsonNodeType.ARRAY);
+            }
+        }
+        return engine.resolveStringList(raw);
     }
 
     private List<Object> resolveObjectListOrEmpty(JsonNode props, String source,
                                                   CloudFormationTemplateEngine engine) {
-        if (props == null || !props.has(source) || props.get(source).isNull()) {
-            return List.of();
-        }
-        JsonNode resolved = engine.resolveNode(props.get(source));
+        JsonNode resolved = resolveTyped(props, source, JsonNodeType.ARRAY, engine);
         if (resolved == null) {
             return List.of();
-        }
-        if (!resolved.isArray()) {
-            throw new AwsException("ValidationError", source + " must be a list", 400);
         }
         List<Object> values = new ArrayList<>();
         resolved.forEach(value -> values.add(jsonNodeToValue(value)));
         return values;
     }
 
-    /**
-     * The object property {@code source}, or {@code defaultValue} when the template leaves it out,
-     * {@code Ref: AWS::NoValue} directly or through {@code Fn::If} included. Any other value is
-     * refused before the function is touched, with the message CloudFormation's property validation
-     * gives (measured in eu-west-1, 2026-10-18), where a number or a boolean reads as a String too.
-     */
+    /** The object property {@code source}, or {@code defaultValue} when the template leaves it out. */
     private Map<String, Object> resolveMapOrDefault(JsonNode props, String source,
                                                     CloudFormationTemplateEngine engine,
                                                     Map<String, Object> defaultValue) {
+        JsonNode resolved = resolveTyped(props, source, JsonNodeType.OBJECT, engine);
+        return resolved == null ? defaultValue : jsonObjectToMap(resolved);
+    }
+
+    /**
+     * The property {@code source}, or null when the template leaves it out, {@code Ref: AWS::NoValue}
+     * directly or through {@code Fn::If} included. A value of another type than {@code expected} is
+     * refused before the function is touched; see {@link #requireType}.
+     */
+    private static JsonNode resolveTyped(JsonNode props, String source, JsonNodeType expected,
+                                         CloudFormationTemplateEngine engine) {
         if (props == null || !props.has(source) || props.get(source).isNull()) {
-            return defaultValue;
+            return null;
         }
         JsonNode resolved = engine.resolveNodeOmittingNoValue(props.get(source));
         if (resolved == null || resolved.isNull() || resolved.isMissingNode()) {
-            return defaultValue;
+            return null;
         }
-        if (!resolved.isObject()) {
-            throw new AwsException("ValidationError", "Property [" + source + "] expected type: JSONObject, found: "
-                    + (resolved.isArray() ? "JSONArray" : "String"), 400);
+        requireType(source, resolved, expected);
+        return resolved;
+    }
+
+    /**
+     * Refuses a value of another type than {@code expected} with the message CloudFormation's
+     * property validation gives (measured in eu-west-1, 2026-10-18), where a number or a boolean
+     * reads as a String: "Property [Layers] expected type: JSONArray, found: String".
+     */
+    private static void requireType(String property, JsonNode value, JsonNodeType expected) {
+        if (value.getNodeType() != expected) {
+            throw new AwsException("ValidationError", "Property [" + property + "] expected type: "
+                    + jsonTypeName(expected) + ", found: " + jsonTypeName(value.getNodeType()), 400);
         }
-        return jsonObjectToMap(resolved);
+    }
+
+    private static String jsonTypeName(JsonNodeType type) {
+        return switch (type) {
+            case OBJECT -> "JSONObject";
+            case ARRAY -> "JSONArray";
+            default -> "String";
+        };
     }
 
     private static Map<String, Object> mapWithNullValue(String key) {
@@ -849,24 +886,16 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
 
     private void putStringListIfPresent(Map<String, Object> request, JsonNode props, String source,
                                         String target, CloudFormationTemplateEngine engine) {
-        if (props == null || !props.has(source) || props.get(source).isNull()) {
-            return;
-        }
-        JsonNode resolved = engine.resolveNode(props.get(source));
-        if (resolved != null && resolved.isArray()) {
-            List<String> values = new ArrayList<>();
-            resolved.forEach(v -> values.add(v.asText()));
+        List<String> values = resolveStringList(props, source, engine);
+        if (values != null) {
             request.put(target, values);
         }
     }
 
     private void putResolvedMapIfPresent(Map<String, Object> request, JsonNode props, String source,
                                          String target, CloudFormationTemplateEngine engine) {
-        if (props == null || !props.has(source) || props.get(source).isNull()) {
-            return;
-        }
-        JsonNode resolved = engine.resolveNode(props.get(source));
-        if (resolved != null && resolved.isObject()) {
+        JsonNode resolved = resolveTyped(props, source, JsonNodeType.OBJECT, engine);
+        if (resolved != null) {
             request.put(target, jsonObjectToMap(resolved));
         }
     }
