@@ -284,7 +284,7 @@ public class IamQueryHandler {
             case "CreateAccessKey" -> handleCreateAccessKey(params);
             case "DeleteAccessKey" -> handleDeleteAccessKey(params, authorization);
             case "ListAccessKeys" -> handleListAccessKeys(params, authorization);
-            case "UpdateAccessKey" -> handleUpdateAccessKey(params);
+            case "UpdateAccessKey" -> handleUpdateAccessKey(params, authorization);
             case "GetAccessKeyLastUsed" -> handleGetAccessKeyLastUsed(params);
 
             case "ListOrganizationsFeatures" -> handleListOrganizationsFeatures(params);
@@ -358,8 +358,8 @@ public class IamQueryHandler {
         return Response.ok(AwsQueryResponse.envelope("CreateUser", AwsNamespaces.IAM, result)).build();
     }
 
-    // UserName is optional on GetUser/ListAccessKeys/DeleteAccessKey: real AWS determines
-    // it implicitly from the access key that signed the request. Mirrors moto: an access
+    // UserName is optional on GetUser/ListAccessKeys/DeleteAccessKey/UpdateAccessKey: real AWS
+    // determines it implicitly from the access key that signed the request. Mirrors moto: an access
     // key that maps to no stored IAM user is the documented NoSuchEntity error.
     private String resolveUserName(MultivaluedMap<String, String> params, String authorization) {
         String userName = getParam(params, "UserName");
@@ -1964,9 +1964,12 @@ public class IamQueryHandler {
         return Response.ok(AwsQueryResponse.envelope("ListAccessKeys", AwsNamespaces.IAM, xml.build())).build();
     }
 
-    private Response handleUpdateAccessKey(MultivaluedMap<String, String> params) {
-        iamService.updateAccessKey(getParam(params, "UserName"),
-                getParam(params, "AccessKeyId"), getParam(params, "Status"));
+    private Response handleUpdateAccessKey(MultivaluedMap<String, String> params, String authorization) {
+        // "If the UserName is not specified, the user name is determined implicitly based on the
+        // AWS access key ID used to sign the request", the same sentence DeleteAccessKey carries.
+        // Read the way the other three statusType operations read theirs, the status included.
+        iamService.updateAccessKey(resolveUserName(params, authorization),
+                requireParam(params, "AccessKeyId"), getParam(params, "Status"));
         return Response.ok(AwsQueryResponse.envelopeNoResult("UpdateAccessKey", AwsNamespaces.IAM)).build();
     }
 

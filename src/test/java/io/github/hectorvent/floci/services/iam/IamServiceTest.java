@@ -2031,6 +2031,52 @@ class IamServiceTest {
     }
 
     @Test
+    void anAccessKeyTakesEveryStatusTheModelPublishes() {
+        // statusType is Active, Inactive or Expired, which is what the reference's Valid Values
+        // line on UpdateAccessKey lists, so Expired is a value to store rather than to refuse.
+        iamService.createUser("alice", "/");
+        AccessKey key = iamService.createAccessKey("alice");
+
+        for (String status : List.of("Inactive", "Expired", "Active")) {
+            iamService.updateAccessKey("alice", key.getAccessKeyId(), status);
+            assertEquals(status, iamService.listAccessKeys("alice").getFirst().getStatus());
+        }
+    }
+
+    @Test
+    void anAccessKeyStatusIsReadBeforeTheKeyIsFound() {
+        // The key does not exist either, and the status is what answers: AWS reads a request's
+        // shape before it resolves anything, so the lookup's NoSuchEntity does not get there first.
+        iamService.createUser("alice", "/");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.updateAccessKey("alice", "AKIANOSUCHKEY00000", "Disabled"));
+
+        assertEquals("ValidationError", error.getErrorCode());
+        // The rendering the three sibling operations already answer with, taken from a recording
+        // of UpdateServiceSpecificCredential: AWS names neither the value nor the permitted set.
+        assertEquals("1 validation error detected: Value at 'status' failed to satisfy "
+                + "constraint: Member must satisfy enum value set", error.getMessage());
+    }
+
+    @Test
+    void anAbsentAccessKeyStatusIsAnsweredLikeAnInvalidOne() {
+        // The shared helper reads a null as a value outside the enum, which is how the other three
+        // statusType operations answer one. Changing that would change all four, so it stays.
+        iamService.createUser("alice", "/");
+        AccessKey key = iamService.createAccessKey("alice");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.updateAccessKey("alice", key.getAccessKeyId(), null));
+
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("1 validation error detected: Value at 'status' failed to satisfy "
+                + "constraint: Member must satisfy enum value set", error.getMessage());
+        // And the key is as it was: the status is read before the lookup, so nothing is written.
+        assertEquals("Active", iamService.listAccessKeys("alice").getFirst().getStatus());
+    }
+
+    @Test
     void aSessionWithNoRoleAndNoRecordedIssuerIsNoCredential() {
         // How GetSessionToken stored its sessions before it recorded the key that minted them. Such
         // a session used to bypass enforcement altogether.

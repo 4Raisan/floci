@@ -193,6 +193,17 @@ own documented role subset.
 | UpdateAccessKey | Updates an access key's status. |
 | DeleteAccessKey | Deletes an access key from a user. |
 
+`UserName` is optional on `UpdateAccessKey`, `ListAccessKeys` and `DeleteAccessKey`: it defaults to
+the user resolved from the signing access key, the same fallback `GetUser` uses.
+
+`Status` takes any of the three values `statusType` publishes, `Active`, `Inactive` and `Expired`,
+which is what the reference's Valid Values line on `UpdateAccessKey` lists, and it is held to that
+set the same way `UpdateSigningCertificate`, `UpdateSSHPublicKey` and
+`UpdateServiceSpecificCredential` hold theirs. It is read before the key is looked up, so a status
+outside the set answers `ValidationError` whether or not the key exists. The `AWS::IAM::AccessKey`
+CloudFormation resource takes the same three, its Allowed values line reading "Active | Inactive |
+Expired" as well.
+
 ### Account Aliases
 
 | Action | Description |

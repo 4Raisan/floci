@@ -279,9 +279,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private static final String CREDENTIAL_STATUS_ACTIVE = "Active";
     private static final String CREDENTIAL_STATUS_EXPIRED = "Expired";
     /**
-     * statusType's values, shared by signing certificates and SSH public keys: Active, Inactive
-     * and Expired. Each operation's prose explains only the first two, so the third is easy to
-     * reject by mistake, while the API Reference lists all three as valid.
+     * statusType's values, shared by access keys, signing certificates, SSH public keys and
+     * service-specific credentials: Active, Inactive and Expired. Each operation's prose explains
+     * only the first two, so the third is easy to reject by mistake, while the API Reference lists
+     * all three as valid on each of them.
      */
     private static final Set<String> CREDENTIAL_STATUSES =
             Set.of(CREDENTIAL_STATUS_ACTIVE, "Inactive", CREDENTIAL_STATUS_EXPIRED);
@@ -401,6 +402,14 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private final Object signingCertificateLock = new Object();
     private final Object sshPublicKeyLock = new Object();
     private final Object serviceCredentialLock = new Object();
+    /**
+     * Guards every check-then-write on an access key, the way its three sibling credential
+     * families are guarded. Both halves of this family need it: CreateAccessKey counts a user's
+     * keys and only then stores another, so two requests racing the quota would both pass a check
+     * for two; and UpdateAccessKey reads a key, changes its status and writes it back, so an
+     * update racing a delete would store the key the delete had just removed.
+     */
+    private final Object accessKeyLock = new Object();
     /**
      * Guards every check-then-write on an MFA device. Assignment is the reason it has to exist:
      * EnableMFADevice reads the device to confirm it is unassigned and reads the user's device
@@ -835,39 +844,43 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 throw new AwsException("DeleteConflict",
                         "Cannot delete entity, must delete policies first.", 409);
             }
-            if (!userAccessKeys(userName).isEmpty()) {
-                throw new AwsException("DeleteConflict",
-                        "Cannot delete entity, must delete access keys first.", 409);
-            }
-            // Both locks are held across the delete rather than just the checks: UploadSigningCertificate
-            // UploadSigningCertificate and EnableMFADevice confirm the user under their own lock, so
-            // none of them can interleave into a credential owned by a deleted user. Taken in this
-            // order here and in UpdateUser, and nowhere else in more than one, so it cannot deadlock.
-            synchronized (serviceCredentialLock) {
-                // AWS lists these among the items to remove first, under their CodeCommit
-                // name: "Git credentials (DeleteServiceSpecificCredential)". Unlike the
-                // cases above it has no message of its own: AWS falls back to the generic
-                // referenced-objects wording here.
-                if (!userServiceCredentials(userName).isEmpty()) {
+            // The credential locks are held across the delete rather than just the checks:
+            // CreateAccessKey, UploadSigningCertificate and EnableMFADevice each confirm the user
+            // under their own lock, so none of them can interleave into a credential owned by a
+            // user that is already gone. Access keys are the outermost of the five here, and
+            // UpdateUser takes that lock on its own rather than inside the others, so no two of
+            // them are ever held in opposite orders.
+            synchronized (accessKeyLock) {
+                if (!userAccessKeys(userName).isEmpty()) {
                     throw new AwsException("DeleteConflict",
-                            "Cannot delete entity, must remove referenced objects first.", 409);
+                            "Cannot delete entity, must delete access keys first.", 409);
                 }
-                synchronized (sshPublicKeyLock) {
-                    if (!userSshPublicKeys(userName).isEmpty()) {
+                synchronized (serviceCredentialLock) {
+                    // AWS lists these among the items to remove first, under their CodeCommit
+                    // name: "Git credentials (DeleteServiceSpecificCredential)". Unlike the
+                    // cases above it has no message of its own: AWS falls back to the generic
+                    // referenced-objects wording here.
+                    if (!userServiceCredentials(userName).isEmpty()) {
                         throw new AwsException("DeleteConflict",
-                                "Cannot delete entity, must delete SSH public keys first.", 409);
+                                "Cannot delete entity, must remove referenced objects first.", 409);
                     }
-                    synchronized (signingCertificateLock) {
-                        if (!userSigningCertificates(userName).isEmpty()) {
+                    synchronized (sshPublicKeyLock) {
+                        if (!userSshPublicKeys(userName).isEmpty()) {
                             throw new AwsException("DeleteConflict",
-                                    "Cannot delete entity, must delete signing certificates first.", 409);
+                                    "Cannot delete entity, must delete SSH public keys first.", 409);
                         }
-                        synchronized (mfaDeviceLock) {
-                            if (!mfaDevicesForUser(userName).isEmpty()) {
+                        synchronized (signingCertificateLock) {
+                            if (!userSigningCertificates(userName).isEmpty()) {
                                 throw new AwsException("DeleteConflict",
-                                        "Cannot delete entity, must deactivate MFA device first.", 409);
+                                        "Cannot delete entity, must delete signing certificates first.", 409);
                             }
-                            users.delete(userName);
+                            synchronized (mfaDeviceLock) {
+                                if (!mfaDevicesForUser(userName).isEmpty()) {
+                                    throw new AwsException("DeleteConflict",
+                                            "Cannot delete entity, must deactivate MFA device first.", 409);
+                                }
+                                users.delete(userName);
+                            }
                         }
                     }
                 }
@@ -904,7 +917,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                     throw new AwsException("EntityAlreadyExists",
                             "User with name " + newUserName + " already exists.", 409);
                 }
-                List<AccessKey> keysToMove = userAccessKeys(userName);
                 // The rename publishes the user under its new name and moves the credentials that
                 // DeleteUser refuses to delete a user over: its MFA devices, its signing
                 // certificates and its SSH public keys. Each moves under the lock DeleteUser checks it with, because split
@@ -955,9 +967,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                         loginProfiles.put(newUserName, profile);
                     });
                 }
-                for (AccessKey key : keysToMove) {
-                    key.setUserName(newUserName);
-                    accessKeys.put(key.getAccessKeyId(), key);
+                synchronized (accessKeyLock) {
+                    // Read inside the lock that rewrites them, the way each credential above is
+                    // read inside its own: a DeleteAccessKey landing between a read taken earlier
+                    // and this loop would be undone, the deleted key coming back under the new
+                    // name and still authenticating.
+                    for (AccessKey key : userAccessKeys(userName)) {
+                        key.setUserName(newUserName);
+                        accessKeys.put(key.getAccessKeyId(), key);
+                    }
                 }
                 for (String groupName : user.getGroupNames()) {
                     groups.get(groupName).ifPresent(group -> {
@@ -2231,31 +2249,30 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     public AccessKey createAccessKey(String userName) {
-        getUser(userName); // validates existence
-        long existingCount = accessKeys.scan(k -> true).stream()
-                .filter(ak -> userName.equals(ak.getUserName()))
-                .count();
-        if (existingCount >= 2) {
-            throw new AwsException("LimitExceeded",
-                    "Cannot exceed quota for AccessKeysPerUser: 2", 409);
+        synchronized (accessKeyLock) {
+            // Confirmed under the lock, not before it, the way UploadSigningCertificate confirms
+            // its own: DeleteUser checks for access keys holding this same lock, so the two cannot
+            // interleave into a key owned by a user that no longer exists.
+            getUser(userName);
+            long existingCount = userAccessKeys(userName).size();
+            if (existingCount >= 2) {
+                throw new AwsException("LimitExceeded",
+                        "Cannot exceed quota for AccessKeysPerUser: 2", 409);
+            }
+            String keyId = "AKIA" + randomId(16);
+            String secretKey = randomSecret(40);
+            AccessKey key = new AccessKey(keyId, secretKey, userName);
+            accessKeys.put(keyId, key);
+            LOG.infov("Created access key for user: {0}", userName);
+            return key;
         }
-        String keyId = "AKIA" + randomId(16);
-        String secretKey = randomSecret(40);
-        AccessKey key = new AccessKey(keyId, secretKey, userName);
-        accessKeys.put(keyId, key);
-        LOG.infov("Created access key for user: {0}", userName);
-        return key;
     }
 
     public void deleteAccessKey(String userName, String accessKeyId) {
-        AccessKey key = accessKeys.get(accessKeyId)
-                .orElseThrow(() -> new AwsException("NoSuchEntity",
-                        "Access key " + accessKeyId + " not found.", 404));
-        if (!key.getUserName().equals(userName)) {
-            throw new AwsException("NoSuchEntity",
-                    "Access key " + accessKeyId + " does not belong to user " + userName + ".", 404);
+        synchronized (accessKeyLock) {
+            AccessKey key = userAccessKey(userName, accessKeyId);
+            accessKeys.delete(key.getAccessKeyId());
         }
-        accessKeys.delete(accessKeyId);
     }
 
     public List<AccessKey> listAccessKeys(String userName) {
@@ -2269,7 +2286,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .toList();
     }
 
+    /**
+     * Sets an access key's status, validated before the key is looked up the way the other three
+     * {@code statusType} operations validate theirs: a status outside the enum is answered for the
+     * status whether or not the key exists.
+     */
     public void updateAccessKey(String userName, String accessKeyId, String status) {
+        requireStatusFromEnum(status);
+        synchronized (accessKeyLock) {
+            AccessKey key = userAccessKey(userName, accessKeyId);
+            key.setStatus(status);
+            accessKeys.put(accessKeyId, key);
+        }
+    }
+
+    /** The user's key with this id, or the NoSuchEntity each of these operations answers. */
+    private AccessKey userAccessKey(String userName, String accessKeyId) {
         AccessKey key = accessKeys.get(accessKeyId)
                 .orElseThrow(() -> new AwsException("NoSuchEntity",
                         "Access key " + accessKeyId + " not found.", 404));
@@ -2277,12 +2309,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             throw new AwsException("NoSuchEntity",
                     "Access key " + accessKeyId + " does not belong to user " + userName + ".", 404);
         }
-        if (!"Active".equals(status) && !"Inactive".equals(status)) {
-            throw new AwsException("ValidationError",
-                    "Status must be Active or Inactive.", 400);
-        }
-        key.setStatus(status);
-        accessKeys.put(accessKeyId, key);
+        return key;
     }
 
     // =========================================================================
@@ -3284,12 +3311,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return getServerCertificate(name).getTags();
     }
 
-    // Credential status, shared by the three operations that take statusType
+    // Credential status, shared by the four operations that take statusType
     // =========================================================================
 
     /**
-     * {@code statusType}, shared by UpdateSigningCertificate, UpdateSSHPublicKey and
-     * UpdateServiceSpecificCredential. One rendering serves all three because one front end
+     * {@code statusType}, shared by UpdateAccessKey, UpdateSigningCertificate, UpdateSSHPublicKey
+     * and UpdateServiceSpecificCredential. One rendering serves all four because one front end
      * validates one shape: the recording is of UpdateServiceSpecificCredential, and AWS names
      * neither the offending value nor the permitted set, unlike this message elsewhere in the
      * tree. Matched rather than made uniform.
