@@ -61,6 +61,34 @@ class S3OwnershipControlsIntegrationTest {
     }
 
     @Test
+    @Order(10)
+    void ownerCanUploadWithPrivateAclOnEnforcedBucket() {
+        String bucket = BUCKET + "-private-upload";
+        given().when().put("/" + bucket).then().statusCode(200);
+
+        given().header("x-amz-acl", "private").body("single upload")
+                .when().put("/" + bucket + "/single")
+                .then().statusCode(200);
+        given().when().get("/" + bucket + "/single")
+                .then().statusCode(200).body(containsString("single upload"));
+
+        String uploadId = given().header("x-amz-acl", "private")
+                .when().post("/" + bucket + "/multipart?uploads")
+                .then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        String partETag = given().body("multipart upload")
+                .when().put("/" + bucket + "/multipart?uploadId=" + uploadId + "&partNumber=1")
+                .then().statusCode(200).extract().header("ETag");
+        String completeXml = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+                + partETag + "</ETag></Part></CompleteMultipartUpload>";
+        given().contentType("application/xml").body(completeXml)
+                .when().post("/" + bucket + "/multipart?uploadId=" + uploadId)
+                .then().statusCode(200);
+        given().when().get("/" + bucket + "/multipart")
+                .then().statusCode(200).body(containsString("multipart upload"));
+    }
+
+    @Test
     @Order(2)
     void createBucketHonorsExplicitOwnershipAndRejectsIncompatibleAcl() {
         String legacyBucket = BUCKET + "-explicit-writer";

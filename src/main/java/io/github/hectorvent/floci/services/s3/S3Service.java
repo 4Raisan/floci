@@ -694,7 +694,7 @@ public class S3Service implements Resettable, ResourceProvider {
         AccountAwareStorageBackend.OwnedEntry<Bucket> checkedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
-        rejectUploadAclWhenOwnershipEnforced(checkedBucket.value(), checkedBucket.account(), effectiveOptions);
+        rejectUploadAclWhenOwnershipEnforced(checkedBucket.value(), checkedBucket.account(), effectiveOptions, ownerId());
         rejectObjectLockWithoutLockEnabled(checkedBucket.value(), effectiveOptions);
         rejectConflictingServerSideEncryption(
                 normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption()),
@@ -788,7 +788,16 @@ public class S3Service implements Resettable, ResourceProvider {
     private S3Object storeObject(String bucketName, String key, ObjectBody body,
                                  String contentType, Map<String, String> metadata,
                                  S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag) {
-        return storeObject(null, bucketName, key, body, contentType, metadata, checksum, parts, options, eTag);
+        return storeObject(null, bucketName, key, body, contentType, metadata, checksum, parts,
+                options, eTag, ownerId());
+    }
+
+    private S3Object storeObject(String bucketName, String key, ObjectBody body,
+                                 String contentType, Map<String, String> metadata,
+                                 S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag,
+                                 String aclRequestAccount) {
+        return storeObject(null, bucketName, key, body, contentType, metadata, checksum, parts,
+                options, eTag, aclRequestAccount);
     }
 
     /**
@@ -802,6 +811,15 @@ public class S3Service implements Resettable, ResourceProvider {
                                  String bucketName, String key, ObjectBody body,
                                  String contentType, Map<String, String> metadata,
                                  S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag) {
+        return storeObject(checkedBucket, bucketName, key, body, contentType, metadata, checksum,
+                parts, options, eTag, ownerId());
+    }
+
+    private S3Object storeObject(AccountAwareStorageBackend.OwnedEntry<Bucket> checkedBucket,
+                                 String bucketName, String key, ObjectBody body,
+                                 String contentType, Map<String, String> metadata,
+                                 S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag,
+                                 String aclRequestAccount) {
         AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
@@ -814,7 +832,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 throw new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404);
             }
             return storeObjectInternal(ownedBucket.account(), bucket, bucketName, key, body,
-                    contentType, metadata, checksum, parts, options, eTag);
+                    contentType, metadata, checksum, parts, options, eTag, aclRequestAccount);
         }
     }
 
@@ -845,7 +863,7 @@ public class S3Service implements Resettable, ResourceProvider {
                                          String bucketName, String key, ObjectBody body,
                                          String contentType, Map<String, String> metadata,
                                          S3Checksum checksum, List<Part> parts, PutObjectOptions options,
-                                         String eTag) {
+                                         String eTag, String aclRequestAccount) {
         PutObjectOptions effectiveOptions = options != null ? options : new PutObjectOptions();
         String normalizedServerSideEncryption = normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption());
         SseCustomerKey sseCustomerKey = validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(), effectiveOptions.getSseCustomerKey(), effectiveOptions.getSseCustomerKeyMd5());
@@ -877,7 +895,8 @@ public class S3Service implements Resettable, ResourceProvider {
             object.setSseCustomerAlgorithm(sseCustomerKey.algorithm());
             object.setSseCustomerKeyMd5(sseCustomerKey.keyMd5());
         }
-        rejectUploadAclWhenOwnershipEnforced(bucket, bucketOwnerAccount, effectiveOptions);
+        rejectUploadAclWhenOwnershipEnforced(bucket, bucketOwnerAccount, effectiveOptions,
+                aclRequestAccount);
         rejectObjectLockWithoutLockEnabled(bucket, effectiveOptions);
         String objectAcl = resolveObjectAclXml(bucketOwnerAccount,
                 effectiveOptions.getAcl(), effectiveOptions.getGrantRead(),
@@ -4239,7 +4258,7 @@ public class S3Service implements Resettable, ResourceProvider {
                     .orElseThrow(() -> new AwsException("NoSuchBucket",
                             "The specified bucket does not exist.", 404));
             String ownerAccount = getBucketOwnerAccountId(bucket);
-            rejectUploadAclWhenOwnershipEnforced(destination, ownerAccount, objectOptions);
+            rejectUploadAclWhenOwnershipEnforced(destination, ownerAccount, objectOptions, ownerId());
             rejectObjectLockWithoutLockEnabled(destination, objectOptions);
             resolveObjectAclXml(ownerAccount, acl, objectOptions.getGrantRead(), objectOptions.getGrantWrite(),
                     objectOptions.getGrantFullControl(), objectOptions.getGrantReadAcp(),
@@ -4730,7 +4749,8 @@ public class S3Service implements Resettable, ResourceProvider {
                                     .withRetainUntilDate(upload.getRetainUntilDate())
                                     .withLegalHoldStatus(upload.getLegalHoldStatus())
                                     .withTagging(upload.getTagging()),
-                            compositeETag);
+                            compositeETag,
+                            upload.getInitiatorAccountId() != null ? upload.getInitiatorAccountId() : ownerId());
                 } finally {
                     // A stored body was moved away, so this only removes the file of a failed store and
                     // leaves the parts in place for a retry or an abort.
@@ -5655,8 +5675,8 @@ public class S3Service implements Resettable, ResourceProvider {
         }
     }
 
-    private static void rejectUploadAclWhenOwnershipEnforced(Bucket bucket, String ownerAccount,
-                                                              PutObjectOptions options) {
+    private void rejectUploadAclWhenOwnershipEnforced(Bucket bucket, String ownerAccount,
+                                                      PutObjectOptions options, String aclRequestAccount) {
         if (!ownershipIsEnforced(bucket)) {
             return;
         }
@@ -5667,7 +5687,9 @@ public class S3Service implements Resettable, ResourceProvider {
                 && (isBlank(options.getGrantFullControl()) || ownerGrant);
         boolean ownerFullControlAcl = "bucket-owner-full-control".equals(options.getAcl())
                 && isBlank(options.getGrantFullControl());
-        if (!otherGrants && (withoutAcl || ownerFullControlAcl)) {
+        boolean ownerPrivateAcl = "private".equals(options.getAcl())
+                && ownerAccount.equals(aclRequestAccount) && isBlank(options.getGrantFullControl());
+        if (!otherGrants && (withoutAcl || ownerFullControlAcl || ownerPrivateAcl)) {
             return;
         }
         throw new AwsException("AccessControlListNotSupported", "The bucket does not allow ACLs", 400);

@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.MultipartUpload;
+import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
@@ -333,5 +334,35 @@ class S3GlobalBucketNamespaceTest {
                 "a cross-account multipart completion must not create a caller shadow object");
         assertTrue(objects.getForAccount(ACCOUNT_B, versionKey).isEmpty(),
                 "a cross-account multipart completion must not create a caller shadow version");
+    }
+
+    @Test
+    void ownerPrivateMultipartUploadCanBeCompletedByAnotherAccount() {
+        Instance<RequestContext> ctx = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        S3Service globalNs = new S3Service(
+                buckets, objects, Path.of("s3-gns-private-multipart-test"), true, true);
+
+        String bucket = "shared-private-multipart-bucket";
+        String key = "object.bin";
+        caller.set(ACCOUNT_A);
+        globalNs.createBucket(bucket, "us-east-1");
+        MultipartUpload upload = globalNs.initiateMultipartUpload(bucket, key,
+                "application/octet-stream", Map.of(), null, new PutObjectOptions().withAcl("private"));
+        globalNs.uploadPart(bucket, key, upload.getUploadId(), 1, "payload".getBytes(UTF_8));
+
+        caller.set(ACCOUNT_B);
+        AwsException rejected = assertThrows(AwsException.class, () -> globalNs.initiateMultipartUpload(
+                bucket, "unauthorized-private.bin", "application/octet-stream", Map.of(), null,
+                new PutObjectOptions().withAcl("private")));
+        assertEquals("AccessControlListNotSupported", rejected.getErrorCode());
+        assertDoesNotThrow(() -> globalNs.completeMultipartUpload(
+                bucket, key, upload.getUploadId(), List.of(1), null, null));
+
+        assertTrue(objects.getForAccount(ACCOUNT_A, bucket + "/" + key).isPresent());
+        assertTrue(objects.getForAccount(ACCOUNT_B, bucket + "/" + key).isEmpty());
     }
 }
