@@ -867,7 +867,7 @@ public class CodeArtifactService implements Resettable {
                 pageAssets.add(new AssetSummary(assetName, content.length, computeHashes(content)));
             }
             page = new PaginatedResult<>(pageAssets, namePage.nextToken());
-            revision = synthesizeContainerBackedRevision(repoId, namespace, packageName, version);
+            revision = synthesizeContainerBackedRevision(format, repoId, namespace, packageName, version);
         } else {
             String key = packageVersionKey(region, domain, repository, format, namespace, packageName, version);
             CodeArtifactPackageVersion pv = packageVersions.getForAccount(owner, key)
@@ -927,7 +927,7 @@ public class CodeArtifactService implements Resettable {
         pv.setPackageName(packageName);
         pv.setVersion(version);
         pv.setStatus("Published");
-        pv.setRevision(synthesizeContainerBackedRevision(repoId, namespace, packageName, version));
+        pv.setRevision(synthesizeContainerBackedRevision(format, repoId, namespace, packageName, version));
         return pv;
     }
 
@@ -1247,7 +1247,7 @@ public class CodeArtifactService implements Resettable {
             throw validation("namespace is required when requesting an asset from a maven package version.");
         }
         String repoId = ensureFormatContainerId(format, region, domain, owner, repository);
-        String revision = synthesizeContainerBackedRevision(repoId, namespace, packageName, version);
+        String revision = synthesizeContainerBackedRevision(format, repoId, namespace, packageName, version);
         if (packageVersionRevision != null && !packageVersionRevision.equals(revision)) {
             throw notFound("Package version '" + version + "' was not found at revision '"
                     + packageVersionRevision + "'.", version, "package-version");
@@ -1294,10 +1294,21 @@ public class CodeArtifactService implements Resettable {
      * or a caller could never round-trip it through a revision-pinned copy. 50 hex characters
      * (200 bits) is still astronomically collision-resistant for distinguishing the handful of
      * live repository/namespace/package/version coordinates this emulator ever holds at once.
+     *
+     * <p>{@code nuget} normalizes {@code version} first ({@link NuGetVersions#normalize}, the
+     * same normalization {@link BagetterSidecarClient}'s own version matching already applies
+     * before comparing a requested version against what BaGetter holds): without it, two
+     * equivalent spellings of the same NuGet version (AWS's own worked example, {@code 1.00} and
+     * {@code 1.0.0}) resolved to the identical stored version but hashed to two different
+     * revisions, so a revision obtained with one spelling never matched a later request using the
+     * other. Maven, npm, and pypi need no such normalization: only BaGetter's client normalizes
+     * the requested version before matching it; Reposilite and Verdaccio match the literal string.
      */
-    private static String synthesizeContainerBackedRevision(String repoId, String namespace, String packageName,
-            String version) {
-        String revisionKey = repoId + "/" + (namespace == null ? "" : namespace) + "/" + packageName + "/" + version;
+    private static String synthesizeContainerBackedRevision(String format, String repoId, String namespace,
+            String packageName, String version) {
+        String revisionVersion = "nuget".equals(format) ? NuGetVersions.normalize(version) : version;
+        String revisionKey = repoId + "/" + (namespace == null ? "" : namespace) + "/" + packageName + "/"
+                + revisionVersion;
         return Digests.sha256Hex(revisionKey.getBytes(StandardCharsets.UTF_8)).substring(0, MAX_REVISION_LENGTH);
     }
 
@@ -1560,8 +1571,8 @@ public class CodeArtifactService implements Resettable {
                 }
                 if (hasRevisions) {
                     String expectedRevision = versionRevisions.get(version);
-                    String actualRevision = synthesizeContainerBackedRevision(sourceRepoId, namespace, packageName,
-                            version);
+                    String actualRevision = synthesizeContainerBackedRevision(format, sourceRepoId, namespace,
+                            packageName, version);
                     if (!actualRevision.equals(expectedRevision)) {
                         failures.put(version, new PackageVersionCopyFailure("MISMATCHED_REVISION",
                                 "current revision: " + actualRevision + ", expected revision: "
@@ -1686,7 +1697,7 @@ public class CodeArtifactService implements Resettable {
             }
             copyCapturedReadmeIfApplicable(region, domain, owner, sourceRepository, destinationRepository, format,
                     namespace, packageName, version);
-            String revision = synthesizeContainerBackedRevision(destRepoId, namespace, packageName, version);
+            String revision = synthesizeContainerBackedRevision(format, destRepoId, namespace, packageName, version);
             successes.put(version, new PackageVersionCopyOutcome(revision, "Published"));
         }
         return new CopyPackageVersionsResult(successes, Map.of());
@@ -1966,7 +1977,7 @@ public class CodeArtifactService implements Resettable {
         String owner = effectiveOwner(domainOwner);
         requireRepository(owner, repositoryKey(region, domain, repository), repository);
         String repoId = ensureFormatContainerId(format, region, domain, owner, repository);
-        String revision = synthesizeContainerBackedRevision(repoId, namespace, packageName, version);
+        String revision = synthesizeContainerBackedRevision(format, repoId, namespace, packageName, version);
         if ("nuget".equals(format)) {
             String readme = sidecarRegistry.forFormat(format)
                     .flatMap(manager -> manager.fetchPackageVersionReadme(repoId, domain, repository, namespace,

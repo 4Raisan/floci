@@ -3251,6 +3251,44 @@ class CodeArtifactServiceTest {
         assertEquals("ValidationException", missingVersion.getErrorCode());
     }
 
+    // --------------------------------------------- NuGet revision normalization
+
+    @Test
+    void describePackageVersionReturnsTheSameRevisionForEquivalentNuGetVersionSpellings() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        when(bagetterClient.packageVersionExists(anyString(), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("1.00.0"))).thenReturn(true);
+        when(bagetterClient.packageVersionExists(anyString(), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("1.0.0"))).thenReturn(true);
+
+        CodeArtifactPackageVersion fromPadded = service.describePackageVersion(REGION, "dom", null, "repo", "nuget",
+                null, "my-pkg", "1.00.0");
+        CodeArtifactPackageVersion fromNormalized = service.describePackageVersion(REGION, "dom", null, "repo",
+                "nuget", null, "my-pkg", "1.0.0");
+
+        assertEquals(fromNormalized.getRevision(), fromPadded.getRevision());
+    }
+
+    @Test
+    void getPackageVersionAssetAcceptsARevisionObtainedFromAnEquivalentNuGetVersionSpelling() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] content = "nupkg-bytes".getBytes(StandardCharsets.UTF_8);
+        when(bagetterClient.fetchPackageVersionAsset(anyString(), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("1.00.0"), eq("my-pkg.1.0.0.nupkg"))).thenReturn(Optional.of(content));
+        when(bagetterClient.fetchPackageVersionAsset(anyString(), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("1.0.0"), eq("my-pkg.1.0.0.nupkg"))).thenReturn(Optional.of(content));
+
+        PackageVersionAssetResult fromPadded = service.getPackageVersionAsset(REGION, "dom", null, "repo", "nuget",
+                null, "my-pkg", "1.00.0", "my-pkg.1.0.0.nupkg", null);
+
+        PackageVersionAssetResult pinned = service.getPackageVersionAsset(REGION, "dom", null, "repo", "nuget", null,
+                "my-pkg", "1.0.0", "my-pkg.1.0.0.nupkg", fromPadded.packageVersionRevision());
+
+        assertEquals(content.length, pinned.asset().getSize());
+    }
+
     // ---------------------------------------------------------- GetPackageVersionReadme
 
     @Test
