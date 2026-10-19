@@ -20,16 +20,21 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -38,6 +43,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -50,6 +56,10 @@ class IotMqttEnabledIntegrationTest {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String BUILDING_RULE_SQL = "SELECT *, topic() AS topic, clientid() AS cid "
             + "FROM '$aws/things/+/shadow/name/building/update/accepted' WHERE endswith(clientToken, 'inbound')";
+    private static final String TKLOCAL_CONNECTED_SQL =
+            "SELECT * FROM '$aws/events/presence/connected/+' WHERE startswith(clientId, 'tklocal-')";
+    private static final String TKLOCAL_DISCONNECTED_SQL =
+            "SELECT * FROM '$aws/events/presence/disconnected/+' WHERE startswith(clientId, 'tklocal-')";
 
     @Inject
     IotPublishEventRecorder eventRecorder;
@@ -582,6 +592,46 @@ class IotMqttEnabledIntegrationTest {
     }
 
     @Test
+    void tklocalPresenceRulesReceiveTheConnectAndCleanDisconnectOfATklocalClientOnly() throws Exception {
+        long suffix = System.nanoTime();
+        String queueUrl = createQueue("presence-clean-" + suffix);
+        String connectedRule = "presenceConnected" + suffix;
+        String disconnectedRule = "presenceDisconnected" + suffix;
+        createSqsRule(connectedRule, TKLOCAL_CONNECTED_SQL, queueUrl);
+        createSqsRule(disconnectedRule, TKLOCAL_DISCONNECTED_SQL, queueUrl);
+        try {
+            String clientId = "tklocal-" + suffix;
+            try (MqttTestClient other = connectMqttClientId("other-" + suffix)) {
+                assertTrue(other.isConnected());
+            }
+            try (MqttTestClient client = connectMqttClientId(clientId)) {
+                assertTrue(client.isConnected());
+            }
+
+            // One worker runs the rules in publish order, so the other client's events were evaluated first.
+            List<JsonNode> messages = awaitMessages(queueUrl, 2);
+            assertEquals(2, messages.size(), "only the tklocal client's two events: " + messages);
+            Map<String, JsonNode> byType = new HashMap<>();
+            for (JsonNode message : messages) {
+                assertEquals(clientId, message.path("clientId").asText(), message.toString());
+                byType.put(message.path("eventType").asText(), message);
+            }
+            JsonNode connected = byType.get("connected");
+            JsonNode disconnected = byType.get("disconnected");
+            assertEquals(Set.of("connected", "disconnected"), byType.keySet());
+            assertEquals(connected.path("sessionIdentifier").asText(), disconnected.path("sessionIdentifier").asText());
+            assertEquals(0, connected.path("versionNumber").asLong());
+            assertEquals(0, disconnected.path("versionNumber").asLong());
+            assertEquals("127.0.0.1", connected.path("ipAddress").asText());
+            assertTrue(disconnected.path("clientInitiatedDisconnect").asBoolean(), disconnected.toString());
+            assertEquals("CLIENT_INITIATED_DISCONNECT", disconnected.path("disconnectReason").asText());
+        } finally {
+            deleteRule(connectedRule);
+            deleteRule(disconnectedRule);
+        }
+    }
+
+    @Test
     void mqttSubscriberReceivesTheAcceptedEventOfARestShadowUpdate() throws Exception {
         String thing = "shadowRestToMqtt" + System.nanoTime();
         String accepted = "$aws/things/" + thing + "/shadow/name/building/update/accepted";
@@ -597,6 +647,74 @@ class IotMqttEnabledIntegrationTest {
             assertEquals(21, payload.at("/state/desired/temp").asInt());
             assertEquals("rest-token", payload.path("clientToken").asText());
             assertEquals(1, payload.path("version").asInt());
+        }
+    }
+
+    @Test
+    void tklocalDisconnectedRuleReceivesConnectionLostWhenTheClientVanishesWithoutDisconnect() throws Exception {
+        long suffix = System.nanoTime();
+        String queueUrl = createQueue("presence-lost-" + suffix);
+        String disconnectedRule = "presenceLost" + suffix;
+        createSqsRule(disconnectedRule, TKLOCAL_DISCONNECTED_SQL, queueUrl);
+        try {
+            String clientId = "tklocal-lost-" + suffix;
+            MqttTestClient client = connectMqttClientId(clientId);
+            client.closeWithoutDisconnect();
+
+            List<JsonNode> messages = awaitMessages(queueUrl, 1);
+            assertEquals(1, messages.size(), messages.toString());
+            JsonNode disconnected = messages.get(0);
+            assertEquals(clientId, disconnected.path("clientId").asText());
+            assertEquals("CONNECTION_LOST", disconnected.path("disconnectReason").asText());
+            assertTrue(disconnected.path("clientInitiatedDisconnect").isBoolean(), disconnected.toString());
+            assertFalse(disconnected.path("clientInitiatedDisconnect").asBoolean());
+        } finally {
+            deleteRule(disconnectedRule);
+        }
+    }
+
+    @Test
+    void tklocalDisconnectedRuleReceivesKeepAliveTimeoutWhenTheClientFallsSilent() throws Exception {
+        long suffix = System.nanoTime();
+        String queueUrl = createQueue("presence-silent-" + suffix);
+        String disconnectedRule = "presenceSilent" + suffix;
+        createSqsRule(disconnectedRule, TKLOCAL_DISCONNECTED_SQL, queueUrl);
+        try (Socket socket = rawConnect("tklocal-silent-" + suffix, 1)) {
+            List<JsonNode> messages = awaitMessages(queueUrl, 1);
+
+            assertEquals(1, messages.size(), messages.toString());
+            JsonNode disconnected = messages.get(0);
+            assertEquals("tklocal-silent-" + suffix, disconnected.path("clientId").asText());
+            assertEquals("MQTT_KEEP_ALIVE_TIMEOUT", disconnected.path("disconnectReason").asText());
+            assertTrue(disconnected.path("clientInitiatedDisconnect").isBoolean(), disconnected.toString());
+            assertFalse(disconnected.path("clientInitiatedDisconnect").asBoolean());
+        } finally {
+            deleteRule(disconnectedRule);
+        }
+    }
+
+    @Test
+    void tklocalDisconnectedRuleReceivesConnectionLostWhenAPingingClientDrops() throws Exception {
+        long suffix = System.nanoTime();
+        String queueUrl = createQueue("presence-pinging-" + suffix);
+        String disconnectedRule = "presencePinging" + suffix;
+        createSqsRule(disconnectedRule, TKLOCAL_DISCONNECTED_SQL, queueUrl);
+        try {
+            try (Socket socket = rawConnect("tklocal-pinging-" + suffix, 1)) {
+                Instant pingUntil = Instant.now().plusMillis(2_500);
+                while (Instant.now().isBefore(pingUntil)) {
+                    socket.getOutputStream().write(new byte[] {(byte) 0xc0, 0x00});
+                    assertArrayEquals(new byte[] {(byte) 0xd0, 0x00}, socket.getInputStream().readNBytes(2), "PINGRESP");
+                    Thread.sleep(400);
+                }
+            }
+
+            List<JsonNode> messages = awaitMessages(queueUrl, 1);
+            assertEquals(1, messages.size(), messages.toString());
+            assertEquals("CONNECTION_LOST", messages.get(0).path("disconnectReason").asText());
+            assertFalse(messages.get(0).path("clientInitiatedDisconnect").asBoolean());
+        } finally {
+            deleteRule(disconnectedRule);
         }
     }
 
@@ -638,12 +756,31 @@ class IotMqttEnabledIntegrationTest {
         throw new AssertionError("No message arrived on " + queueUrl);
     }
 
+    /** Receives until {@code count} messages arrived or ten seconds passed, then once more, so a surplus one shows too. */
+    private List<JsonNode> awaitMessages(String queueUrl, int count) throws Exception {
+        List<JsonNode> messages = new ArrayList<>();
+        Instant deadline = Instant.now().plus(Duration.ofSeconds(10));
+        while (messages.size() < count && Instant.now().isBefore(deadline)) {
+            for (String body : receiveMessages(queueUrl)) {
+                messages.add(OBJECT_MAPPER.readTree(body));
+            }
+            if (messages.size() < count) {
+                Thread.sleep(50);
+            }
+        }
+        for (String body : receiveMessages(queueUrl)) {
+            messages.add(OBJECT_MAPPER.readTree(body));
+        }
+        return messages;
+    }
+
     private void createSqsRule(String ruleName, String sql, String queueUrl) {
         ObjectNode sqs = OBJECT_MAPPER.createObjectNode()
                 .put("roleArn", "arn:aws:iam::000000000000:role/iot-rule-role")
                 .put("queueUrl", queueUrl);
         ObjectNode payload = OBJECT_MAPPER.createObjectNode()
                 .put("sql", sql)
+                .put("awsIotSqlVersion", "2016-03-23")
                 .put("ruleDisabled", false);
         payload.putArray("actions").addObject().set("sqs", sqs);
         ObjectNode body = OBJECT_MAPPER.createObjectNode();
@@ -726,6 +863,34 @@ class IotMqttEnabledIntegrationTest {
         throw new AssertionError("MQTT publish event was not recorded");
     }
 
+    /** An MQTT 3.1.1 CONNECT over a plain socket, so the test decides exactly which packets follow it. */
+    private static Socket rawConnect(String clientId, int keepAliveSeconds) throws IOException {
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress("127.0.0.1", IotMqttTlsProfile.PLAIN_PORT), 5_000);
+        socket.setSoTimeout(5_000);
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        writeUtf8(body, "MQTT");
+        body.write(0x04);
+        body.write(0x02);
+        body.write(keepAliveSeconds >>> 8);
+        body.write(keepAliveSeconds & 0xff);
+        writeUtf8(body, clientId);
+        ByteArrayOutputStream connect = new ByteArrayOutputStream();
+        connect.write(0x10);
+        connect.write(body.size());
+        connect.writeBytes(body.toByteArray());
+        socket.getOutputStream().write(connect.toByteArray());
+        assertArrayEquals(new byte[] {0x20, 0x02, 0x00, 0x00}, socket.getInputStream().readNBytes(4), "CONNACK accepted");
+        return socket;
+    }
+
+    private static void writeUtf8(ByteArrayOutputStream out, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        out.write(bytes.length >>> 8);
+        out.write(bytes.length & 0xff);
+        out.writeBytes(bytes);
+    }
+
     private record MqttPublish(String topic, byte[] payload) {
     }
 
@@ -793,6 +958,12 @@ class IotMqttEnabledIntegrationTest {
                 Thread.sleep(25);
             }
             throw new AssertionError("MQTT connection stayed open");
+        }
+
+        /** Drops the TCP connection without sending DISCONNECT, as a crashed device would. */
+        void closeWithoutDisconnect() throws MqttException {
+            client.disconnectForcibly(0, 0, false);
+            client.close();
         }
 
         @Override

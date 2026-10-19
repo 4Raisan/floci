@@ -2035,6 +2035,11 @@ public class IotService {
             return false;
         }
         String[] filterParts = filter.split("/", -1);
+        // Measured on AWS IoT: a wildcard first level matches the $aws/things shadow topics but not the lifecycle topics.
+        if (topic.startsWith(IotMqttBrokerService.PRESENCE_TOPIC_PREFIX)
+                && ("#".equals(filterParts[0]) || "+".equals(filterParts[0]))) {
+            return false;
+        }
         String[] topicParts = topic.split("/", -1);
         int i = 0;
         for (; i < filterParts.length; i++) {
