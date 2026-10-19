@@ -4784,7 +4784,8 @@ public class AslExecutor {
         validateConnectionArn(input);
         validateHttpHeaders(headers);
 
-        HttpRequestPayload requestPayload = requestPayload(requestBody, requestBodyEncoding);
+        HttpRequestPayload requestPayload = requestPayload(requestBody, requestBodyEncoding,
+                input.path("Transform").path("RequestEncodingOptions"));
         MultiMap requestHeaders = requestHeaders(headers, requestPayload.contentType());
         MultiMap requestQueryParameters = queryParameters(queryParameters);
 
@@ -4814,9 +4815,6 @@ public class AslExecutor {
     }
 
     private HttpResponse<Buffer> sendHttpRequest(HttpRequest<Buffer> request, HttpRequestPayload payload) throws NoStackTraceTimeoutException {
-        if (payload.form() != null) {
-            return request.sendFormAndAwait(payload.form());
-        }
         if (payload.body() != null) {
             return request.sendBufferAndAwait(payload.body());
         }
@@ -4910,19 +4908,22 @@ public class AslExecutor {
         }
     }
 
-    private HttpRequestPayload requestPayload(JsonNode requestBody, String requestBodyEncoding) {
+    private HttpRequestPayload requestPayload(JsonNode requestBody, String requestBodyEncoding, JsonNode options) {
         if ("URL_ENCODED".equalsIgnoreCase(requestBodyEncoding)) {
-            // TODO: Implement Transform.RequestBodyEncoding URL_ENCODED with AWS-compatible array formats.
-            throw new FailStateException("States.TaskFailed", "URL-encoded request bodies are not supported yet");
+            try {
+                return new HttpRequestPayload(Buffer.buffer(HttpTaskFormEncoder.encode(requestBody, options)),
+                        "application/x-www-form-urlencoded");
+            } catch (IllegalArgumentException e) {
+                throw new FailStateException("States.TaskFailed", e.getMessage());
+            }
         } else if ("NONE".equalsIgnoreCase(requestBodyEncoding)) {
             try {
                 if (requestBody.isMissingNode() || requestBody.isNull()) {
-                    return new HttpRequestPayload(null, null, null);
+                    return new HttpRequestPayload(null, null);
                 }
 
                 return new HttpRequestPayload(
                     Buffer.buffer(objectMapper.writeValueAsString(requestBody)),
-                    null,
                     "application/json");
             } catch (Exception e) {
                 throw new FailStateException("States.TaskFailed",
@@ -4934,7 +4935,7 @@ public class AslExecutor {
         }
     }
 
-    private record HttpRequestPayload(Buffer body, MultiMap form, String contentType) {
+    private record HttpRequestPayload(Buffer body, String contentType) {
     }
 
     private record HttpTaskResponse(
