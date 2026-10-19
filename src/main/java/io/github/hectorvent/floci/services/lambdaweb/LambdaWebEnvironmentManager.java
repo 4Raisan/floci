@@ -107,6 +107,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
     private static final int INIT_ERROR_MAX_BYTES = 64;
     /** Longer than the data plane waits to see an exit, so a request the exit failed is counted. */
     private static final Duration EXCHANGES_WAIT = Duration.ofSeconds(2);
+    private static final Duration METRICS_WAIT = Duration.ofSeconds(5);
 
     /**
      * One container of an endpoint's pool. It joins the pool before it starts, so requests that
@@ -265,6 +266,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final LambdaWebLogs logs;
+    private final LambdaWebMetrics metrics;
     private final byte[] runtime;
     /** The environments of each endpoint in each region. A list is only touched inside a map operation on its key. */
     private final ConcurrentHashMap<String, List<Environment>> pools = new ConcurrentHashMap<>();
@@ -280,7 +282,8 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
                                        @StreamingDocker DockerClient streamingDocker, ImageResolver imageResolver,
                                        EcrRegistryManager ecrRegistryManager, S3Service s3Service,
                                        ZipExtractor zipExtractor, LaunchedContainerAwsEnv awsEnv,
-                                       LambdaExecutionRoleCredentials executionRoleCredentials, LambdaWebLogs logs) {
+                                       LambdaExecutionRoleCredentials executionRoleCredentials, LambdaWebLogs logs,
+                                       LambdaWebMetrics metrics) {
         this.config = config;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -292,6 +295,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
         this.logs = logs;
+        this.metrics = metrics;
         this.runtime = runtimeScript();
         long period = Math.max(1, Math.min(30, config.services().lambda().containerIdleTimeoutSeconds() / 2 + 1));
         reaper.scheduleWithFixedDelay(this::reapIdle, period, period, TimeUnit.SECONDS);
@@ -368,6 +372,16 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
         pool.add(started);
         started.reserve();
         return new Pick(started, true, retired);
+    }
+
+    /** The live environments of the endpoint, also those that are starting. */
+    int environmentCount(String endpointKey) {
+        AtomicInteger count = new AtomicInteger();
+        pools.computeIfPresent(endpointKey, (key, pool) -> {
+            count.set((int) pool.stream().filter(Environment::isAlive).count());
+            return pool;
+        });
+        return count.get();
     }
 
     private static boolean isIdle(Environment environment, long idleNanos) {
@@ -476,6 +490,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
     @Override
     public void stopManagedContainers() {
         allEnvironments().forEach(this::discard);
+        metrics.awaitPublished(METRICS_WAIT);
     }
 
     /** The live environment that writes {@code logStream}, the one a response names. */
@@ -569,7 +584,8 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
             environment.logs = logs.open(accountId, region, revision.serviceConfig.logGroup, environment.logStream,
                     revision.serviceConfig.systemLogLevel);
             platform = new LambdaWebPlatformLog(environment.logs, region, fn.functionName, revision.revisionId,
-                    revision.buildConfig.runtime, revision.serviceConfig.applicationLogLevel);
+                    revision.buildConfig.runtime, revision.serviceConfig.applicationLogLevel,
+                    metrics.environment(accountId, region, fn.functionName));
             environment.platformLog = platform;
             ContainerInfo info = lifecycleManager.startCreated(containerId, spec);
             platform.initStart();
