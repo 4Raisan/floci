@@ -357,7 +357,6 @@ public class AslExecutor {
                 : EXPRESS_MAX_EXECUTION_TIME;
         if (vertx != null) {
             // This can be optimized further
-            // TODO Set WebclientOptions useragent to Amazon|StepFunctions|HttpInvoke|{{{{region}}}}
             this.webClient = WebClient.wrap(vertx.createHttpClient());
         } else {
             webClient = null;
@@ -4792,7 +4791,8 @@ public class AslExecutor {
         try {
             HttpRequest<Buffer> request = webClient.requestAbs(HttpMethod.valueOf(method), rawUri)
                 .timeout(timeoutMillis)
-                .putHeaders(requestHeaders);
+                .putHeaders(requestHeaders)
+                .putHeader("User-Agent", "Amazon|StepFunctions|HttpInvoke|" + region);
             request.queryParams().addAll(requestQueryParameters);
 
             LOG.infov("Step Functions HTTP task sending request: method={0}, uri={1}", method, uri);

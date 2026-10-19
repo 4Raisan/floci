@@ -219,6 +219,7 @@ class AslExecutorHttpInvokeTest {
 
         assertFalse(request.query().contains("ignored"));
         assertEquals(List.of("one", "two"), request.headerValues("X-Custom"));
+        assertEquals(List.of("Amazon|StepFunctions|HttpInvoke|" + REGION), request.headerValues("User-Agent"));
     }
 
     @Test
@@ -235,6 +236,9 @@ class AslExecutorHttpInvokeTest {
                         "Method.$": "$.method",
                         "Authentication": {
                           "ConnectionArn": "%s"
+                        },
+                        "Headers": {
+                          "User-Agent": "custom-client/1.0"
                         },
                         "RequestBody": {
                           "customerId.$": "$.customerId",
@@ -259,6 +263,7 @@ class AslExecutorHttpInvokeTest {
 
         RecordedRequest request = onlyRequest();
         assertEquals("POST", request.method());
+        assertEquals(List.of("Amazon|StepFunctions|HttpInvoke|" + REGION), request.headerValues("User-Agent"));
         assertEquals("application/json", request.firstHeader("Content-Type"));
         JsonNode body = objectMapper.readTree(request.body());
         assertEquals("cust-123", body.path("customerId").asText());
