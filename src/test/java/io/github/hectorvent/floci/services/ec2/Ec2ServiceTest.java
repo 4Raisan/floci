@@ -667,6 +667,228 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void describeTagsListsOnlyTheRequestRegionsTags() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String east = service.createVpc("us-east-1", "10.80.0.0/16", false).getVpcId();
+        String west = service.createVpc("eu-west-1", "10.81.0.0/16", false).getVpcId();
+        service.createTags("us-east-1", List.of(east), List.of(new Tag("Team", "east")));
+        service.createTags("eu-west-1", List.of(west), List.of(new Tag("Team", "west")));
+
+        assertEquals(List.of(east), tagResourceIds(service.describeTags("us-east-1", Map.of("key", List.of("Team")))));
+        assertEquals(List.of(west), tagResourceIds(service.describeTags("eu-west-1", Map.of("key", List.of("Team")))));
+        assertTrue(service.describeTags("eu-west-1", Map.of("resource-id", List.of(east))).isEmpty());
+        assertTrue(service.resourceTags("eu-west-1", east).isEmpty());
+        assertEquals("east", service.resourceTags("us-east-1", east).getFirst().getValue());
+    }
+
+    @Test
+    void tagsCarryTheResourceTypeOfImagesVolumesSnapshotsAclsPeeringsAndSpotRequests() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Map<String, String> expected = Map.of(
+                "ami-0abc12345678", "image", "vol-0abc12345678", "volume", "snap-0abc12345678", "snapshot",
+                "acl-0abc12345678", "network-acl", "pcx-0abc12345678", "vpc-peering-connection",
+                "sir-0abc12345678", "spot-instances-request");
+        service.createSystemTags("us-east-1", List.copyOf(expected.keySet()), List.of(new Tag("Team", "typed")));
+
+        Map<String, String> types = new HashMap<>();
+        for (Map<String, String> item : service.describeTags("us-east-1", Map.of("key", List.of("Team")))) {
+            types.put(item.get("resourceId"), item.get("resourceType"));
+        }
+        assertEquals(expected, types);
+    }
+
+    @Test
+    void volumeTagsGivenAtCreationAreListedByDescribeTags() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of(new Tag("Team", "storage")));
+
+        List<Map<String, String>> listed = service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(volume.getVolumeId())));
+        assertEquals(1, listed.size());
+        assertEquals("volume", listed.getFirst().get("resourceType"));
+        assertTrue(service.describeTags("eu-west-1", Map.of("resource-id", List.of(volume.getVolumeId()))).isEmpty());
+    }
+
+    @Test
+    void tagsStoredByBareIdMoveUnderTheirResourcesRegionAndOrphansAreDropped() {
+        AccountAwareStorageBackend<List<Tag>> tagStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-tags.json", tagStore)));
+        String vpcId = service.createVpc("eu-west-1", "10.82.0.0/16", false).getVpcId();
+        tagStore.put(vpcId, new ArrayList<>(List.of(new Tag("Team", "legacy"))));
+        tagStore.put("vpc-0000dead0000", new ArrayList<>(List.of(new Tag("Team", "orphan"))));
+
+        service.migrateTagsToRegionKeys();
+        service.migrateTagsToRegionKeys();
+
+        assertEquals(List.of(vpcId), tagResourceIds(service.describeTags("eu-west-1", Map.of("key", List.of("Team")))));
+        assertTrue(service.describeTags("us-east-1", Map.of("key", List.of("Team"))).isEmpty());
+        assertTrue(tagStore.keys().stream().allMatch(storeKey -> storeKey.contains("::")));
+    }
+
+    @Test
+    void volumeTagChangesShowInDescribeVolumes() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String volumeId = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of(new Tag("Team", "storage"))).getVolumeId();
+
+        service.createTags("us-east-1", List.of(volumeId), List.of(new Tag("Env", "dev")));
+        service.deleteTags("us-east-1", List.of(volumeId), List.of(new Tag("Team", null)));
+
+        List<Tag> described = service.describeVolumes("us-east-1", List.of(volumeId), Map.of()).getFirst().getTags();
+        assertEquals(List.of("Env"), described.stream().map(Tag::getKey).toList());
+    }
+
+    @Test
+    void eachSideOfACrossRegionPeeringConnectionSeesItsOwnTags() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String eastVpc = service.createVpc("us-east-1", "10.83.0.0/16", false).getVpcId();
+        String westVpc = service.createVpc("eu-west-1", "10.84.0.0/16", false).getVpcId();
+        String pcxId = service.createVpcPeeringConnection("us-east-1", eastVpc, westVpc, null, "eu-west-1",
+                List.of(new Tag("Side", "requester"))).getVpcPeeringConnectionId();
+        service.createTags("eu-west-1", List.of(pcxId), List.of(new Tag("Side", "accepter")));
+
+        assertEquals("requester", peeringTag(service, "us-east-1", pcxId));
+        assertEquals("accepter", peeringTag(service, "eu-west-1", pcxId));
+        assertEquals(List.of(pcxId), tagResourceIds(service.describeTags("us-east-1", Map.of("key", List.of("Side")))));
+        assertEquals("requester", peeringTag(service, "us-east-1", pcxId));
+    }
+
+    private static String peeringTag(Ec2Service service, String region, String pcxId) {
+        return service.describeVpcPeeringConnections(region, List.of(pcxId), Map.of()).getFirst().getTags().stream()
+                .filter(tag -> "Side".equals(tag.getKey())).map(Tag::getValue).findFirst().orElse(null);
+    }
+
+    @Test
+    void aDeletedVolumesTagsAreNoLongerListed() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String volumeId = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of(new Tag("Team", "storage"))).getVolumeId();
+        service.createTags("us-east-1", List.of(volumeId), List.of(new Tag("Env", "dev")));
+
+        service.deleteVolume("us-east-1", volumeId);
+
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).isEmpty());
+    }
+
+    @Test
+    void aRootVolumeDeletedOnTerminationTakesItsTags() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Instance inst = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        String rootVolumeId = inst.getRootVolumeId();
+        service.createTags("us-east-1", List.of(rootVolumeId), List.of(new Tag("Team", "root")));
+
+        service.terminateInstances("us-east-1", List.of(inst.getInstanceId()));
+
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                .noneMatch(volume -> rootVolumeId.equals(volume.getVolumeId())));
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(rootVolumeId))).isEmpty());
+    }
+
+    @Test
+    void deletingAPeeringConnectionRemovesBothSidesTags() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String eastVpc = service.createVpc("us-east-1", "10.89.0.0/16", false).getVpcId();
+        String westVpc = service.createVpc("eu-west-1", "10.90.0.0/16", false).getVpcId();
+        String pcxId = service.createVpcPeeringConnection("us-east-1", eastVpc, westVpc, null, "eu-west-1",
+                List.of(new Tag("Side", "requester"))).getVpcPeeringConnectionId();
+        service.createTags("eu-west-1", List.of(pcxId), List.of(new Tag("Side", "accepter")));
+
+        service.deleteVpcPeeringConnection("eu-west-1", pcxId);
+
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(pcxId))).isEmpty());
+        assertTrue(service.describeTags("eu-west-1", Map.of("resource-id", List.of(pcxId))).isEmpty());
+    }
+
+    @Test
+    void migrationKeepsCatalogImageAndClusterNodeTags() {
+        AccountAwareStorageBackend<List<Tag>> tagStore = AccountAwareStorageBackend.inMemory("000000000000");
+        EmulatorConfig config = mockConfig(true);
+        when(config.defaultRegion()).thenReturn("us-east-1");
+        Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
+        Ec2Service service = new Ec2Service(config, mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
+                new AmiImageResolver(imageCatalog), imageCatalog, new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-tags.json", tagStore)));
+        String catalogImageId = imageCatalog.images().getFirst().imageId;
+        String nodeId = "i-0de0000000000001a";
+        tagStore.put(catalogImageId, new ArrayList<>(List.of(new Tag("Team", "image"))));
+        tagStore.put(nodeId, new ArrayList<>(List.of(new Tag("Team", "node"))));
+        tagStore.put("vpc-0000dead0000", new ArrayList<>(List.of(new Tag("Team", "orphan"))));
+
+        service.migrateTagsToRegionKeys();
+
+        assertEquals(List.of(catalogImageId),
+                tagResourceIds(service.describeTags("us-east-1", Map.of("key", List.of("Team")))));
+        assertTrue(tagStore.keys().contains(nodeId));
+        assertFalse(tagStore.keys().contains("vpc-0000dead0000"));
+
+        Instance node = new Instance();
+        node.setInstanceId(nodeId);
+        node.setRegion("eu-west-1");
+        node.setPlacement(new Placement("eu-west-1a"));
+        node.setState(InstanceState.running());
+        node.setInstanceType("m5.large");
+        service.setClusterNodeInstanceProvider(new ClusterNodeInstanceProvider() {
+            @Override
+            public Optional<Instance> findInstance(String accountId, String region, String instanceId) {
+                return nodeId.equals(instanceId) && "eu-west-1".equals(region) ? Optional.of(node) : Optional.empty();
+            }
+
+            @Override
+            public List<Instance> listInstances(String accountId, String region) {
+                return "eu-west-1".equals(region) ? List.of(node) : List.of();
+            }
+        });
+
+        assertEquals("node", service.describeInstances("eu-west-1", List.of(nodeId), Map.of()).getFirst()
+                .getInstances().getFirst().getTags().getFirst().getValue());
+        assertEquals(List.of(nodeId), tagResourceIds(service.describeTags("eu-west-1", Map.of("key", List.of("Team")))));
+        assertFalse(tagStore.keys().contains(nodeId));
+    }
+
+    @Test
+    void regionlessLookupFilesClusterNodeTagsUnderTheNodesRegion() {
+        AccountAwareStorageBackend<List<Tag>> tagStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-tags.json", tagStore)));
+        String nodeId = "i-0de0000000000002b";
+        tagStore.put(nodeId, new ArrayList<>(List.of(new Tag("Team", "node"))));
+        service.migrateTagsToRegionKeys();
+        Instance node = new Instance();
+        node.setInstanceId(nodeId);
+        node.setRegion("eu-west-1");
+        node.setPlacement(new Placement("eu-west-1a"));
+        node.setState(InstanceState.running());
+        node.setInstanceType("m5.large");
+        service.setClusterNodeInstanceProvider(new ClusterNodeInstanceProvider() {
+            @Override
+            public Optional<Instance> findInstance(String accountId, String region, String instanceId) {
+                return nodeId.equals(instanceId) && (region == null || "eu-west-1".equals(region))
+                        ? Optional.of(node) : Optional.empty();
+            }
+
+            @Override
+            public List<Instance> listInstances(String accountId, String region) {
+                return region == null || "eu-west-1".equals(region) ? List.of(node) : List.of();
+            }
+        });
+
+        assertEquals("node", service.findInstanceById(nodeId).getTags().getFirst().getValue());
+
+        assertEquals(List.of(nodeId), tagResourceIds(service.describeTags("eu-west-1", Map.of("key", List.of("Team")))));
+        assertFalse(tagStore.keys().contains("null::" + nodeId));
+    }
+
+    private static Ec2Service tagTestService(StorageFactory storageFactory) {
+        return new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), storageFactory);
+    }
+
+    private static List<String> tagResourceIds(List<Map<String, String>> items) {
+        return items.stream().map(item -> item.get("resourceId")).distinct().toList();
+    }
+
+    @Test
     void deleteVpcRemovesItsOwnTagsAndThoseOnItsDefaultResources() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class),

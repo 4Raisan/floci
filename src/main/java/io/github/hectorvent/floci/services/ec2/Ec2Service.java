@@ -816,6 +816,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     @PostConstruct
     void restoreMetadataRegistrations() {
+        migrateTagsToRegionKeys();
         if (portForwardManager != null) {
             portForwardManager.setPersister(inst -> {
                 if (inst != null && inst.getRegion() != null && inst.getInstanceId() != null) {
@@ -1065,6 +1066,147 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             store.get(key).ifPresent(value -> entries.add(new AccountAwareStorageBackend.AccountEntry<>(null, key, value)));
         }
         return entries;
+    }
+
+    /**
+     * Moves tags stored before tags were regional, keyed by the bare resource id, to
+     * {@code region::id}, taking the region from where the resource itself is stored (both sides'
+     * regions for a peering attachment or connection). A catalog AMI, which every region serves
+     * under one id, takes the default region. An instance no store holds may be an EKS node, which
+     * its provider restores on its own schedule: it keeps its bare key until
+     * {@link #getTagsForAccount} first finds that node in a region. Any other tag whose resource
+     * no store holds is dropped: AWS has no tag without its resource. Runs once at startup; an entry
+     * already keyed by region is left alone, so a later run finds nothing to do.
+     */
+    void migrateTagsToRegionKeys() {
+        List<AccountAwareStorageBackend.AccountEntry<List<Tag>>> legacy = entriesOfEveryAccount(tags).stream()
+                .filter(entry -> !entry.key().contains("::"))
+                .toList();
+        if (legacy.isEmpty()) {
+            return;
+        }
+        Map<String, Map<String, Set<String>>> regionsByOwner = resourceRegionsByOwner();
+        int moved = 0;
+        int kept = 0;
+        int dropped = 0;
+        for (AccountAwareStorageBackend.AccountEntry<List<Tag>> entry : legacy) {
+            Set<String> regions = regionsByOwner.getOrDefault(ownerKey(entry.accountId()), Map.of())
+                    .getOrDefault(entry.key(), Set.of());
+            if (regions.isEmpty() && entry.key().startsWith("ami-")
+                    && imageCatalog != null && imageCatalog.findByIdOrAlias(entry.key()).isPresent()) {
+                regions = Set.of(config.defaultRegion());
+            }
+            if (regions.isEmpty() && entry.key().startsWith("i-")) {
+                kept++;
+                continue;
+            }
+            for (String region : regions) {
+                AccountAwareStorageBackend.AccountEntry<List<Tag>> regional =
+                        new AccountAwareStorageBackend.AccountEntry<>(entry.accountId(), key(region, entry.key()), entry.value());
+                if (getForOwner(tags, regional).isEmpty()) {
+                    putForOwner(tags, regional, entry.value());
+                }
+            }
+            deleteForOwner(tags, entry);
+            if (regions.isEmpty()) {
+                dropped++;
+            } else {
+                moved++;
+            }
+        }
+        LOG.infov("Moved {0} EC2 tag record(s) under their resource's region; kept {1} for instances not yet"
+                + " restored; dropped {2} whose resource no region holds", moved, kept, dropped);
+    }
+
+    /** Resource id to the regions it is stored in, per owning account ("" for a store without accounts). */
+    private Map<String, Map<String, Set<String>>> resourceRegionsByOwner() {
+        Map<String, Map<String, Set<String>>> index = new HashMap<>();
+        for (StorageBackend<String, ?> store : List.of(instances, vpcs, subnets, securityGroups, securityGroupRules,
+                internetGateways, egressOnlyInternetGateways, routeTables, networkAcls, keyPairs, addresses, volumes,
+                snapshots, registeredImages, launchTemplates, vpcEndpoints, natGateways, spotInstanceRequests,
+                managedPrefixLists, transitGateways, transitGatewayRouteTables, transitGatewayVpcAttachments,
+                networkInterfaces, capacityReservations, hosts)) {
+            indexRegionalKeys(index, store);
+        }
+        for (AccountAwareStorageBackend.AccountEntry<Instance> entry : entriesOfEveryAccount(instances)) {
+            String region = entry.value().getRegion();
+            if (region != null && entry.value().getNetworkInterfaces() != null) {
+                entry.value().getNetworkInterfaces().forEach(eni ->
+                        indexRegion(index, entry.accountId(), eni.getNetworkInterfaceId(), region));
+            }
+        }
+        for (AccountAwareStorageBackend.AccountEntry<NatGateway> entry : entriesOfEveryAccount(natGateways)) {
+            String region = regionOfKey(entry.key());
+            if (region != null && entry.value().getNatGatewayAddresses() != null) {
+                entry.value().getNatGatewayAddresses().forEach(address ->
+                        indexRegion(index, entry.accountId(), address.getNetworkInterfaceId(), region));
+            }
+        }
+        // Peering records are keyed by bare id: each side's account sees its own tags in its own region.
+        for (AccountAwareStorageBackend.AccountEntry<TransitGatewayPeeringAttachment> entry
+                : entriesOfEveryAccount(transitGatewayPeeringAttachments)) {
+            String id = entry.value().getTransitGatewayAttachmentId();
+            for (TransitGatewayPeeringAttachment.TgwInfo side
+                    : List.of(entry.value().getRequesterTgwInfo(), entry.value().getAccepterTgwInfo())) {
+                if (side != null) {
+                    indexRegion(index, entry.accountId() == null ? null : side.getOwnerId(), id, side.getRegion());
+                }
+            }
+        }
+        for (AccountAwareStorageBackend.AccountEntry<VpcPeeringConnection> entry : entriesOfEveryAccount(vpcPeeringConnections)) {
+            String id = entry.value().getVpcPeeringConnectionId();
+            for (VpcPeeringConnectionVpcInfo side
+                    : List.of(entry.value().getRequesterVpcInfo(), entry.value().getAccepterVpcInfo())) {
+                if (side != null) {
+                    indexRegion(index, entry.accountId() == null ? null : side.getOwnerId(), id, side.getRegion());
+                }
+            }
+        }
+        return index;
+    }
+
+    private static <T> void indexRegionalKeys(Map<String, Map<String, Set<String>>> index, StorageBackend<String, T> store) {
+        for (AccountAwareStorageBackend.AccountEntry<T> entry : entriesOfEveryAccount(store)) {
+            String region = regionOfKey(entry.key());
+            if (region != null) {
+                indexRegion(index, entry.accountId(), entry.key().substring(region.length() + 2), region);
+            }
+        }
+    }
+
+    private static void indexRegion(Map<String, Map<String, Set<String>>> index, String accountId, String resourceId,
+                                    String region) {
+        if (resourceId != null && region != null) {
+            index.computeIfAbsent(ownerKey(accountId), ignored -> new HashMap<>())
+                    .computeIfAbsent(resourceId, ignored -> new LinkedHashSet<>())
+                    .add(region);
+        }
+    }
+
+    private static String regionOfKey(String storeKey) {
+        int separator = storeKey.indexOf("::");
+        return separator > 0 ? storeKey.substring(0, separator) : null;
+    }
+
+    private static String ownerKey(String accountId) {
+        return accountId == null ? "" : accountId;
+    }
+
+    private static <T> Optional<T> getForOwner(StorageBackend<String, T> store, AccountAwareStorageBackend.AccountEntry<T> entry) {
+        if (store instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<T> accountAware = (AccountAwareStorageBackend<T>) rawAccountAware;
+            return accountAware.getForAccount(entry.accountId(), entry.key());
+        }
+        return store.get(entry.key());
+    }
+
+    private static <T> void deleteForOwner(StorageBackend<String, T> store, AccountAwareStorageBackend.AccountEntry<T> entry) {
+        if (store instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            rawAccountAware.deleteForAccount(entry.accountId(), entry.key());
+            return;
+        }
+        store.delete(entry.key());
     }
 
     private static <T> void putForOwner(StorageBackend<String, T> store,
@@ -1531,7 +1673,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         list.getEntriesByVersion().put("1", new ArrayList<>(initial));
         if (prefixListTags != null && !prefixListTags.isEmpty()) {
             list.setTags(new ArrayList<>(prefixListTags));
-            tags.put(prefixListId, new ArrayList<>(prefixListTags));
+            putTags(region, prefixListId, new ArrayList<>(prefixListTags));
         }
         managedPrefixLists.put(key(region, prefixListId), list);
         return list;
@@ -1633,7 +1775,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             ManagedPrefixList list = getRequiredManagedPrefixList(region, prefixListId);
             requireCustomerManaged(list, "deleted");
             managedPrefixLists.delete(key(region, prefixListId));
-            tags.delete(prefixListId);
+            removeTags(region, prefixListId);
             reconcileFirewallPolicies(region);
             // AWS reports delete-complete on the returned object even though it is now gone.
             list.setState("delete-complete");
@@ -1847,7 +1989,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         if (gatewayTags != null && !gatewayTags.isEmpty()) {
             gateway.setTags(new ArrayList<>(gatewayTags));
-            tags.put(transitGatewayId, new ArrayList<>(gatewayTags));
+            putTags(region, transitGatewayId, new ArrayList<>(gatewayTags));
         }
         transitGateways.put(key(region, transitGatewayId), gateway);
         return gateway;
@@ -2184,10 +2326,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         routesOf(region, routeTableId).forEach(route -> transitGatewayRoutes
                                 .delete(routeKey(region, routeTableId, route.getDestinationCidrBlock())));
                         transitGatewayRouteTables.delete(key(region, routeTableId));
-                        tags.delete(routeTableId);
+                        removeTags(region, routeTableId);
                     });
             transitGateways.delete(key(region, transitGatewayId));
-            tags.delete(transitGatewayId);
+            removeTags(region, transitGatewayId);
             gateway.setState("deleted");
             return gateway;
         }
@@ -2278,7 +2420,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (attachmentTags != null && !attachmentTags.isEmpty()) {
             attachment.setTags(new ArrayList<>(attachmentTags));
-            tags.put(attachmentId, new ArrayList<>(attachmentTags));
+            putTags(region, attachmentId, new ArrayList<>(attachmentTags));
         }
         transitGatewayVpcAttachments.put(key(region, attachmentId), attachment);
         return attachment;
@@ -2440,7 +2582,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                 route.getDestinationCidrBlock()), route);
                     });
             transitGatewayVpcAttachments.delete(key(region, attachmentId));
-            tags.delete(attachmentId);
+            removeTags(region, attachmentId);
             attachment.setState("deleted");
             return attachment;
         }
@@ -2490,9 +2632,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             attachment.setCreationTime(ISO_FMT.format(Instant.now()));
             transitGatewayPeeringAttachments.put(attachmentId, attachment);
             if (attachmentTags != null && !attachmentTags.isEmpty()) {
-                tags.put(attachmentId, new ArrayList<>(attachmentTags));
+                putTags(region, attachmentId, new ArrayList<>(attachmentTags));
             }
-            return withStoredTags(attachment);
+            return withStoredTags(attachment, region);
         }
     }
 
@@ -2502,7 +2644,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String account = callerAccountId();
         List<TransitGatewayPeeringAttachment> visible = allPeeringAttachments().stream()
                 .filter(attachment -> isPartyTo(attachment, account, region))
-                .map(this::withStoredTags)
+                .map(attachment -> withStoredTags(attachment, region))
                 .toList();
         for (String attachmentId : attachmentIds) {
             if (visible.stream().noneMatch(a -> a.getTransitGatewayAttachmentId().equals(attachmentId))) {
@@ -2538,7 +2680,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             getRequiredTransitGateway(region, attachment.getAccepterTgwInfo().getTransitGatewayId());
             attachment.setState("available");
             savePeeringAttachment(owned);
-            return withStoredTags(attachment);
+            return withStoredTags(attachment, region);
         }
         }
     }
@@ -2568,18 +2710,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public TransitGatewayPeeringAttachment deleteTransitGatewayPeeringAttachment(String region, String attachmentId) {
         synchronized (lockFor(attachmentId)) {
             OwnedPeeringAttachment owned = getRequiredPeeringAttachment(region, attachmentId);
-            TransitGatewayPeeringAttachment attachment = withStoredTags(owned.attachment());
+            TransitGatewayPeeringAttachment attachment = withStoredTags(owned.attachment(), region);
             if (owned.storageAccountId() != null) {
                 peeringAttachmentsByAccount().deleteForAccount(owned.storageAccountId(), attachmentId);
             } else {
                 transitGatewayPeeringAttachments.delete(attachmentId);
             }
-            // Tags are per account, so each side keeps its own; both go with the attachment.
+            // Tags are per account and per region, so each side keeps its own; both go with the attachment.
+            TransitGatewayPeeringAttachment.TgwInfo requester = attachment.getRequesterTgwInfo();
+            TransitGatewayPeeringAttachment.TgwInfo accepter = attachment.getAccepterTgwInfo();
             if (tags instanceof AccountAwareStorageBackend<?> tagsByAccount) {
-                tagsByAccount.deleteForAccount(attachment.getRequesterTgwInfo().getOwnerId(), attachmentId);
-                tagsByAccount.deleteForAccount(attachment.getAccepterTgwInfo().getOwnerId(), attachmentId);
+                tagsByAccount.deleteForAccount(requester.getOwnerId(), key(requester.getRegion(), attachmentId));
+                tagsByAccount.deleteForAccount(accepter.getOwnerId(), key(accepter.getRegion(), attachmentId));
             } else {
-                tags.delete(attachmentId);
+                removeTags(requester.getRegion(), attachmentId);
+                removeTags(accepter.getRegion(), attachmentId);
             }
             attachment.setState("deleted");
             return attachment;
@@ -2652,8 +2797,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 ? attachment.getAccepterTgwInfo() : attachment.getRequesterTgwInfo();
     }
 
-    private TransitGatewayPeeringAttachment withStoredTags(TransitGatewayPeeringAttachment attachment) {
-        attachment.setTags(new ArrayList<>(tags.get(attachment.getTransitGatewayAttachmentId()).orElse(List.of())));
+    private TransitGatewayPeeringAttachment withStoredTags(TransitGatewayPeeringAttachment attachment, String region) {
+        attachment.setTags(new ArrayList<>(tagsOf(region, attachment.getTransitGatewayAttachmentId()).orElse(List.of())));
         return attachment;
     }
 
@@ -2696,7 +2841,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             routeTable.setRegion(region);
             if (routeTableTags != null && !routeTableTags.isEmpty()) {
                 routeTable.setTags(new ArrayList<>(routeTableTags));
-                tags.put(routeTableId, new ArrayList<>(routeTableTags));
+                putTags(region, routeTableId, new ArrayList<>(routeTableTags));
             }
             transitGatewayRouteTables.put(key(region, routeTableId), routeTable);
             return routeTable;
@@ -2747,7 +2892,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             routesOf(region, routeTableId).forEach(route -> transitGatewayRoutes
                     .delete(routeKey(region, routeTableId, route.getDestinationCidrBlock())));
             transitGatewayRouteTables.delete(key(region, routeTableId));
-            tags.delete(routeTableId);
+            removeTags(region, routeTableId);
             routeTable.setState("deleted");
             return routeTable;
         }
@@ -3530,7 +3675,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                 acquiredCpuCredits(effectiveInstanceType, creditSpecificationCpuCredits));
                         if (instanceTags != null && !instanceTags.isEmpty()) {
                             inst.setTags(new ArrayList<>(instanceTags));
-                            tags.put(instanceId, new ArrayList<>(instanceTags));
+                            putTags(region, instanceId, new ArrayList<>(instanceTags));
                         }
 
                         // Network interface, either the caller-supplied standalone ENI (override-default-eni,
@@ -4062,6 +4207,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             volumeBlockDeviceManager.deleteVolume(inst.getRootVolumeId());
                         }
                         volumes.delete(key(region, inst.getRootVolumeId()));
+                        removeTags(region, inst.getRootVolumeId());
                     }
                 }
             }
@@ -4229,6 +4375,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     && inst.getTerminatedAt() > 0
                     && inst.getTerminatedAt() < cutoff) {
                 instances.delete(storeKey);
+                if (inst.getRegion() != null) {
+                    removeTags(inst.getRegion(), inst.getInstanceId());
+                }
             }
         }
     }
@@ -4601,15 +4750,45 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         + "Valid values are: standard, unlimited.", 400);
     }
 
-    private List<Tag> getTagsForAccount(String accountId, String resourceId, List<Tag> fallback) {
+    private List<Tag> getTagsForAccount(String accountId, String region, String resourceId, List<Tag> fallback) {
         String safeAccount = accountId != null ? accountId : callerAccountId();
-        Optional<List<Tag>> stored = tags instanceof AccountAwareStorageBackend<List<Tag>> aware
-                ? aware.getForAccount(safeAccount, resourceId)
-                : tags.get(resourceId);
-        return stored.orElse(fallback);
+        Optional<List<Tag>> regional = tagsOf(safeAccount, region, resourceId);
+        if (regional.isPresent()) {
+            return regional.get();
+        }
+        return claimLegacyInstanceTags(safeAccount, region, resourceId).orElse(fallback);
     }
 
-    private Instance copyExternalInstance(String accountId, Instance source) {
+    /**
+     * Moves an external instance's tags, stored by bare id before tags were regional and kept by
+     * {@link #migrateTagsToRegionKeys}, under the region the instance is now found in. With no
+     * region to file them under, the tags are read in place and left for a regional lookup.
+     */
+    private Optional<List<Tag>> claimLegacyInstanceTags(String accountId, String region, String instanceId) {
+        if (region == null || region.isBlank()) {
+            return tags instanceof AccountAwareStorageBackend<List<Tag>> aware
+                    ? aware.getForAccount(accountId, instanceId)
+                    : tags.get(instanceId);
+        }
+        synchronized (lockFor(key(region, instanceId))) {
+            if (tags instanceof AccountAwareStorageBackend<List<Tag>> aware) {
+                Optional<List<Tag>> legacy = aware.getForAccount(accountId, instanceId);
+                legacy.ifPresent(value -> {
+                    aware.putForAccount(accountId, key(region, instanceId), value);
+                    aware.deleteForAccount(accountId, instanceId);
+                });
+                return legacy;
+            }
+            Optional<List<Tag>> legacy = tags.get(instanceId);
+            legacy.ifPresent(value -> {
+                tags.put(key(region, instanceId), value);
+                tags.delete(instanceId);
+            });
+            return legacy;
+        }
+    }
+
+    private Instance copyExternalInstance(String accountId, String region, Instance source) {
         if (source == null) {
             return null;
         }
@@ -4659,7 +4838,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (source.getNetworkInterfaces() != null) {
             copy.setNetworkInterfaces(new ArrayList<>(source.getNetworkInterfaces()));
         }
-        List<Tag> effectiveTags = getTagsForAccount(accountId, source.getInstanceId(), source.getTags());
+        String tagRegion = region != null && !region.isBlank() ? region : source.getRegion();
+        List<Tag> effectiveTags = getTagsForAccount(accountId, tagRegion, source.getInstanceId(), source.getTags());
         copy.setTags(effectiveTags != null ? new ArrayList<>(effectiveTags) : new ArrayList<>());
         return copy;
     }
@@ -4667,7 +4847,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private Optional<Instance> findExternalInstance(String accountId, String region, String instanceId) {
         if (testClusterNodeInstanceProvider != null) {
             return testClusterNodeInstanceProvider.findInstance(accountId, region, instanceId)
-                    .map(inst -> copyExternalInstance(accountId, inst));
+                    .map(inst -> copyExternalInstance(accountId, region, inst));
         }
         if (clusterNodeInstanceProviders == null || clusterNodeInstanceProviders.isUnsatisfied()) {
             return Optional.empty();
@@ -4675,7 +4855,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (ClusterNodeInstanceProvider provider : clusterNodeInstanceProviders) {
             Optional<Instance> inst = provider.findInstance(accountId, region, instanceId);
             if (inst.isPresent()) {
-                return inst.map(i -> copyExternalInstance(accountId, i));
+                return inst.map(i -> copyExternalInstance(accountId, region, i));
             }
         }
         return Optional.empty();
@@ -4684,7 +4864,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private List<Instance> listExternalInstances(String accountId, String region) {
         if (testClusterNodeInstanceProvider != null) {
             return testClusterNodeInstanceProvider.listInstances(accountId, region).stream()
-                    .map(inst -> copyExternalInstance(accountId, inst))
+                    .map(inst -> copyExternalInstance(accountId, region, inst))
                     .toList();
         }
         if (clusterNodeInstanceProviders == null || clusterNodeInstanceProviders.isUnsatisfied()) {
@@ -4695,7 +4875,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             List<Instance> list = provider.listInstances(accountId, region);
             if (list != null && !list.isEmpty()) {
                 for (Instance inst : list) {
-                    result.add(copyExternalInstance(accountId, inst));
+                    result.add(copyExternalInstance(accountId, region, inst));
                 }
             }
         }
@@ -4835,7 +5015,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             eigw.setCreationTags(new ArrayList<>(tagList));
             eigw.setTags(new ArrayList<>(tagList));
             if (!tagList.isEmpty()) {
-                tags.put(eigw.getEgressOnlyInternetGatewayId(), new ArrayList<>(tagList));
+                putTags(region, eigw.getEgressOnlyInternetGatewayId(), new ArrayList<>(tagList));
             }
             egressOnlyInternetGateways.put(key(region, eigw.getEgressOnlyInternetGatewayId()), eigw);
             return eigw;
@@ -4894,7 +5074,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "The eigw ID '" + eigwId + "' does not exist", 400);
             }
             egressOnlyInternetGateways.delete(key(region, eigwId));
-            tags.delete(eigwId);
+            removeTags(region, eigwId);
         }
         for (RouteTable table : routeTables.scan(k -> k.startsWith(region + "::"))) {
             if (table.getRoutes().stream().noneMatch(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))) {
@@ -4934,7 +5114,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             requireNoVpcDependents(region, vpcId);
             deleteVpcDefaultResources(region, vpcId);
             vpcs.delete(key(region, vpcId));
-            tags.delete(vpcId);
+            removeTags(region, vpcId);
         }
         if (vpcNetworkManager != null) {
             vpcNetworkManager.deleteVpcNetwork(region, vpcId);
@@ -5025,10 +5205,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .toList();
                 ruleIds.forEach(ruleId -> {
                     securityGroupRules.delete(key(region, ruleId));
-                    tags.delete(ruleId);
+                    removeTags(region, ruleId);
                 });
                 securityGroups.delete(key(region, group.getGroupId()));
-                tags.delete(group.getGroupId());
+                removeTags(region, group.getGroupId());
             }
         }
 
@@ -5041,7 +5221,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .toList();
         mainRouteTableIds.forEach(routeTableId -> {
             routeTables.delete(key(region, routeTableId));
-            tags.delete(routeTableId);
+            removeTags(region, routeTableId);
         });
 
         List<String> defaultNetworkAclIds = networkAcls.scan(k -> k.startsWith(region + "::")).stream()
@@ -5052,7 +5232,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .toList();
         defaultNetworkAclIds.forEach(aclId -> {
             networkAcls.delete(key(region, aclId));
-            tags.delete(aclId);
+            removeTags(region, aclId);
         });
     }
 
@@ -5289,7 +5469,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         endpoint.setPolicyDocument(policyDocument);
         if (endpointTags != null && !endpointTags.isEmpty()) {
             endpoint.setTags(new ArrayList<>(endpointTags));
-            tags.put(endpoint.getVpcEndpointId(), new ArrayList<>(endpointTags));
+            putTags(region, endpoint.getVpcEndpointId(), new ArrayList<>(endpointTags));
         }
         synchronized (attachmentTopologyLock(region)) {
             getRequiredVpc(region, vpcId);
@@ -5498,7 +5678,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             VpcEndpoint endpoint = getRequiredVpcEndpoint(region, endpointId);
             endpoint.setState("deleted");
             vpcEndpoints.delete(key(region, endpointId));
-            tags.delete(endpointId);
+            removeTags(region, endpointId);
             deleted.add(endpoint);
         }
         return deleted;
@@ -7345,6 +7525,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 continue;
             }
             snapshots.delete(key(region, snapshotId));
+            removeTags(region, snapshotId);
             results.add(new SnapshotDeletion(snapshotId, "success"));
         }
         return results;
@@ -7491,7 +7672,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         launchTemplate.setData(new LaunchTemplateData(data != null ? data : new LaunchTemplateData()));
         if (launchTemplateTags != null && !launchTemplateTags.isEmpty()) {
             launchTemplate.setTags(new ArrayList<>(launchTemplateTags));
-            tags.put(launchTemplate.getLaunchTemplateId(), new ArrayList<>(launchTemplateTags));
+            putTags(region, launchTemplate.getLaunchTemplateId(), new ArrayList<>(launchTemplateTags));
         }
         launchTemplate.getVersions().put("1", new LaunchTemplateData(launchTemplate.getData()));
         if (versionDescription != null && !versionDescription.isBlank()) {
@@ -7809,7 +7990,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         LaunchTemplate launchTemplate = findLaunchTemplate(region, id, name);
         launchTemplates.delete(key(region, launchTemplate.getLaunchTemplateId()));
-        tags.delete(launchTemplate.getLaunchTemplateId());
+        removeTags(region, launchTemplate.getLaunchTemplateId());
         return launchTemplate;
     }
 
@@ -8029,7 +8210,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private Image withCurrentImageTags(Image image) {
-        List<Tag> currentTags = tags.get(image.getImageId())
+        List<Tag> currentTags = tagsOf(image.getRegion(), image.getImageId())
                 .orElseGet(() -> image.getTags() == null ? List.of() : image.getTags());
         image.setTags(new ArrayList<>(currentTags));
         // Persistent backends may return detached values from scan(), so do not rely on
@@ -8152,7 +8333,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String resourceId : resourceIds) {
             withTopologyLockIfNeeded(region, resourceId, () -> {
                 synchronized (lockFor(key(region, resourceId))) {
-                    List<Tag> existing = new ArrayList<>(tags.get(resourceId).orElseGet(() -> {
+                    List<Tag> existing = new ArrayList<>(tagsOf(region, resourceId).orElseGet(() -> {
                         Instance ext = findExternalInstance(callerAccountId(), region, resourceId).orElse(null);
                         return ext != null && ext.getTags() != null ? ext.getTags() : List.of();
                     }));
@@ -8160,7 +8341,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         existing.removeIf(t -> t.getKey().equals(tag.getKey()));
                         existing.add(tag);
                     }
-                    tags.put(resourceId, existing);
+                    putTags(region, resourceId, existing);
                     // Update resource objects
                     updateResourceTags(region, resourceId, existing);
                 }
@@ -8190,7 +8371,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String resourceId : resourceIds) {
             withTopologyLockIfNeeded(region, resourceId, () -> {
             synchronized (lockFor(key(region, resourceId))) {
-                List<Tag> stored = tags.get(resourceId).orElseGet(() -> {
+                List<Tag> stored = tagsOf(region, resourceId).orElseGet(() -> {
                     Instance ext = findExternalInstance(callerAccountId(), region, resourceId).orElse(null);
                     return ext != null && ext.getTags() != null ? ext.getTags() : null;
                 });
@@ -8203,7 +8384,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         existing.removeIf(t -> t.getKey().equals(tag.getKey())
                                 && (tag.getValue() == null || tag.getValue().equals(t.getValue())));
                     }
-                    tags.put(resourceId, existing);
+                    putTags(region, resourceId, existing);
                     updateResourceTags(region, resourceId, existing);
                 }
             }
@@ -8276,6 +8457,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             managedPrefixLists.put(storeKey, prefixList);
             return;
         }
+        Volume volume = volumes.get(storeKey).orElse(null);
+        if (volume != null) {
+            volume.setTags(new ArrayList<>(tagList));
+            volumes.put(storeKey, volume);
+            return;
+        }
+        Snapshot snapshot = snapshots.get(storeKey).orElse(null);
+        if (snapshot != null) {
+            snapshot.setTags(new ArrayList<>(tagList));
+            snapshots.put(storeKey, snapshot);
+            return;
+        }
+        SpotInstanceRequest spotRequest = spotInstanceRequests.get(storeKey).orElse(null);
+        if (spotRequest != null) {
+            spotRequest.setTags(new ArrayList<>(tagList));
+            spotInstanceRequests.put(storeKey, spotRequest);
+            return;
+        }
         // Reached with the topology lock already held for tgw- resources, so the read-modify-write
         // below cannot put back something a concurrent delete has just removed.
         {
@@ -8299,9 +8498,30 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    /** The tags currently on one resource, as CreateTags and DeleteTags maintain them. */
-    public List<Tag> resourceTags(String resourceId) {
-        return List.copyOf(tags.get(resourceId).orElse(List.of()));
+    // Tags are regional, like the resources they label: one entry per region::id, so a tag set in
+    // one region is never listed, read or removed from another.
+
+    private Optional<List<Tag>> tagsOf(String region, String resourceId) {
+        return tags.get(key(region, resourceId));
+    }
+
+    private Optional<List<Tag>> tagsOf(String accountId, String region, String resourceId) {
+        return tags instanceof AccountAwareStorageBackend<List<Tag>> aware
+                ? aware.getForAccount(accountId, key(region, resourceId))
+                : tagsOf(region, resourceId);
+    }
+
+    private void putTags(String region, String resourceId, List<Tag> resourceTags) {
+        tags.put(key(region, resourceId), resourceTags);
+    }
+
+    private void removeTags(String region, String resourceId) {
+        tags.delete(key(region, resourceId));
+    }
+
+    /** The tags currently on one resource in {@code region}, as CreateTags and DeleteTags maintain them. */
+    public List<Tag> resourceTags(String region, String resourceId) {
+        return List.copyOf(tagsOf(region, resourceId).orElse(List.of()));
     }
 
     public List<Map<String, String>> describeTags(String region, Map<String, List<String>> filters) {
@@ -8313,7 +8533,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         List<Map<String, String>> result = new ArrayList<>();
         Set<String> processedResourceIds = new LinkedHashSet<>();
-        for (String resourceId : new ArrayList<>(tags.keys())) {
+        String regionPrefix = region + "::";
+        for (String tagKey : new ArrayList<>(tags.keys())) {
+            if (!tagKey.startsWith(regionPrefix)) {
+                continue;
+            }
+            String resourceId = tagKey.substring(regionPrefix.length());
             processedResourceIds.add(resourceId);
             String resourceType = inferResourceType(resourceId);
 
@@ -8323,7 +8548,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (filterResourceTypes != null && !filterResourceTypes.contains(resourceType)) {
                 continue;
             }
-            for (Tag tag : tags.get(resourceId).orElse(List.of())) {
+            for (Tag tag : tagsOf(region, resourceId).orElse(List.of())) {
                 if (filterKeys != null && !filterKeys.contains(tag.getKey())) {
                     continue;
                 }
@@ -8430,6 +8655,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (resourceId.startsWith("tgw-")) {
             return "transit-gateway";
+        }
+        if (resourceId.startsWith("ami-")) {
+            return "image";
+        }
+        if (resourceId.startsWith("vol-")) {
+            return "volume";
+        }
+        if (resourceId.startsWith("snap-")) {
+            return "snapshot";
+        }
+        if (resourceId.startsWith("acl-")) {
+            return "network-acl";
+        }
+        if (resourceId.startsWith("pcx-")) {
+            return "vpc-peering-connection";
+        }
+        if (resourceId.startsWith("sir-")) {
+            return "spot-instances-request";
         }
         return "unknown";
     }
@@ -9319,6 +9562,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 "Pending Acceptance by " + accepterOwnerId));
         if (peeringTags != null) {
             pcx.setTags(new ArrayList<>(peeringTags));
+            // Tags on create are tags like any other: DescribeTags lists them in this region.
+            putTags(region, pcxId, new ArrayList<>(peeringTags));
         }
 
         vpcPeeringConnections.put(pcxId, pcx);
@@ -9431,8 +9676,33 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(pcx -> visibleToAccount(pcx, caller))
                 .filter(pcx -> visibleFromRegion(pcx, region))
                 .filter(pcx -> ids.isEmpty() || ids.contains(pcx.getVpcPeeringConnectionId()))
+                .map(pcx -> withStoredTags(pcx, caller, region))
                 .filter(pcx -> matchesFilters(pcx, filters, region))
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * A peering connection's tags as the caller sees them from {@code region}: each side tags it in
+     * its own account and region. A connection recorded before its create-time tags reached the tag
+     * store keeps showing those to its requester.
+     */
+    private VpcPeeringConnection withStoredTags(VpcPeeringConnection pcx, String caller, String region) {
+        String id = pcx.getVpcPeeringConnectionId();
+        VpcPeeringConnectionVpcInfo requester = pcx.getRequesterVpcInfo();
+        boolean requesterSide = requester != null && caller.equals(requester.getOwnerId())
+                && region.equals(requester.getRegion());
+        List<Tag> fallback = requesterSide && pcx.getTags() != null ? pcx.getTags() : List.of();
+        // A copy, so one side's view never reaches the stored connection the other side reads.
+        VpcPeeringConnection view = new VpcPeeringConnection();
+        view.setVpcPeeringConnectionId(id);
+        view.setRegion(pcx.getRegion());
+        view.setRequesterVpcInfo(requester);
+        view.setAccepterVpcInfo(pcx.getAccepterVpcInfo());
+        view.setStatus(pcx.getStatus());
+        view.setAccepterAllowRemoteVpcDnsResolution(pcx.isAccepterAllowRemoteVpcDnsResolution());
+        view.setRequesterAllowRemoteVpcDnsResolution(pcx.isRequesterAllowRemoteVpcDnsResolution());
+        view.setTags(new ArrayList<>(tagsOf(region, id).orElse(fallback)));
+        return view;
     }
 
     public VpcPeeringConnection acceptVpcPeeringConnection(String region, String vpcPeeringConnectionId) {
@@ -9556,6 +9826,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void deleteVpcPeeringConnection(OwnedVpcPeeringConnection owned) {
+        removePeeringConnectionTags(owned.pcx());
         if (owned.storageAccountId() != null
                 && vpcPeeringConnections instanceof AccountAwareStorageBackend<?> rawAccountAware) {
             @SuppressWarnings("unchecked")
@@ -9565,6 +9836,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return;
         }
         vpcPeeringConnections.delete(owned.pcx().getVpcPeeringConnectionId());
+    }
+
+    /** Each side tags a peering connection in its own account and region; both go with it. */
+    private void removePeeringConnectionTags(VpcPeeringConnection pcx) {
+        String id = pcx.getVpcPeeringConnectionId();
+        for (VpcPeeringConnectionVpcInfo side : List.of(pcx.getRequesterVpcInfo(), pcx.getAccepterVpcInfo())) {
+            if (side == null || side.getRegion() == null) {
+                continue;
+            }
+            if (tags instanceof AccountAwareStorageBackend<?> tagsByAccount && side.getOwnerId() != null) {
+                tagsByAccount.deleteForAccount(side.getOwnerId(), key(side.getRegion(), id));
+            } else {
+                removeTags(side.getRegion(), id);
+            }
+        }
     }
 
     private static AwsException vpcPeeringConnectionNotFound(String vpcPeeringConnectionId) {
@@ -9654,7 +9940,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             if (natGatewayTags != null && !natGatewayTags.isEmpty()) {
                 natGateway.setTags(new ArrayList<>(natGatewayTags));
-                tags.put(natGateway.getNatGatewayId(), new ArrayList<>(natGatewayTags));
+                putTags(region, natGateway.getNatGatewayId(), new ArrayList<>(natGatewayTags));
             }
             natGateways.put(key(region, natGateway.getNatGatewayId()), natGateway);
         }
@@ -9767,8 +10053,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         });
             }
             natGateways.delete(key(region, natGatewayId));
-            tags.delete(natGatewayId);
-            natGateway.getNatGatewayAddresses().forEach(a -> tags.delete(a.getNetworkInterfaceId()));
+            removeTags(region, natGatewayId);
+            natGateway.getNatGatewayAddresses().forEach(a -> removeTags(region, a.getNetworkInterfaceId()));
         }
         return natGateway;
     }
@@ -10710,7 +10996,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vol.setCreateTime(Instant.now());
         vol.setState("available");
         vol.setRegion(region);
-        if (volumeTags != null) vol.setTags(new ArrayList<>(volumeTags));
+        if (volumeTags != null) {
+            vol.setTags(new ArrayList<>(volumeTags));
+            // Tags on create are tags like any other: DescribeTags lists them in this region.
+            putTags(region, vol.getVolumeId(), new ArrayList<>(volumeTags));
+        }
         volumes.put(key(region, volumeId), vol);
         if (volumeBlockDeviceManager != null) {
             volumeBlockDeviceManager.createVolume(volumeId, vol.getSize());
@@ -10755,6 +11045,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
             volumes.delete(key(region, volumeId));
+            removeTags(region, volumeId);
         });
     }
 
@@ -11195,9 +11486,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 // resource. Read the interface's own entry in the tag store instead:
                 // CreateTags on the eni- id writes it, and so does a RunInstances
                 // TagSpecification with ResourceType=network-interface.
-                Optional<List<Tag>> tagList = tags instanceof AccountAwareStorageBackend<List<Tag>> aware
-                        ? aware.getForAccount(safeAccount, eni.getNetworkInterfaceId())
-                        : tags.get(eni.getNetworkInterfaceId());
+                Optional<List<Tag>> tagList = tagsOf(safeAccount, region, eni.getNetworkInterfaceId());
                 ni.getTagSet().addAll(tagList.orElse(List.of()));
 
                 NetworkInterfaceAttachment att = new NetworkInterfaceAttachment();
@@ -11322,8 +11611,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     continue;
                 }
                 foundIds.add(natEniId);
-                natNi.getTagSet().addAll((tags instanceof AccountAwareStorageBackend<List<Tag>> aware
-                        ? aware.getForAccount(safeAccount, natEniId) : tags.get(natEniId)).orElse(List.of()));
+                natNi.getTagSet().addAll(tagsOf(safeAccount, region, natEniId).orElse(List.of()));
                 if (!matchesFilters(natNi, filters, region)) {
                     continue;
                 }
@@ -11636,6 +11924,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             volumeBlockDeviceManager.deleteVolume(vol.getVolumeId());
                         }
                         volumes.delete(k);
+                        removeTags(region, vol.getVolumeId());
                         modified = false;
                         break;
                     } else {
@@ -11810,7 +12099,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
             if (spotRequestTags != null && !spotRequestTags.isEmpty()) {
                 sir.setTags(new ArrayList<>(spotRequestTags));
-                tags.put(spotRequestId, new ArrayList<>(spotRequestTags));
+                putTags(region, spotRequestId, new ArrayList<>(spotRequestTags));
             }
 
             spotInstanceRequests.put(key(region, spotRequestId), sir);
