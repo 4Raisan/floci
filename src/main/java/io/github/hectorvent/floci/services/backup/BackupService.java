@@ -91,6 +91,43 @@ public class BackupService {
     public BackupVault createBackupVault(String vaultName, String encryptionKeyArn,
                                          String creatorRequestId, Map<String, String> tags,
                                          String region) {
+        return createVault(new BackupVault(), vaultName, encryptionKeyArn, creatorRequestId, tags, region);
+    }
+
+    /**
+     * CreateLogicallyAirGappedBackupVault. Both retention values are "Required: Yes" in the
+     * reference, and MinRetentionDays carries "The minimum value accepted is 7 days." The vault
+     * shares the standard vault namespace and ARN shape, so DescribeBackupVault, DeleteBackupVault
+     * and the tag operations reach it unchanged; what distinguishes it is VaultType, which the
+     * Terraform provider checks on every read. Creation is synchronous here, so the vault is
+     * AVAILABLE at once rather than passing through CREATING.
+     */
+    public BackupVault createLogicallyAirGappedBackupVault(String vaultName, String encryptionKeyArn,
+                                                           String creatorRequestId, Map<String, String> tags,
+                                                           Long minRetentionDays, Long maxRetentionDays,
+                                                           String region) {
+        if (minRetentionDays == null) {
+            throw new AwsException("MissingParameterValueException", "MinRetentionDays is required", 400);
+        }
+        if (maxRetentionDays == null) {
+            throw new AwsException("MissingParameterValueException", "MaxRetentionDays is required", 400);
+        }
+        requireDayRange("MinRetentionDays", minRetentionDays, 7, null);
+        requireDayRange("MaxRetentionDays", maxRetentionDays, minRetentionDays, null);
+        BackupVault vault = new BackupVault();
+        vault.setVaultType("LOGICALLY_AIR_GAPPED_BACKUP_VAULT");
+        vault.setVaultState("AVAILABLE");
+        // Retention is mandatory and fixed at creation, so the existing locked-vault enforcement
+        // (backup-job lifecycle window, recovery-point deletion floor) applies to it as well.
+        // createVault sets LockDate to the creation date: a compliance lock, never changeable.
+        vault.setLocked(true);
+        vault.setMinRetentionDays(minRetentionDays);
+        vault.setMaxRetentionDays(maxRetentionDays);
+        return createVault(vault, vaultName, encryptionKeyArn, creatorRequestId, tags, region);
+    }
+
+    private BackupVault createVault(BackupVault vault, String vaultName, String encryptionKeyArn,
+                                    String creatorRequestId, Map<String, String> tags, String region) {
         String key = vaultKey(region, vaultName);
         // Check and write under one monitor. Unsynchronised, two creates of the same name can
         // both find the name free and both write, so AlreadyExistsException never fires and the
@@ -108,11 +145,17 @@ public class BackupService {
             if (vaultStore.get(key).isPresent()) {
                 throw new AwsException("AlreadyExistsException", "Backup vault already exists: " + vaultName, 400);
             }
-            BackupVault vault = new BackupVault();
             vault.setBackupVaultName(vaultName);
             vault.setBackupVaultArn(regionResolver.buildArn("backup", region, "backup-vault:" + vaultName));
             vault.setEncryptionKeyArn(encryptionKeyArn);
-            vault.setCreationDate(Instant.now().getEpochSecond());
+            long now = Instant.now().getEpochSecond();
+            vault.setCreationDate(now);
+            // Only an air-gapped vault arrives here locked. AWS creates it with a compliance-mode
+            // lock whose LockDate is the creation date, so the lock is immutable from the start;
+            // a null LockDate would read as a governance lock that can still change.
+            if (vault.isLocked()) {
+                vault.setLockDate(now);
+            }
             vault.setVaultId(UUID.randomUUID().toString());
             vault.setCreatorRequestId(creatorRequestId);
             vault.setNumberOfRecoveryPoints(0);
@@ -164,9 +207,21 @@ public class BackupService {
         vaultStore.delete(vaultKey(region, vaultName));
     }
 
-    public List<BackupVault> listBackupVaults(String region) {
+    public List<BackupVault> listBackupVaults(String region, String byVaultType) {
         String prefix = region + ":";
-        return vaultStore.scan(k -> k.startsWith(prefix));
+        // A standard vault leaves VaultType unset; AWS reports it as BACKUP_VAULT.
+        return vaultStore.scan(k -> k.startsWith(prefix)).stream()
+                .filter(v -> byVaultType == null || byVaultType.equals(
+                        v.getVaultType() == null ? "BACKUP_VAULT" : v.getVaultType()))
+                .toList();
+    }
+
+    private static void requireNotAirGapped(BackupVault vault, String action) {
+        if (vault.getVaultType() != null) {
+            throw new AwsException("InvalidRequestException",
+                    "Backup vault lock configuration cannot be " + action
+                            + " on a logically air-gapped vault: " + vault.getBackupVaultName(), 400);
+        }
     }
 
     // ── Vault sub-resources: access policy, notifications, lock ────────────────
@@ -353,6 +408,7 @@ public class BackupService {
                                                        Long maxRetentionDays,
                                                        Long changeableForDays) {
         BackupVault vault = describeBackupVault(vaultName, region);
+        requireNotAirGapped(vault, "changed");
         if (vault.isLocked() && !lockIsStillChangeable(vault)) {
             throw new AwsException("InvalidRequestException",
                     "Backup vault lock is immutable and cannot be changed: " + vaultName, 400);
@@ -412,6 +468,7 @@ public class BackupService {
 
     public void deleteBackupVaultLockConfiguration(String vaultName, String region) {
         BackupVault vault = describeBackupVault(vaultName, region);
+        requireNotAirGapped(vault, "deleted");
         if (vault.isLocked() && !lockIsStillChangeable(vault)) {
             throw new AwsException("InvalidRequestException",
                     "Backup vault lock is immutable and cannot be deleted: " + vaultName, 400);
@@ -735,9 +792,31 @@ public class BackupService {
     }
 
     private void completeJob(String jobId, String vaultName, String region, String notificationKey) {
+        // Under the vault-name monitor, so the vault cannot be deleted or recreated between the
+        // incarnation check and the recovery point landing in it.
+        synchronized (lockFor(vaultKey(region, vaultName))) {
+            completeJobLocked(jobId, vaultName, region, notificationKey);
+        }
+    }
+
+    private void completeJobLocked(String jobId, String vaultName, String region, String notificationKey) {
         jobStore.get(jobId).ifPresent(job -> {
             if ("RUNNING".equals(job.getState())) {
                 long now = Instant.now().getEpochSecond();
+                // The recovery point belongs to the vault the job started in, not to whatever
+                // vault holds the name now. A vault deleted mid-job (allowed: it held no recovery
+                // point yet) and recreated unlocked would otherwise receive a recovery point its
+                // creator's lock was meant to protect, deletable inside that lock's retention.
+                boolean sameVault = vaultStore.get(vaultKey(region, vaultName))
+                        .map(v -> subResourceKey(region, v).equals(notificationKey))
+                        .orElse(false);
+                if (!sameVault) {
+                    job.setState("FAILED");
+                    job.setStatusMessage("Backup vault was deleted before the job completed: " + vaultName);
+                    job.setCompletionDate(now);
+                    jobStore.put(jobId, job);
+                    return;
+                }
                 String rpArn = regionResolver.buildArn("backup", region,
                         "recovery-point:" + UUID.randomUUID());
 
