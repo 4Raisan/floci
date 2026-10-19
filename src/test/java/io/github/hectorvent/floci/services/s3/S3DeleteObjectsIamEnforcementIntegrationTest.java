@@ -231,7 +231,7 @@ class S3DeleteObjectsIamEnforcementIntegrationTest {
     @Test
     void bypassingGovernanceRetentionNeedsTheBypassPermission() {
         String bucket = bucket("delobj-governance");
-        enableVersioning(bucket);
+        enableObjectLock(bucket);
         String versionId = putGovernanceRetained(bucket, "retained.txt");
         String plainVersionId = put(bucket, "plain.txt");
         String user = uniqueName("delobj-governance");
@@ -260,12 +260,17 @@ class S3DeleteObjectsIamEnforcementIntegrationTest {
     }
 
     // An object written before versioning was enabled is the null version, which an entry names as
-    // VersionId "null". Its retention protects it as any version's does, so the bypass needs the permission.
+    // VersionId "null". Retention set on it once the bucket has Object Lock protects it as any version's
+    // does, so the bypass needs the permission.
     @Test
     void bypassingGovernanceRetentionOnTheNullVersionNeedsTheBypassPermission() {
         String bucket = bucket("delobj-governance-null");
-        putGovernanceRetained(bucket, "retained.txt");
-        enableVersioning(bucket);
+        put(bucket, "retained.txt");
+        enableObjectLock(bucket);
+        given().header("Authorization", auth(ADMIN, "s3")).queryParam("versionId", "null")
+                .body("<Retention><Mode>GOVERNANCE</Mode>"
+                        + "<RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>")
+                .when().put("/" + bucket + "/retained.txt?retention").then().statusCode(200);
         String user = uniqueName("delobj-governance-null");
         String accessKeyId = createUser(user);
         String objects = "arn:aws:s3:::" + bucket + "/*";
@@ -289,7 +294,7 @@ class S3DeleteObjectsIamEnforcementIntegrationTest {
     @Test
     void aNullVersionEntryDoesNotInheritTheRetentionOfAVersionedObject() {
         String bucket = bucket("delobj-governance-no-null");
-        enableVersioning(bucket);
+        enableObjectLock(bucket);
         String versionId = putGovernanceRetained(bucket, "retained.txt");
         String user = uniqueName("delobj-governance-no-null");
         String accessKeyId = createUser(user);
@@ -453,6 +458,14 @@ class S3DeleteObjectsIamEnforcementIntegrationTest {
         given().header("Authorization", auth(ADMIN, "s3")).contentType("application/xml")
                 .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
                 .when().put("/" + bucket + "?versioning").then().statusCode(200);
+    }
+
+    /** Object Lock on an existing bucket, which needs versioning: "Object Lock works only with versioned buckets". */
+    private static void enableObjectLock(String bucket) {
+        enableVersioning(bucket);
+        given().header("Authorization", auth(ADMIN, "s3")).contentType("application/xml")
+                .body("<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>")
+                .when().put("/" + bucket + "?object-lock").then().statusCode(200);
     }
 
     private static void assertPresent(String bucket, String key) {

@@ -465,6 +465,130 @@ class S3ObjectLockIntegrationTest {
         }
     }
 
+    // --- Object Lock settings on a bucket without Object Lock ---
+
+    @Test
+    @Order(25)
+    void retentionAndLegalHoldAreRefusedOnABucketWithoutObjectLock() {
+        String retention = "<Retention><Mode>GOVERNANCE</Mode>"
+                + "<RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>";
+        for (String bucket : new String[] {PLAIN_BUCKET, NO_LOCK_BUCKET}) {
+            String path = "/" + bucket + "/unlockable.txt";
+            given().body("x").when().put(path).then().statusCode(200);
+
+            assertMissingObjectLockConfiguration(given().body(retention).when().put(path + "?retention"));
+            assertMissingObjectLockConfiguration(given().when().get(path + "?retention"));
+            assertMissingObjectLockConfiguration(given().body("<LegalHold><Status>ON</Status></LegalHold>")
+                    .when().put(path + "?legal-hold"));
+            assertMissingObjectLockConfiguration(given().when().get(path + "?legal-hold"));
+            // S3 was recorded answering a legal hold without a status as malformed first.
+            given()
+                .body("<LegalHold></LegalHold>")
+            .when()
+                .put(path + "?legal-hold")
+            .then()
+                .statusCode(400)
+                .body(containsString("<Code>MalformedXML</Code>"));
+        }
+    }
+
+    @Test
+    @Order(26)
+    void objectLockHeadersAreRefusedOnABucketWithoutObjectLock() {
+        given().body("source").when().put("/" + PLAIN_BUCKET + "/plain-source.txt").then().statusCode(200);
+        String copySource = "/" + PLAIN_BUCKET + "/plain-source.txt";
+        for (String operation : new String[] {"put", "copy", "upload"}) {
+            String path = "/" + PLAIN_BUCKET + "/refused-lock-" + operation + ".txt";
+            assertMissingObjectLockConfiguration(createObject(operation, path, copySource, given()
+                    .header("x-amz-object-lock-mode", "GOVERNANCE")
+                    .header("x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00Z")));
+            assertMissingObjectLockConfiguration(createObject(operation, path, copySource, given()
+                    .header("x-amz-object-lock-legal-hold", "ON")));
+            given().when().head(path).then().statusCode(404);
+            // A legal hold that is OFF sets no lock, so the object is created.
+            createObject(operation, path, copySource, given().header("x-amz-object-lock-legal-hold", "OFF"))
+                .then()
+                .statusCode(200);
+        }
+    }
+
+    @Test
+    @Order(27)
+    void aCopyOfALockedObjectIntoABucketWithoutObjectLockTakesNoLock() {
+        given()
+            .header("x-amz-copy-source", "/" + LOCK_BUCKET + "/copy-lock-target.txt")
+        .when()
+            .put("/" + PLAIN_BUCKET + "/copy-of-locked.txt")
+        .then()
+            .statusCode(200);
+
+        given().when().delete("/" + PLAIN_BUCKET + "/copy-of-locked.txt").then().statusCode(204);
+    }
+
+    @Test
+    @Order(28)
+    void readingARetentionOrLegalHoldTheObjectDoesNotHaveIsNoSuchObjectLockConfiguration() {
+        String bucket = "object-lock-without-rule";
+        given().header("x-amz-bucket-object-lock-enabled", "true").when().put("/" + bucket).then().statusCode(200);
+        String path = "/" + bucket + "/never-locked.txt";
+        given().body("x").when().put(path).then().statusCode(200);
+
+        for (String setting : new String[] {"?retention", "?legal-hold"}) {
+            given()
+            .when()
+                .get(path + setting)
+            .then()
+                .statusCode(404)
+                .body(containsString("<Code>NoSuchObjectLockConfiguration</Code>"))
+                .body(containsString("<Message>The specified object does not have a ObjectLock configuration</Message>"));
+        }
+    }
+
+    @Test
+    @Order(29)
+    void aRetentionMissingItsModeOrItsDateOrWithAnUnknownModeIsMalformedAndNotSaved() {
+        String bucket = "object-lock-incomplete-retention";
+        given().header("x-amz-bucket-object-lock-enabled", "true").when().put("/" + bucket).then().statusCode(200);
+        String path = "/" + bucket + "/incomplete.txt";
+        given().body("x").when().put(path).then().statusCode(200);
+
+        for (String retention : new String[] {
+                "<Mode>GOVERNANCE</Mode>",
+                "<RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate>",
+                "<Mode>BAD-VALUE</Mode><RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate>"}) {
+            given()
+                .body("<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" + retention + "</Retention>")
+            .when()
+                .put(path + "?retention")
+            .then()
+                .statusCode(400)
+                .body(containsString("<Code>MalformedXML</Code>"));
+        }
+        given()
+        .when()
+            .get(path + "?retention")
+        .then()
+            .statusCode(404)
+            .body(containsString("<Code>NoSuchObjectLockConfiguration</Code>"));
+    }
+
+    /** A PutObject, a CopyObject of {@code copySource} or a CreateMultipartUpload of {@code path}. */
+    private static Response createObject(String operation, String path, String copySource,
+                                         RequestSpecification request) {
+        return switch (operation) {
+            case "put" -> request.body("x").when().put(path);
+            case "copy" -> request.header("x-amz-copy-source", copySource).when().put(path);
+            default -> request.when().post(path + "?uploads");
+        };
+    }
+
+    private static void assertMissingObjectLockConfiguration(Response response) {
+        response.then()
+            .statusCode(400)
+            .body(containsString("<Code>InvalidRequest</Code>"))
+            .body(containsString("<Message>Bucket is missing Object Lock Configuration</Message>"));
+    }
+
     /** A PutObject, a CopyObject of {@code copySource} or a CreateMultipartUpload refused for its lock headers. */
     private static void assertInvalidLockHeaders(String operation, String copySource, String mode, String until,
                                                  String argumentName, String argumentValue, String message) {
@@ -476,12 +600,7 @@ class S3ObjectLockIntegrationTest {
             request = request.header("x-amz-object-lock-retain-until-date", until);
         }
         String path = "/" + LOCK_BUCKET + "/invalid-lock-" + operation + ".txt";
-        Response response = switch (operation) {
-            case "put" -> request.body("x").when().put(path);
-            case "copy" -> request.header("x-amz-copy-source", copySource).when().put(path);
-            default -> request.when().post(path + "?uploads");
-        };
-        ValidatableResponse then = response.then()
+        ValidatableResponse then = createObject(operation, path, copySource, request).then()
             .statusCode(400)
             .body(containsString("<Code>InvalidArgument</Code>"))
             .body(containsString(message))

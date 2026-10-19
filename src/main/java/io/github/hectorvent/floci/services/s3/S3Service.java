@@ -695,6 +695,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
         rejectUploadAclWhenOwnershipEnforced(checkedBucket.value(), checkedBucket.account(), effectiveOptions);
+        rejectObjectLockWithoutLockEnabled(checkedBucket.value(), effectiveOptions);
         rejectConflictingServerSideEncryption(
                 normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption()),
                 validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(),
@@ -877,6 +878,7 @@ public class S3Service implements Resettable, ResourceProvider {
             object.setSseCustomerKeyMd5(sseCustomerKey.keyMd5());
         }
         rejectUploadAclWhenOwnershipEnforced(bucket, bucketOwnerAccount, effectiveOptions);
+        rejectObjectLockWithoutLockEnabled(bucket, effectiveOptions);
         String objectAcl = resolveObjectAclXml(bucketOwnerAccount,
                 effectiveOptions.getAcl(), effectiveOptions.getGrantRead(),
                 effectiveOptions.getGrantWrite(), effectiveOptions.getGrantFullControl(),
@@ -4027,11 +4029,54 @@ public class S3Service implements Resettable, ResourceProvider {
         return bucket.getDefaultRetention();
     }
 
+    /**
+     * An object has Object Lock settings only in a bucket with Object Lock enabled. S3 was recorded
+     * refusing retention and legal hold on any other bucket with this error.
+     */
+    private static void requireObjectLockEnabled(Bucket bucket) {
+        if (!bucket.isObjectLockEnabled()) {
+            throw new AwsException("InvalidRequest", "Bucket is missing Object Lock Configuration", 400);
+        }
+    }
+
+    /**
+     * Refuses the Object Lock settings an object is created with in a bucket without Object Lock, as
+     * retention and legal hold are refused there: a mode, a retain-until date or a legal hold that is
+     * ON. A legal hold that is OFF sets no lock.
+     */
+    private static void rejectObjectLockWithoutLockEnabled(Bucket bucket, PutObjectOptions options) {
+        if (options.getObjectLockMode() != null || options.getRetainUntilDate() != null
+                || "ON".equals(options.getLegalHoldStatus())) {
+            requireObjectLockEnabled(bucket);
+        }
+    }
+
+    /**
+     * The version a retention or legal-hold request names. S3 was recorded refusing these requests
+     * on a bucket without Object Lock before it looks for the key.
+     */
+    private AccountAwareStorageBackend.OwnedEntry<S3Object> getLockableObjectEntry(
+            String bucketName, String key, String versionId) {
+        requireObjectLockEnabled(resolveBucket(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404)));
+        return getStoredObjectEntry(bucketName, key, versionId);
+    }
+
     public void putObjectRetention(String bucketName, String key, String versionId,
                                    String mode, Instant retainUntil, boolean bypassGovernance) {
         AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject =
-                getStoredObjectEntry(bucketName, key, versionId);
+                getLockableObjectEntry(bucketName, key, versionId);
         S3Object obj = ownedObject.value();
+
+        // A mode without a date, or a mode S3 does not know, is malformed, as S3 was recorded
+        // answering; a date without a mode is refused the same way, since GetObjectRetention reads a
+        // retention by its mode. A retention naming neither removes it.
+        if ((mode == null) != (retainUntil == null)
+                || (mode != null && !"GOVERNANCE".equals(mode) && !"COMPLIANCE".equals(mode))) {
+            throw new AwsException("MalformedXML",
+                    "The XML you provided was not well-formed or did not validate against our published schema", 400);
+        }
 
         boolean activeComplianceRetention = "COMPLIANCE".equals(obj.getObjectLockMode())
                 && obj.getRetainUntilDate() != null
@@ -4070,12 +4115,22 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public S3Object getObjectRetention(String bucketName, String key, String versionId) {
-        return getStoredObject(bucketName, key, versionId);
+        S3Object object = getLockableObjectEntry(bucketName, key, versionId).value();
+        if (object.getObjectLockMode() == null) {
+            throw noSuchObjectLockConfiguration();
+        }
+        return object;
+    }
+
+    /** S3 was recorded answering a read of a retention or legal hold the object does not have with this error. */
+    private static AwsException noSuchObjectLockConfiguration() {
+        return new AwsException("NoSuchObjectLockConfiguration",
+                "The specified object does not have a ObjectLock configuration", 404);
     }
 
     public void putObjectLegalHold(String bucketName, String key, String versionId, String status) {
         AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject =
-                getStoredObjectEntry(bucketName, key, versionId);
+                getLockableObjectEntry(bucketName, key, versionId);
         S3Object obj = ownedObject.value();
         obj.setLegalHoldStatus(status);
         putObjectMetadataForAccount(ownedObject.account(), bucketName, key, obj);
@@ -4083,7 +4138,11 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public S3Object getObjectLegalHold(String bucketName, String key, String versionId) {
-        return getStoredObject(bucketName, key, versionId);
+        S3Object object = getLockableObjectEntry(bucketName, key, versionId).value();
+        if (object.getLegalHoldStatus() == null) {
+            throw noSuchObjectLockConfiguration();
+        }
+        return object;
     }
 
     // --- Multipart Upload Operations ---
@@ -4181,6 +4240,7 @@ public class S3Service implements Resettable, ResourceProvider {
                             "The specified bucket does not exist.", 404));
             String ownerAccount = getBucketOwnerAccountId(bucket);
             rejectUploadAclWhenOwnershipEnforced(destination, ownerAccount, objectOptions);
+            rejectObjectLockWithoutLockEnabled(destination, objectOptions);
             resolveObjectAclXml(ownerAccount, acl, objectOptions.getGrantRead(), objectOptions.getGrantWrite(),
                     objectOptions.getGrantFullControl(), objectOptions.getGrantReadAcp(),
                     objectOptions.getGrantWriteAcp());

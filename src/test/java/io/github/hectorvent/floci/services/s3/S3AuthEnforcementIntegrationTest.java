@@ -1481,17 +1481,24 @@ class S3AuthEnforcementIntegrationTest {
         String bucket = "auth-batch-bypass-scope-bucket";
         String unlockedKey = "unlocked.txt";
         String lockedKey = "locked.txt";
-        given().filter(LOCAL_SIGNER).when().put("/" + bucket).then().statusCode(200);
-
         given()
+            .filter(LOCAL_SIGNER)
+            .header("x-amz-bucket-object-lock-enabled", "true")
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(200);
+
+        String unlockedVersion = given()
             .filter(LOCAL_SIGNER)
             .body("unlocked")
         .when()
             .put("/" + bucket + "/" + unlockedKey)
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .extract().header("x-amz-version-id");
 
-        given()
+        String lockedVersion = given()
             .filter(LOCAL_SIGNER)
             .header("x-amz-object-lock-mode", "GOVERNANCE")
             .header("x-amz-object-lock-retain-until-date", "2030-01-01T00:00:00Z")
@@ -1499,23 +1506,25 @@ class S3AuthEnforcementIntegrationTest {
         .when()
             .put("/" + bucket + "/" + lockedKey)
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .extract().header("x-amz-version-id");
 
         given()
             .filter(LOCAL_SIGNER)
             .contentType("application/json")
-            .body(publicObjectActionPolicy(bucket, "s3:DeleteObject"))
+            .body(publicObjectActionPolicy(bucket, "s3:DeleteObjectVersion"))
         .when()
             .put("/" + bucket + "?policy")
         .then()
             .statusCode(200);
 
+        // The lock protects a version, so the entries name theirs.
         String deleteXml = """
                 <Delete>
-                  <Object><Key>%s</Key></Object>
-                  <Object><Key>%s</Key></Object>
+                  <Object><Key>%s</Key><VersionId>%s</VersionId></Object>
+                  <Object><Key>%s</Key><VersionId>%s</VersionId></Object>
                 </Delete>
-                """.formatted(unlockedKey, lockedKey);
+                """.formatted(unlockedKey, unlockedVersion, lockedKey, lockedVersion);
 
         given()
             .header("x-amz-bypass-governance-retention", "true")

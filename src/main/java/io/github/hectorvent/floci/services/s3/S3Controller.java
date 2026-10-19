@@ -3007,11 +3007,10 @@ public class S3Controller {
 
     private Response handleGetObjectLegalHold(String bucket, String key, String versionId) {
         S3Object obj = s3Service.getObjectLegalHold(bucket, key, versionId);
-        String status = obj.getLegalHoldStatus() != null ? obj.getLegalHoldStatus() : "OFF";
         String xml = new XmlBuilder()
                 .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                 .start("LegalHold", AwsNamespaces.S3)
-                .elem("Status", status)
+                .elem("Status", obj.getLegalHoldStatus())
                 .end("LegalHold")
                 .build();
         return Response.ok(xml).type(MediaType.APPLICATION_XML).build();

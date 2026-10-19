@@ -129,6 +129,7 @@ class S3LifecycleServiceTest {
     @Test
     void aNoncurrentVersionUnderALegalHoldIsKept() {
         s3Service.putBucketVersioning(BUCKET, "Enabled");
+        s3Service.setBucketObjectLockEnabled(BUCKET);
         S3Object held = s3Service.putObject(BUCKET, "a.txt", "held".getBytes(StandardCharsets.UTF_8), "text/plain",
                 Map.of(), null, null, "ON");
         S3Object current = put("a.txt");

@@ -252,6 +252,7 @@ class S3GlobalBucketNamespaceTest {
         globalNs.putBucketOwnershipControls("shared-metadata-bucket", "<OwnershipControls><Rule>"
                 + "<ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>");
         globalNs.putBucketVersioning("shared-metadata-bucket", "Enabled");
+        globalNs.setBucketObjectLockEnabled("shared-metadata-bucket");
         S3Object created = globalNs.putObject(
                 "shared-metadata-bucket", "object.txt", "payload".getBytes(UTF_8),
                 "text/plain", Map.of());
