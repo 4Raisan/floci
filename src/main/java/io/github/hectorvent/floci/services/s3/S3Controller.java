@@ -459,6 +459,7 @@ public class S3Controller {
                         new String(body, StandardCharsets.UTF_8), "Tag", "Key", "Value");
             }
             String region = bucketRegionForCreate(locationConstraint, regionResolver.resolveRegion(httpHeaders));
+            authorizeBucketCreationSettings(httpHeaders, uriInfo, bucket, region);
             s3Service.createBucket(bucket, region,
                     httpHeaders.getHeaderString("x-amz-object-ownership"),
                     httpHeaders.getHeaderString("x-amz-acl"),
@@ -4494,6 +4495,24 @@ public class S3Controller {
                     resourcePolicyEvaluation.decision(), resourcePolicyEvaluation.resourceOwnerAccountId());
         }
         s3Service.authorizeObjectCreationSetting(destBucket, destKey, action, authorization, null);
+    }
+
+    /**
+     * Authorizes the actions a CreateBucket needs besides {@code s3:CreateBucket}
+     * (see {@link S3ObjectActions#bucketCreationActions}) on the new bucket. It runs before the bucket
+     * is created, so a denied request creates nothing.
+     */
+    private void authorizeBucketCreationSettings(HttpHeaders httpHeaders, UriInfo uriInfo, String bucket,
+                                                 String region) {
+        List<String> actions = S3ObjectActions.bucketCreationActions(httpHeaders::getHeaderString);
+        if (actions.isEmpty()) {
+            return;
+        }
+        String credential = iamCredential(httpHeaders, uriInfo);
+        String resource = S3PublicAccessEvaluator.bucketArn(AwsRegions.partitionFor(region), bucket);
+        for (String action : actions) {
+            iamEnforcementFilter.authorizeAdditionalResource(credential, action, resource);
+        }
     }
 
     /**
