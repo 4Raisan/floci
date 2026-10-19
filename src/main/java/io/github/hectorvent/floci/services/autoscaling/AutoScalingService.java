@@ -173,6 +173,19 @@ public class AutoScalingService {
                                                           Boolean associatePublicIpAddress,
                                                           Boolean instanceMonitoringEnabled,
                                                           List<LaunchConfigurationBlockDeviceMapping> blockDeviceMappings) {
+        return createLaunchConfiguration(region, name, instanceId, imageId, instanceType, keyName,
+                securityGroups, userData, iamInstanceProfile, associatePublicIpAddress,
+                instanceMonitoringEnabled, blockDeviceMappings, null);
+    }
+
+    public LaunchConfiguration createLaunchConfiguration(String region, String name, String instanceId,
+                                                          String imageId, String instanceType, String keyName,
+                                                          List<String> securityGroups, String userData,
+                                                          String iamInstanceProfile, Boolean associatePublicIpAddress,
+                                                          Boolean instanceMonitoringEnabled,
+                                                          List<LaunchConfigurationBlockDeviceMapping> blockDeviceMappings,
+                                                          LaunchTemplateData.MetadataOptions metadataOptions) {
+        validateMetadataOptions(metadataOptions);
         String key = lcKey(region, name);
         if (launchConfigs.containsKey(key)) {
             throw new AwsException("AlreadyExists",
@@ -230,6 +243,7 @@ public class AutoScalingService {
         lc.setUserData(userData);
         lc.setUserDataBase64Encoded(Boolean.TRUE);
         lc.setIamInstanceProfile(iamInstanceProfile);
+        lc.setMetadataOptions(metadataOptions);
         lc.setAssociatePublicIpAddress(associatePublicIpAddress);
         // AWS documents InstanceMonitoring as enabled by default and always returns the
         // structure from Describe, unlike AssociatePublicIpAddress whose absence is meaningful.
@@ -239,6 +253,36 @@ public class AutoScalingService {
         lc.setRegion(region);
         launchConfigs.put(key, lc);
         return lc;
+    }
+
+    /**
+     * Refuses metadata options outside the Auto Scaling model, every violation in one
+     * {@code ValidationError} with AWS's texts.
+     */
+    private static void validateMetadataOptions(LaunchTemplateData.MetadataOptions options) {
+        if (options == null) {
+            return;
+        }
+        List<String> violations = new ArrayList<>();
+        requireMetadataEnum(violations, "httpTokens", options.getHttpTokens(), "optional", "required");
+        Integer hopLimit = options.getHttpPutResponseHopLimit();
+        if (hopLimit != null && (hopLimit < 1 || hopLimit > 64)) {
+            violations.add("Value '" + hopLimit + "' at 'metadataOptions.httpPutResponseHopLimit' failed to satisfy"
+                    + " constraint: Member must have value "
+                    + (hopLimit < 1 ? "greater than or equal to 1" : "less than or equal to 64"));
+        }
+        requireMetadataEnum(violations, "httpEndpoint", options.getHttpEndpoint(), "disabled", "enabled");
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.validationError(violations);
+        }
+    }
+
+    private static void requireMetadataEnum(List<String> violations, String member, String value,
+                                            String... allowed) {
+        if (value != null && !List.of(allowed).contains(value)) {
+            violations.add("Value '" + value + "' at 'metadataOptions." + member + "' failed to satisfy constraint:"
+                    + " Member must satisfy enum value set: [" + String.join(", ", allowed) + "]");
+        }
     }
 
     String resolveLaunchConfigurationProfile(String profile) {
