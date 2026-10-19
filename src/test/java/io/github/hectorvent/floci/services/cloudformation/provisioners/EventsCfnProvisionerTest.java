@@ -65,6 +65,11 @@ class EventsCfnProvisionerTest {
             ((JsonNode) inv.getArgument(0)).forEach(value -> values.add(value.asText()));
             return values;
         });
+        when(engine.resolveLiteralList(any())).thenAnswer(inv -> {
+            List<String> values = new ArrayList<>();
+            ((JsonNode) inv.getArgument(0)).forEach(value -> values.add(value.asText()));
+            return values;
+        });
         return new ProvisionContext(engine, REGION, "000000000000", "my-stack", priorPhysicalId);
     }
 
@@ -276,9 +281,9 @@ class EventsCfnProvisionerTest {
     }
 
     /**
-     * Measured on CloudFormation (eu-west-1, 2026-10-18): a member the resource schema types fails
-     * template validation, naming the member or the list index, or the handler's model validation,
-     * naming the whole path, before the rule exists.
+     * Measured on CloudFormation (eu-west-1, 2026-10-18 and 2026-10-19): a member the resource schema
+     * types fails template validation, naming the member, the list index or the map key, or the
+     * handler's model validation, naming the whole path, before the rule exists.
      */
     @ParameterizedTest(name = "{0}")
     @MethodSource("mistypedMembers")
@@ -348,6 +353,21 @@ class EventsCfnProvisionerTest {
                         "Property [Group] expected type: String, found: JSONObject"),
                 Arguments.of("{\"EcsParameters\": {\"Group\": [\"a\"]}}", template,
                         "Property [Group] expected type: String, found: JSONArray"),
+                Arguments.of("{\"Input\": {\"a\": 1}}", template,
+                        "Property [Input] expected type: String, found: JSONObject"),
+                Arguments.of("{\"InputPath\": [\"$.a\"]}", template,
+                        "Property [InputPath] expected type: String, found: JSONArray"),
+                Arguments.of("{\"InputTransformer\": {\"InputTemplate\": \"x\", \"InputPathsMap\": \"x\"}}", template,
+                        "Property [InputPathsMap] expected type: JSONObject, found: String"),
+                Arguments.of("{\"InputTransformer\": {\"InputTemplate\": \"x\", \"InputPathsMap\": {\"a\": {\"b\": 1}}}}",
+                        template, "Property [a] expected type: String, found: JSONObject"),
+                Arguments.of("{\"BatchParameters\": {\"JobDefinition\": \"d\", \"JobName\": \"n\","
+                        + " \"ArrayProperties\": {\"Size\": \"abc\"}}}", template,
+                        "Property [Size] expected type: Integer, found: String"),
+                Arguments.of("{\"HttpParameters\": {\"HeaderParameters\": {\"h\": {\"x\": 1}}}}", template,
+                        "Property [h] expected type: String, found: JSONObject"),
+                Arguments.of("{\"SqsParameters\": \"x\"}", template,
+                        "Property [SqsParameters] expected type: JSONObject, found: String"),
                 Arguments.of("{\"RetryPolicy\": {\"MaximumRetryAttempts\": 3000000000}}", model,
                         "Model validation failed (#/Targets/0/RetryPolicy/MaximumRetryAttempts:"
                                 + " expected type: Integer, found: String" + range + ")"),
@@ -402,6 +422,29 @@ class EventsCfnProvisionerTest {
         assertEquals(3, ecs.getTaskCount());
         assertEquals(Boolean.TRUE, ecs.getEnableECSManagedTags());
         assertEquals(List.of("5"), ecs.getNetworkConfiguration().getAwsvpcConfiguration().getSubnets());
+    }
+
+    @Test
+    void aLiteralListKeepsItsBlankEntriesWhereTheTemplatePutThem() throws Exception {
+        // Measured: SecurityGroups ["", "sg-..."] reaches the target as both. Path parameter values
+        // are positional, so a blank one dropped would move the next into its wildcard.
+        stubPutRule();
+        ObjectNode props = mapper.createObjectNode().put("Name", "orders");
+        props.putArray("Targets").add(mapper.readTree("""
+                {"Id": "Run", "Arn": "arn:aws:ecs:us-east-1:000000000000:cluster/jobs",
+                 "HttpParameters": {"PathParameterValues": ["", "b"]},
+                 "EcsParameters": {"TaskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/job:1",
+                   "NetworkConfiguration": {"AwsVpcConfiguration": {"Subnets": ["subnet-1"], "SecurityGroups": ["", "sg-1"]}}}}
+                """));
+
+        provisioner.provision(resource("AWS::Events::Rule", "Rule"), props, new ProvisionContext(
+                CloudFormationTemplateEngine.standalone("000000000000", REGION, "my-stack", mapper, null),
+                REGION, "000000000000", "my-stack", null));
+
+        Target put = onlyPutTarget();
+        assertEquals(List.of("", "b"), put.getHttpParameters().getPathParameterValues());
+        assertEquals(List.of("", "sg-1"),
+                put.getEcsParameters().getNetworkConfiguration().getAwsvpcConfiguration().getSecurityGroups());
     }
 
     private Target onlyPutTarget() {
