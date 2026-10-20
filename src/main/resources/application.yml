@@ -380,6 +380,9 @@ floci:
       max-message-size: 1048576
       clear-fifo-deduplication-cache-on-purge: false
       receipt-handle-secret: local-emulator-secret
+      # QueueUrl shape. floci is <base-url>/<account>/<name>,
+      # aws is https://sqs.<region>.<partition dns suffix>/<account>/<name>
+      endpoint-strategy: floci
     s3:
       enabled: true
       enforce-auth: false

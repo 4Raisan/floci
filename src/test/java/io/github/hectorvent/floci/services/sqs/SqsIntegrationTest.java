@@ -1323,4 +1323,11 @@ class SqsIntegrationTest {
         }
         return request;
     }
+
+    @Test
+    void queueUrlsUseTheFlociFormByDefault() {
+        SqsQueueUrlRoundTrip.query("floci-url-queue",
+                "http://localhost:4566/000000000000/floci-url-queue",
+                "https://sqs.us-east-1.amazonaws.com/000000000000/floci-url-queue");
+    }
 }
