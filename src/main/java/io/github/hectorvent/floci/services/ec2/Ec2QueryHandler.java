@@ -795,6 +795,7 @@ public class Ec2QueryHandler {
         // Absent fields stay null so the launch default, or the launch template's value, applies.
         LaunchTemplateData.MetadataOptions metadataOptions = parseMetadataOptions(p, "MetadataOptions.");
         String creditSpecificationCpuCredits = p.getFirst("CreditSpecification.CpuCredits");
+        String marketType = p.getFirst("InstanceMarketOptions.MarketType");
 
         List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings =
                 parseLaunchTemplateBlockDeviceMappings(p, "");
@@ -808,6 +809,9 @@ public class Ec2QueryHandler {
                     "Network interfaces and an instance-level subnet ID may not be specified on the same request", 400);
         }
         if (launchTemplateData != null) {
+            if (marketType == null && launchTemplateData.getInstanceMarketOptions() != null) {
+                marketType = launchTemplateData.getInstanceMarketOptions().getMarketType();
+            }
             blockDeviceMappings = LaunchTemplateData.BlockDeviceMapping.merge(
                     launchTemplateData.getBlockDeviceMappings(), blockDeviceMappings);
             if (!suppliedInterfaces) {
@@ -860,7 +864,8 @@ public class Ec2QueryHandler {
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, Boolean.parseBoolean(p.getFirst("DryRun")),
-                p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings);
+                p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
+                "spot".equals(marketType));
 
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
@@ -987,7 +992,7 @@ public class Ec2QueryHandler {
                         null,
                         0,
                         launch.availabilityZone(), launch.metadataOptions(), null, launch.encodedUserData(), false,
-                        null, null, launch.blockDeviceMappings());
+                        null, null, launch.blockDeviceMappings(), "spot".equals(capacityType));
                 Instance instance = reservation.getInstances().get(0);
                 launchedInstanceIds.add(instance.getInstanceId());
                 results.add(new FleetLaunchResult(instance, launch));
@@ -4844,6 +4849,10 @@ public class Ec2QueryHandler {
                 .elem("amiLaunchIndex", String.valueOf(inst.getAmiLaunchIndex()))
                 .elem("instanceType", inst.getInstanceType())
                 .elem("launchTime", inst.getLaunchTime() != null ? ISO_FMT.format(inst.getLaunchTime()) : "");
+
+        if (inst.isSpot()) {
+            xml.elem("instanceLifecycle", "spot");
+        }
 
         if (inst.getPlacement() != null) {
             xml.start("placement")

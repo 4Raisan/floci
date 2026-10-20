@@ -22,8 +22,37 @@ By default, Docker containers launched for EC2 instances are bounded to the CPU 
 
 - **CPU limit**: Each vCPU corresponds to 1024 CPU units (Docker nanoCPUs = `vcpu * 1_000_000_000`). If the host machine has fewer physical cores than requested, Floci clamps execution to available host CPUs and warns (since Docker refuses a nanoCPUs value exceeding the host CPU count).
 - **Memory limit**: Container memory is bounded to the exact MiB value specified for the instance type in the catalog.
-- **Unknown instance types**: If an instance type is not present in the catalog, the container launches unbounded without CPU or memory restrictions, avoiding launch failures for custom or unmodeled instance types.
+- **Types outside the full catalog**: Docker CPU and memory limits are not applied when the full catalog lacks a type. When opted in, Standard On-Demand admission requires a known default vCPU count, as described below.
 - **Configuration knob**: To disable container resource limits (for example, running a large instance type on a developer machine with limited resources), set `floci.services.ec2.instance-resource-limits: false` (or environment variable `FLOCI_SERVICES_EC2_INSTANCE_RESOURCE_LIMITS=false`).
+
+## Standard On-Demand admission
+
+Quota admission is opt-in. Set `FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS=true` to
+check `RunInstances` and `StartInstances` against the applied Standard On-Demand
+quota (`L-1216C47A`) for the caller's account and region. The flag defaults to
+`false`, including mock mode. Disabled admission does not refuse a type merely
+because its default vCPU count is absent from the snapshot.
+
+`FLOCI_SERVICES_SERVICEQUOTAS_STANDARD_ON_DEMAND_VCPUS` supplies the applied value
+(default `5`). Service Quotas reports this value independently of admission.
+With admission enabled, a launch batch can return fewer than `MaxCount` when at
+least `MinCount` fits, otherwise it returns `VcpuLimitExceeded`. A refused start
+leaves stopped instances unchanged. Types in the Standard bucket require a
+known default vCPU count; the separate CPU-only snapshot supplements the full
+instance metadata catalog without inventing memory sizes or regional availability.
+
+Only current `running` Standard On-Demand instances count. Pending, stopping,
+stopped, shutting-down and terminated instances do not reserve capacity. Spot
+and dedicated-host instances do not consume this bucket. RunInstances retains
+direct or inherited launch-template Spot selection; explicit request market
+options override the template. Requests for Spot through the other supported
+launch APIs retain that provenance too.
+
+These are checks of running usage at request admission, not a reservation ledger
+or an eventual running ceiling. Accepted pending operations can complete after
+other work consumes capacity, and changing a running instance's type is not
+covered by the Run/Start checks. Admission does not change guest cleanup,
+restart, user-data, public-address or CloudFormation lifecycle behavior.
 
 ## AMI to Docker Image Mapping
 

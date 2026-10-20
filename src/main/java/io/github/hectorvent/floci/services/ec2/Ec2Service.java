@@ -3535,6 +3535,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
                                     String hostId, String tenancy,
                                     List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings) {
+        return runInstances(region, imageId, instanceType, minCount, maxCount, keyName,
+                securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
+                metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy,
+                blockDeviceMappings, false);
+    }
+
+    Reservation runInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy,
+                                    List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot) {
         if (hostId != null && !hostId.isBlank()) {
             Host host = getRequiredAvailableHost(region, hostId);
             if ((availabilityZone == null || availabilityZone.isBlank())
@@ -3673,14 +3691,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
             synchronized (privateIpAllocationLock) {
+                int admitted = !config.services().ec2().enforceVcpuQuotas() || spot || "host".equals(tenancy)
+                        ? count : admittedInstanceCount(region, effectiveInstanceType, minCount, maxCount);
                 synchronized (hostLock) {
                     if (hostId != null) {
                         // Re-checked under hostLock: a ReleaseHosts or ModifyHosts may have landed
                         // since the unlocked check above.
                         validateHostPlacement(getRequiredAvailableHost(region, hostId), az, effectiveInstanceType, tenancy);
                     }
-                    List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni, count);
-                    for (int i = 0; i < count; i++) {
+                    List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni, admitted);
+                    for (int i = 0; i < admitted; i++) {
                         String instanceId = "i-" + randomHex(17);
                         String privateIp = privateIps.get(i);
 
@@ -3690,6 +3710,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         inst.setImageId(imageId);
                         inst.setState(InstanceState.pending());
                         inst.setInstanceType(effectiveInstanceType);
+                        inst.setSpot(spot);
                         Placement placement = new Placement(az);
                         placement.setHostId(hostId);
                         if (tenancy != null && !tenancy.isBlank()) {
@@ -4590,6 +4611,33 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<Map<String, String>> startInstances(String region, List<String> instanceIds) {
         ensureDefaultResources(region);
+        if (config.services().ec2().enforceVcpuQuotas()) {
+            synchronized (privateIpAllocationLock) {
+                long additional = 0;
+                Set<String> legacySpot = spotInstanceIds(region);
+                List<Instance> targets = new ArrayList<>();
+                for (String id : new LinkedHashSet<>(instanceIds)) {
+                    Instance instance = getRequiredInstance(region, id);
+                    if (isExternalInstance(region, id)) {
+                        throw new AwsException("OperationNotPermitted",
+                                "The instance '" + id + "' is a cluster node and cannot be started through EC2", 400);
+                    }
+                    if ("terminated".equals(instance.getState().getName())) {
+                        throw new AwsException("IncorrectInstanceState",
+                                "The instance '" + id + "' is not in a state from which it can be started.", 400);
+                    }
+                    targets.add(instance);
+                }
+                for (Instance instance : targets) {
+                    String state = instance.getState().getName();
+                    if (("stopped".equals(state) || "stopping".equals(state))
+                            && !isSpot(instance, legacySpot) && !onDedicatedHost(instance)) {
+                        additional += standardOnDemandVcpus(instance.getInstanceType());
+                    }
+                }
+                enforceStandardOnDemandQuota(region, additional);
+            }
+        }
         List<Map<String, String>> result = new ArrayList<>();
         for (String id : instanceIds) {
            Instance inst = getRequiredInstance(region, id);
@@ -4629,6 +4677,71 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             result.add(entry);
         }
         return result;
+    }
+
+    private int appliedStandardOnDemandLimit() {
+        return config.services().servicequotas() == null ? 5
+                : config.services().servicequotas().standardOnDemandVcpus();
+    }
+
+    private int admittedInstanceCount(String region, String instanceType, int minimum, int maximum) {
+        int vcpus = standardOnDemandVcpus(instanceType);
+        int requested = Math.max(maximum, Math.max(minimum, 1));
+        if (vcpus == 0) {
+            return requested;
+        }
+        long available = Math.max(0L, (long) appliedStandardOnDemandLimit() - runningStandardOnDemandVcpus(region));
+        int admitted = (int) Math.min(requested, available / vcpus);
+        if (admitted < Math.max(minimum, 1)) {
+            throw vcpuLimitExceeded();
+        }
+        return admitted;
+    }
+
+    private void enforceStandardOnDemandQuota(String region, long additional) {
+        if (additional > 0 && runningStandardOnDemandVcpus(region) + additional > appliedStandardOnDemandLimit()) {
+            throw vcpuLimitExceeded();
+        }
+    }
+
+    private AwsException vcpuLimitExceeded() {
+        return new AwsException("VcpuLimitExceeded", "You have requested more vCPU capacity than your current vCPU limit of "
+                + appliedStandardOnDemandLimit() + " allows for the instance bucket that the specified instance type belongs to.", 400);
+    }
+
+    private Set<String> spotInstanceIds(String region) {
+        return spotInstanceRequests.scan(k -> k.startsWith(region + "::")).stream()
+                .map(SpotInstanceRequest::getInstanceId).filter(Objects::nonNull).collect(Collectors.toSet());
+    }
+
+    private static boolean isSpot(Instance instance, Set<String> legacySpot) {
+        return instance.isSpot() || legacySpot.contains(instance.getInstanceId());
+    }
+
+    private static boolean onDedicatedHost(Instance instance) {
+        return instance.getPlacement() != null && "host".equals(instance.getPlacement().getTenancy());
+    }
+
+    /** Current running usage only: pending operations do not reserve admission capacity. */
+    private long runningStandardOnDemandVcpus(String region) {
+        Set<String> legacySpot = spotInstanceIds(region);
+        return instances.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(i -> !isSpot(i, legacySpot) && !onDedicatedHost(i))
+                .filter(i -> i.getState() != null && "running".equals(i.getState().getName()))
+                .mapToLong(i -> standardOnDemandVcpus(i.getInstanceType())).sum();
+    }
+
+    private int standardOnDemandVcpus(String type) {
+        if (type == null || type.isBlank() || type.startsWith("mac") || type.startsWith("dl")
+                || type.startsWith("hpc") || type.startsWith("inf") || type.startsWith("trn")) {
+            return 0;
+        }
+        return switch (Character.toLowerCase(type.charAt(0))) {
+            case 'a', 'c', 'd', 'h', 'i', 'm', 'r', 't', 'z' -> instanceTypeCatalog.defaultVcpus(type)
+                    .orElseThrow(() -> new AwsException("InvalidParameterValue",
+                            "Instance type '" + type + "' is not supported for quota-enforced launches.", 400));
+            default -> 0;
+        };
     }
 
     public void rebootInstances(String region, List<String> instanceIds) {
@@ -12727,7 +12840,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     securityGroupIds, subnetId, null, instanceTags, userData, iamInstanceProfileArn,
                     /* associatePublicIp */ null, /* networkInterfaceId */ null,
                     /* networkInterfaceDeviceIndex */ 0, /* availabilityZone */ null,
-                    /* metadataOptions */ null, /* creditSpecificationCpuCredits */ null, encodedUserData);
+                    /* metadataOptions */ null, /* creditSpecificationCpuCredits */ null, encodedUserData,
+                    false, null, null, null, true);
 
             Instance launchedInstance = reservation.getInstances().get(0);
 
