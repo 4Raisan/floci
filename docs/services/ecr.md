@@ -33,6 +33,9 @@
 | `TagResource` / `UntagResource` / `ListTagsForResource` | Resource tagging |
 | `PutLifecyclePolicy` / `GetLifecyclePolicy` / `DeleteLifecyclePolicy` | Lifecycle policy round-trip (stored, not enforced) |
 | `SetRepositoryPolicy` / `GetRepositoryPolicy` / `DeleteRepositoryPolicy` | Repository policy round-trip (stored, not enforced) |
+| `PutRegistryPolicy` / `GetRegistryPolicy` / `DeleteRegistryPolicy` | Registry policy round-trip (stored, not enforced) |
+| `PutReplicationConfiguration` / `DescribeRegistry` | Store the registry's replication rules and return them with the registry ID (stored, not acted on) |
+| `PutRegistryScanningConfiguration` / `GetRegistryScanningConfiguration` | Store the registry's scan type and scanning rules (stored, not acted on) |
 
 ### Admin Endpoints
 
@@ -56,6 +59,12 @@
   - `BatchCheckLayerAvailability` lists held layers as `AVAILABLE`, and a layer the repository does not hold under `failures` as `MissingLayerDigest`.
 - **Authorization.** `GetAuthorizationToken` returns `Base64("AWS:floci")` plus a proxy endpoint. The backing `registry:2` runs without auth, so any `aws ecr get-login-password | docker login` succeeds.
 - **Pull through cache rule configuration.** Pull-through cache rule actions persist AWS-compatible rule metadata with account and Region isolation. `UpdatePullThroughCacheRule` preserves fields omitted by the request and refreshes `updatedAt`. `ValidatePullThroughCacheRule` checks that the rule exists and reports it as valid; Floci does not contact the upstream registry or validate credentials. Rules do not proxy or cache images from the configured upstream registry.
+- **Registry settings.** The registry policy, replication configuration and scanning configuration are kept per account and Region and returned as written. Floci does not replicate or scan images, or evaluate the registry policy.
+  - Each request is checked against the constraints of the ECR service model, vendored in `src/main/resources/aws/ecr-request-shapes.json` by `tools/aws/regen_ecr_shapes.py`: member types, required members, lengths and counts, patterns and enum values. A request outside them is `InvalidParameterException` in ECR's form, `Invalid parameter at '<member>' failed to satisfy constraint: '<rule>'`.
+  - Concurrent writes to the policy, replication and scanning configuration, as Terraform makes, each keep their setting.
+  - `GetRegistryPolicy` and `DeleteRegistryPolicy` answer `RegistryPolicyNotFoundException` when no policy is set. `PutRegistryPolicy` refuses text that is not a JSON object.
+  - An empty `rules` list in `PutReplicationConfiguration` clears the configuration. `DescribeRegistry` returns `{"rules": []}` until rules are set.
+  - The scanning configuration is `BASIC` with no rules until one is put. `CONTINUOUS_SCAN` is refused with `BASIC`, since AWS offers it only with enhanced scanning. `BatchGetRepositoryScanningConfiguration` still reports each repository's own `scanOnPush`.
 - **Manifest format negotiation.** `BatchGetImage` forwards the caller's `acceptedMediaTypes` as the upstream `Accept` header. Modern OCI manifests (`application/vnd.oci.image.manifest.v1+json`) and Docker v2 schema 2 are both supported.
 - **Cross-account / cross-region isolation.** Internally the registry namespaces repositories as `<account>/<region>/<repoName>`, so the same repository name in different accounts or regions cannot collide.
 - **Reconcile on first start.** When the registry container starts, Floci queries `GET /v2/_catalog` and recreates `Repository` metadata entries for any namespaces present in the registry but missing from local storage. This means image bytes are never orphaned across restarts.
@@ -251,7 +260,7 @@ new lambda.DockerImageFunction(this, 'MyFn', {
 
 The following ECR features are **not** implemented. Stored values for policies and lifecycle rules round-trip via the API but are not enforced at runtime:
 
-- Replication
+- Replication and registry scanning (the configurations are stored, but images are not copied or scanned)
 - Pull-through cache image proxying and population. Rule configuration APIs are supported, but pulls are not routed to upstream registries
 - Image scanning (`StartImageScan`, `DescribeImageScanFindings`)
 - Image signing and notary attachments

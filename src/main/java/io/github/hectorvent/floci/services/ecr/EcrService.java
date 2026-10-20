@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ecr.model.AuthorizationData;
@@ -24,6 +25,7 @@ import io.github.hectorvent.floci.services.ecr.model.ImageFailure;
 import io.github.hectorvent.floci.services.ecr.model.ImageIdentifier;
 import io.github.hectorvent.floci.services.ecr.model.ImageMetadata;
 import io.github.hectorvent.floci.services.ecr.model.PullThroughCacheRule;
+import io.github.hectorvent.floci.services.ecr.model.RegistrySettings;
 import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecr.registry.RegistryHttpClient;
@@ -62,7 +64,6 @@ public class EcrService implements ResourceProvider {
     private static final Pattern REGISTRY_ID = Pattern.compile("[0-9]{12}");
     private static final Pattern LAYER_DIGEST = Pattern.compile("[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+");
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    /** The OCI distribution spec's tag grammar, which the registry's manifest URL takes. */
     /** ECR's imageTag rule, which the service model bounds at 300 characters. */
     private static final Pattern ECR_IMAGE_TAG = Pattern.compile("[a-zA-Z0-9_.-]+");
     /** The OCI distribution spec's tag grammar, which the backing registry's manifest URL takes. */
@@ -80,6 +81,8 @@ public class EcrService implements ResourceProvider {
     private final StorageBackend<String, Repository> repoStore;
     private final StorageBackend<String, ImageMetadata> imageMetaStore;
     private final StorageBackend<String, PullThroughCacheRule> pullThroughCacheRuleStore;
+    private final StorageBackend<String, RegistrySettings> registrySettingsStore;
+    private final Map<String, Object> registrySettingsLocks = new ConcurrentHashMap<>();
     private final EcrRegistryManager registryManager;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -97,6 +100,8 @@ public class EcrService implements ResourceProvider {
                         new TypeReference<Map<String, ImageMetadata>>() {}),
                 factory.create("ecr", "pull-through-cache-rules.json",
                         new TypeReference<Map<String, PullThroughCacheRule>>() {}),
+                factory.create("ecr", "registry-settings.json",
+                        new TypeReference<Map<String, RegistrySettings>>() {}),
                 registryManager, config, regionResolver);
     }
 
@@ -106,9 +111,21 @@ public class EcrService implements ResourceProvider {
                EcrRegistryManager registryManager,
                EmulatorConfig config,
                RegionResolver regionResolver) {
+        this(repoStore, imageMetaStore, pullThroughCacheRuleStore, new InMemoryStorage<>(),
+                registryManager, config, regionResolver);
+    }
+
+    EcrService(StorageBackend<String, Repository> repoStore,
+               StorageBackend<String, ImageMetadata> imageMetaStore,
+               StorageBackend<String, PullThroughCacheRule> pullThroughCacheRuleStore,
+               StorageBackend<String, RegistrySettings> registrySettingsStore,
+               EcrRegistryManager registryManager,
+               EmulatorConfig config,
+               RegionResolver regionResolver) {
         this.repoStore = repoStore;
         this.imageMetaStore = imageMetaStore;
         this.pullThroughCacheRuleStore = pullThroughCacheRuleStore;
+        this.registrySettingsStore = registrySettingsStore;
         this.registryManager = registryManager;
         this.config = config;
         this.regionResolver = regionResolver;
@@ -973,6 +990,137 @@ public class EcrService implements ResourceProvider {
 
     private static AwsException registryUnavailable(Exception e) {
         return new AwsException("ServerException", "The ECR backing registry failed: " + e.getMessage(), 500);
+    }
+
+    // ============================================================
+    // Registry settings (policy, replication, scanning)
+    // ============================================================
+
+    /**
+     * Stores the registry policy. Its length is checked against the model before this is reached;
+     * text that is not a JSON object is refused here, as the model cannot say so.
+     */
+    public String putRegistryPolicy(String policyText, String region) {
+        JsonNode parsed;
+        try {
+            parsed = policyText == null ? null : MAPPER.readTree(policyText);
+        } catch (Exception e) {
+            parsed = null;
+        }
+        if (parsed == null || !parsed.isObject()) {
+            throw new AwsException("InvalidParameterException", "Invalid parameter at 'PolicyText' failed to satisfy "
+                    + "constraint: 'Invalid registry policy provided'", 400);
+        }
+        updateRegistrySettings(region, settings -> {
+            settings.setPolicyText(policyText);
+            return null;
+        });
+        return policyText;
+    }
+
+    public String getRegistryPolicy(String region) {
+        String policy = registrySettings(region).getPolicyText();
+        if (policy == null) {
+            throw registryPolicyNotFound();
+        }
+        return policy;
+    }
+
+    /** Removes the registry policy and returns what it was. */
+    public String deleteRegistryPolicy(String region) {
+        return updateRegistrySettings(region, settings -> {
+            String policy = settings.getPolicyText();
+            if (policy == null) {
+                throw registryPolicyNotFound();
+            }
+            settings.setPolicyText(null);
+            return policy;
+        });
+    }
+
+    /**
+     * Stores the replication rules; an empty list clears them. The rules are checked against the
+     * model before this is reached. Floci does not replicate images.
+     */
+    public List<RegistrySettings.ReplicationRule> putReplicationConfiguration(
+            List<RegistrySettings.ReplicationRule> rules, String region) {
+        updateRegistrySettings(region, settings -> {
+            settings.setReplicationRules(rules.isEmpty() ? null : List.copyOf(rules));
+            return null;
+        });
+        return replicationRules(region);
+    }
+
+    /** The stored replication rules, empty when none are set. */
+    public List<RegistrySettings.ReplicationRule> replicationRules(String region) {
+        List<RegistrySettings.ReplicationRule> rules = registrySettings(region).getReplicationRules();
+        return rules == null ? List.of() : rules;
+    }
+
+    /**
+     * Stores the scanning configuration. The model's constraints are checked before this is
+     * reached; {@code CONTINUOUS_SCAN} is refused here with {@code BASIC}, as the API reference
+     * offers it only with enhanced scanning and the model cannot say so. Floci does not scan images.
+     */
+    public RegistrySettings putRegistryScanningConfiguration(String scanType, List<RegistrySettings.ScanningRule> rules,
+                                                             String region) {
+        String type = scanType == null ? "BASIC" : scanType;
+        List<RegistrySettings.ScanningRule> given = rules == null ? List.of() : rules;
+        for (RegistrySettings.ScanningRule rule : given) {
+            if ("BASIC".equals(type) && "CONTINUOUS_SCAN".equals(rule.scanFrequency())) {
+                throw new AwsException("InvalidParameterException",
+                        "CONTINUOUS_SCAN is supported only with the ENHANCED scan type", 400);
+            }
+        }
+        updateRegistrySettings(region, settings -> {
+            settings.setScanType(type);
+            settings.setScanningRules(List.copyOf(given));
+            return null;
+        });
+        return registryScanningConfiguration(region);
+    }
+
+    /** The scanning configuration, {@code BASIC} with no rules until one is put. */
+    public RegistrySettings registryScanningConfiguration(String region) {
+        RegistrySettings stored = registrySettings(region);
+        RegistrySettings view = new RegistrySettings();
+        view.setScanType(stored.getScanType() == null ? "BASIC" : stored.getScanType());
+        view.setScanningRules(stored.getScanningRules() == null ? List.of() : stored.getScanningRules());
+        return view;
+    }
+
+    /** The registry ID of the caller's account. */
+    public String registryId() {
+        return regionResolver.getAccountId();
+    }
+
+    private RegistrySettings registrySettings(String region) {
+        return registrySettingsStore.get(registrySettingsKey(region)).orElseGet(RegistrySettings::new);
+    }
+
+    /**
+     * Reads the registry's settings, changes them and writes them back under the registry's lock.
+     * The settings are one record, and Terraform puts the policy, replication and scanning
+     * configuration in parallel: unlocked, two writers could start from the same record and the
+     * later write would drop the other's field.
+     */
+    private <T> T updateRegistrySettings(String region, Function<RegistrySettings, T> change) {
+        String key = registrySettingsKey(region);
+        synchronized (registrySettingsLocks.computeIfAbsent(key, k -> new Object())) {
+            RegistrySettings settings = registrySettings(region);
+            T result = change.apply(settings);
+            registrySettingsStore.put(key, settings);
+            return result;
+        }
+    }
+
+    private String registrySettingsKey(String region) {
+        return region + "::" + regionResolver.getAccountId();
+    }
+
+    private AwsException registryPolicyNotFound() {
+        return new AwsException("RegistryPolicyNotFoundException",
+                "Registry policy does not exist in the registry with id '" + regionResolver.getAccountId() + "'", 400);
     }
 
     // ============================================================
