@@ -157,6 +157,7 @@ public class EmrService {
                 continue;
             }
             cluster.setState("TERMINATED");
+            releaseInstanceCapacity(cluster);
             cluster.setStateChangeReasonCode("USER_REQUEST");
             cluster.setStateChangeMessage("Terminated by user request");
             cluster.setEndDateTime(Instant.now());
@@ -268,6 +269,7 @@ public class EmrService {
 
     public synchronized List<String> addInstanceGroups(String clusterId, List<EmrInstanceGroup> groups) {
         EmrCluster cluster = requireCluster(clusterId);
+        rejectTerminatedCluster(cluster);
         List<String> ids = new ArrayList<>();
         for (EmrInstanceGroup group : groups) {
             group.setId("ig-" + randomId(13));
@@ -297,6 +299,7 @@ public class EmrService {
         List<EmrInstanceGroup> groups = new ArrayList<>();
         for (InstanceGroupModification mod : modifications) {
             EmrCluster found = clusterId != null ? requireCluster(clusterId) : clusterOwning(region, mod.instanceGroupId());
+            rejectTerminatedCluster(found);
             // One copy per cluster, so two groups of the same cluster are changed and stored together.
             EmrCluster cluster = touched.computeIfAbsent(found.getId(), id -> found);
             EmrInstanceGroup group = requireInstanceGroup(cluster, mod.instanceGroupId());
@@ -332,6 +335,7 @@ public class EmrService {
 
     public synchronized String addInstanceFleet(String clusterId, EmrInstanceFleet fleet) {
         EmrCluster cluster = requireCluster(clusterId);
+        rejectTerminatedCluster(cluster);
         fleet.setId("if-" + randomId(13));
         fleet.setProvisionedOnDemandCapacity(fleet.getTargetOnDemandCapacity());
         fleet.setProvisionedSpotCapacity(fleet.getTargetSpotCapacity());
@@ -348,6 +352,7 @@ public class EmrService {
         if (instanceFleetId == null) {
             throw invalid("InstanceFleetId is required.");
         }
+        rejectTerminatedCluster(cluster);
         EmrInstanceFleet fleet = cluster.getInstanceFleets().stream()
                 .filter(f -> instanceFleetId.equals(f.getId()))
                 .findFirst()
@@ -742,6 +747,12 @@ public class EmrService {
         return new AwsException("InvalidRequestException", message, 400);
     }
 
+    private static void rejectTerminatedCluster(EmrCluster cluster) {
+        if ("TERMINATED".equals(cluster.getState())) {
+            throw invalid("Cluster " + cluster.getId() + " is terminated.");
+        }
+    }
+
     private static EmrInstanceGroup requireInstanceGroup(EmrCluster cluster, String instanceGroupId) {
         if (instanceGroupId == null) {
             throw invalid("InstanceGroupId is required.");
@@ -791,9 +802,23 @@ public class EmrService {
             return;
         }
         cluster.setState("TERMINATED");
+        releaseInstanceCapacity(cluster);
         cluster.setStateChangeReasonCode("ALL_STEPS_COMPLETED");
         cluster.setStateChangeMessage("All steps completed.");
         cluster.setEndDateTime(Instant.now());
+    }
+
+    private void releaseInstanceCapacity(EmrCluster cluster) {
+        for (EmrInstanceGroup group : cluster.getInstanceGroups()) {
+            group.setState("TERMINATED");
+            group.setTerminatedInstanceCount(group.getRunningInstanceCount());
+            group.setRunningInstanceCount(0);
+        }
+        for (EmrInstanceFleet fleet : cluster.getInstanceFleets()) {
+            fleet.setState("TERMINATED");
+            fleet.setProvisionedOnDemandCapacity(0);
+            fleet.setProvisionedSpotCapacity(0);
+        }
     }
 
     private void initStep(EmrStep step) {
