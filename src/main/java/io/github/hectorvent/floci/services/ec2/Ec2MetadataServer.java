@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
@@ -136,6 +137,10 @@ public class Ec2MetadataServer {
 
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
+        // Ahead of every route, so a path IMDS does not serve also answers 401 when the instance
+        // requires tokens, as on AWS. A method-free route, so methods IMDS does not serve keep the
+        // router's own answers rather than all becoming 405.
+        router.route().handler(this::refuseTokenlessReadsWhenTokensAreRequired);
 
         // IMDSv2 token endpoint
         router.put("/latest/api/token").handler(this::handleToken);
@@ -496,6 +501,24 @@ public class Ec2MetadataServer {
         return containerIpToInstance.get(remoteIp);
     }
 
+    /**
+     * An instance whose HttpTokens is required refuses IMDSv1: as AWS does, a GET or HEAD without a
+     * token gets 401 before any data is looked up, whatever the path. (No route serves HEAD, so one
+     * with a token gets the router's answer: 405 on a path a GET route serves, 404 elsewhere.)
+     */
+    private void refuseTokenlessReadsWhenTokensAreRequired(RoutingContext ctx) {
+        HttpMethod method = ctx.request().method();
+        String token = ctx.request().getHeader("x-aws-ec2-metadata-token");
+        if ((HttpMethod.GET.equals(method) || HttpMethod.HEAD.equals(method)) && (token == null || token.isBlank())) {
+            Instance inst = resolveInstanceByIp(ctx);
+            if (inst != null && "required".equals(inst.effectiveMetadataOptions().getHttpTokens())) {
+                ctx.response().setStatusCode(401).end();
+                return;
+            }
+        }
+        ctx.next();
+    }
+
     private Instance resolveInstance(RoutingContext ctx) {
         String remoteIp = ctx.request().remoteAddress().host();
         Instance inst = containerIpToInstance.get(remoteIp);
@@ -503,7 +526,8 @@ public class Ec2MetadataServer {
         // IMDSv2: a presented token must be valid; an invalid or expired one gets 401 so the
         // caller fetches a new token. A token is not valid on another instance, so a caller whose
         // IP maps to a different instance also gets 401; an unregistered IP defers to the token.
-        // Requests without a token fall back to IMDSv1.
+        // Requests without a token fall back to IMDSv1; one whose instance requires tokens has
+        // already been refused before routing.
         String token = ctx.request().getHeader("x-aws-ec2-metadata-token");
         if (token != null && !token.isBlank()) {
             SessionToken session = tokens.get(token);
