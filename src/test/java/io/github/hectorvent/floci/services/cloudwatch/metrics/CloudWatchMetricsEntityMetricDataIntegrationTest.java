@@ -14,6 +14,7 @@ import java.time.Instant;
 import static io.restassured.RestAssured.config;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 
@@ -152,5 +153,51 @@ class CloudWatchMetricsEntityMetricDataIntegrationTest {
                 .statusCode(200)
                 .body("GetMetricStatisticsResponse.GetMetricStatisticsResult.Datapoints.member.Sum",
                         equalTo("6.5"));
+    }
+
+    @Test
+    void jsonNestedDatumWithoutMetricNameIsRejectedAndNothingIsStored() {
+        json("PutMetricData")
+                .body("""
+                        {"Namespace":"CWAgent/JsonInvalid",
+                         "MetricData":[{"MetricName":"TopLevel","Value":1}],
+                         "EntityMetricData":[{"MetricData":[{"Value":2}]}]}
+                        """)
+        .when().post("/")
+        .then()
+                .statusCode(400)
+                .header("x-amzn-query-error", equalTo("MissingParameter;Sender"))
+                .body("__type", equalTo("MissingRequiredParameterException"))
+                .body("message", equalTo(
+                        "The parameter EntityMetricData.member.1.MetricData.member.1.MetricName is required."));
+
+        json("ListMetrics")
+                .body("{\"Namespace\":\"CWAgent/JsonInvalid\"}")
+        .when().post("/")
+        .then()
+                .statusCode(200)
+                .body("Metrics", empty());
+    }
+
+    @Test
+    void queryMemberWithoutMetricNameIsRejectedAndNothingIsStored() {
+        query("PutMetricData")
+                .formParam("Namespace", "CWAgent/QueryInvalid")
+                .formParam("MetricData.member.1.Value", "1")
+                .formParam("MetricData.member.2.MetricName", "Valid")
+                .formParam("MetricData.member.2.Value", "2")
+        .when().post("/")
+        .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("MissingParameter"))
+                .body("ErrorResponse.Error.Message",
+                        equalTo("The parameter MetricData.member.1.MetricName is required."));
+
+        query("ListMetrics")
+                .formParam("Namespace", "CWAgent/QueryInvalid")
+        .when().post("/")
+        .then()
+                .statusCode(200)
+                .body("ListMetricsResponse.ListMetricsResult.Metrics.member.size()", equalTo(0));
     }
 }
