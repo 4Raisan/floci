@@ -210,6 +210,19 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     // ── Load Balancers ────────────────────────────────────────────────────────
 
     /**
+     * The subnets a CreateLoadBalancer or SetSubnets request names: {@code Subnets}, or else the subnet
+     * of each {@code SubnetMappings} entry. The two are alternatives, so a request that names subnets
+     * both ways is refused with the error AWS gives; an empty one does not count.
+     */
+    public static List<String> requestedSubnets(List<String> subnets, List<String> mappingSubnetIds) {
+        if (!subnets.isEmpty() && !mappingSubnetIds.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "You can specify either subnets or subnet mappings, not both", 400);
+        }
+        return mappingSubnetIds.isEmpty() ? subnets : mappingSubnetIds;
+    }
+
+    /**
      * Resolving the subnets and publishing the balancer happen under EC2's subnet lock, so a
      * DeleteSubnet cannot pass its dependency check in between and leave the balancer on a subnet
      * that is gone.
@@ -242,6 +255,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         String id = randomHex16();
         String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
         String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
+        requireSubnets(lbType, subnets);
         String vpcId = resolveSubnetVpcId(region, lbType, subnets);
 
         LoadBalancer lb = new LoadBalancer();
@@ -256,7 +270,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         lb.setType(lbType);
         lb.setIpAddressType(ipType);
         lb.setRegion(region);
-        if (subnets != null) lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
+        lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
         if (securityGroups != null) lb.setSecurityGroups(new ArrayList<>(securityGroups));
 
         regionLbs.put(arn, lb);
@@ -266,6 +280,22 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             tags.put(arn, new LinkedHashMap<>(initialTags));
         }
         return lb;
+    }
+
+    /**
+     * Every load balancer type takes {@code Subnets} or {@code SubnetMappings}, so a request with
+     * neither is refused before anything is created, with the message AWS gives an Application or a
+     * Network Load Balancer. A Gateway Load Balancer, which takes subnets the way a Network Load
+     * Balancer does, gets the Network one. This runs after the duplicate-name check, because a
+     * CloudFormation stack update finds the balancer it keeps through DuplicateLoadBalancerName,
+     * whatever subnets its template names.
+     */
+    private static void requireSubnets(String lbType, List<String> subnets) {
+        if (subnets == null || subnets.isEmpty()) {
+            throw new AwsException("ValidationError", "application".equals(lbType)
+                    ? "At least two subnets in two different Availability Zones must be specified"
+                    : "At least one subnet must be specified", 400);
+        }
     }
 
     /**
