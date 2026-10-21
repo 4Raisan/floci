@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.dsql;
 
 import com.github.dockerjava.api.DockerClient;
+import io.github.hectorvent.floci.core.common.PostgresWire;
 import io.github.hectorvent.floci.services.dsql.dataplane.DsqlEndpoint;
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
@@ -16,8 +18,16 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.postgresql.ssl.NonValidatingFactory;
 import org.postgresql.util.PSQLException;
+import org.postgresql.util.PSQLWarning;
 
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -25,6 +35,8 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -32,6 +44,7 @@ import java.util.Properties;
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -48,6 +61,7 @@ class DsqlDataPlaneIntegrationTest {
 
     private static final String ACCOUNT = "111122223333";
     private static final String REGION = "eu-west-1";
+    private static final String ROLE_ARN = "arn:aws:iam::" + ACCOUNT + ":role/service/app-role";
     private static final String AUTH = "AWS4-HMAC-SHA256 Credential=" + ACCOUNT
             + "/20261016/" + REGION + "/dsql/aws4_request, SignedHeaders=host, Signature=abc";
 
@@ -56,6 +70,9 @@ class DsqlDataPlaneIntegrationTest {
 
     @Inject
     DsqlEndpoint endpoint;
+
+    @Inject
+    IamService iamService;
 
     @ConfigProperty(name = "quarkus.http.test-port", defaultValue = "0")
     int httpPort;
@@ -94,11 +111,14 @@ class DsqlDataPlaneIntegrationTest {
         try (Connection connection = connect("admin", adminToken());
              Statement statement = connection.createStatement();
              ResultSet row = statement.executeQuery("SELECT current_user, current_setting('transaction_isolation'),"
-                     + " (SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = 'public')")) {
+                     + " (SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = 'public'),"
+                     + " sys.iam_session_user(), length(sys.current_session_id())")) {
             assertTrue(row.next());
             assertEquals("admin", row.getString(1));
             assertEquals("repeatable read", row.getString(2));
             assertEquals("admin", row.getString(3));
+            assertEquals("arn:aws:iam::" + ACCOUNT + ":root", row.getString(4));
+            assertEquals(26, row.getInt(5));
         }
     }
 
@@ -141,24 +161,197 @@ class DsqlDataPlaneIntegrationTest {
         assertEquals("55000", otherDatabase.getSQLState());
     }
 
-    /** A role other than {@code admin} signs in only for an IAM role mapped to it, and none is. */
     @Test
-    void aRoleOtherThanAdminIsRefusedAsAnUnmappedRole() throws Exception {
+    void aRoleLogsInOnlyForTheIamRoleMappedToIt() throws Exception {
+        String accessKeyId = "ASIA" + Long.toString(System.nanoTime(), 36).toUpperCase();
+        String secret = "app+session/secret=key";
+        String sessionToken = "IQoJb3JpZ2luX2VjEJr+app/role+session==";
+        iamService.registerLambdaExecutionRoleSession(ACCOUNT, accessKeyId, secret, sessionToken, ROLE_ARN);
         try (Connection admin = connect("admin", adminToken()); Statement statement = admin.createStatement()) {
             statement.execute("CREATE ROLE app_role WITH LOGIN");
+
+            PSQLException unmapped = assertThrows(PSQLException.class, () -> connect("app_role",
+                    token("DbConnect", accessKeyId, secret, Instant.now(), 900, sessionToken)).close());
+            assertEquals("unable to accept connection, access denied", unmapped.getServerErrorMessage().getMessage());
+            assertEquals("28000", unmapped.getSQLState());
+
+            statement.execute("AWS IAM GRANT app_role TO '" + ROLE_ARN + "'");
+            try (Connection app = connect("app_role", token("DbConnect", accessKeyId, secret, Instant.now(), 900,
+                         sessionToken));
+                 Statement query = app.createStatement()) {
+                try (ResultSet row = query.executeQuery("SELECT current_user, sys.iam_session_user()")) {
+                    assertTrue(row.next());
+                    assertEquals("app_role", row.getString(1));
+                    assertEquals(ROLE_ARN, row.getString(2));
+                }
+            }
+
+            statement.execute("AWS IAM GRANT app_role TO '" + ROLE_ARN + "'");
+            assertEquals("IAM role \"" + ROLE_ARN + "\" has already been granted access to role \"app_role\" by role"
+                    + " \"admin\"", ((PSQLWarning) statement.getWarnings()).getServerErrorMessage().getMessage());
+            PSQLException mapped = assertThrows(PSQLException.class, () -> statement.execute("DROP ROLE app_role"));
+            assertEquals("2BP01", mapped.getSQLState());
+            assertEquals("role \"app_role\" cannot be dropped because some objects depend on it",
+                    mapped.getServerErrorMessage().getMessage());
+            assertEquals("privileges for trust relationship of role app_role with arn " + ROLE_ARN,
+                    mapped.getServerErrorMessage().getDetail());
+            assertNull(mapped.getServerErrorMessage().getWhere());
+
+            PSQLException adminAction = assertThrows(PSQLException.class, () -> connect("app_role",
+                    token("DbConnectAdmin", accessKeyId, secret, Instant.now(), 900, sessionToken)).close());
+            assertEquals("Wrong user to action mapping. user: app_role, action: DbConnectAdmin",
+                    adminAction.getServerErrorMessage().getHint());
+
+            PSQLException superuser = assertThrows(PSQLException.class, () ->
+                    statement.execute("AWS IAM GRANT dbowner TO '" + ROLE_ARN + "'"));
+            assertEquals("0LP01", superuser.getSQLState());
+            assertEquals("cannot establish trust with role \"dbowner\"", superuser.getServerErrorMessage().getMessage());
+            PSQLException itself = assertThrows(PSQLException.class, () ->
+                    statement.execute("AWS IAM GRANT admin TO '" + ROLE_ARN + "'"));
+            assertEquals("42501", itself.getSQLState());
+            assertEquals("Only roles with the ADMIN option on role \"admin\" may grant IAM trust to this role.",
+                    itself.getServerErrorMessage().getDetail());
+            assertThrows(PSQLException.class, () -> connect("dbowner",
+                    token("DbConnect", accessKeyId, secret, Instant.now(), 900, sessionToken)).close());
+
+            statement.execute("AWS IAM REVOKE app_role FROM '" + ROLE_ARN + "'");
+            assertThrows(PSQLException.class, () -> connect("app_role",
+                    token("DbConnect", accessKeyId, secret, Instant.now(), 900, sessionToken)).close());
+            statement.execute("DROP ROLE app_role");
+        } finally {
+            iamService.unregisterSession(ACCOUNT, accessKeyId);
         }
+    }
 
-        PSQLException unmapped = assertThrows(PSQLException.class, () ->
-                connect("app_role", token("DbConnect", "test", "test", Instant.now(), 900, null)).close());
-        assertEquals("28000", unmapped.getSQLState());
-        assertEquals("unable to accept connection, access denied", unmapped.getServerErrorMessage().getMessage());
-        assertTrue(unmapped.getServerErrorMessage().getDetail().startsWith("Session Id: "));
+    @Test
+    void anIamUserLogsInForTheRoleMappedToIt() throws Exception {
+        String userName = "dsql-" + System.nanoTime();
+        EnforcementFixtures.UserCredentials user = EnforcementFixtures.createUser(cleanup, httpPort,
+                EnforcementFixtures.auth(ACCOUNT, "iam"), userName);
+        String userArn = "arn:aws:iam::" + ACCOUNT + ":user/" + userName;
+        try (Connection admin = connect("admin", adminToken()); Statement statement = admin.createStatement()) {
+            statement.execute("CREATE ROLE user_role WITH LOGIN");
+            statement.execute("AWS IAM GRANT user_role TO '" + userArn + "'");
+            try (Connection app = connect("user_role", token("DbConnect", user.accessKeyId(), user.secretAccessKey(),
+                         Instant.now(), 900, null));
+                 Statement query = app.createStatement();
+                 ResultSet row = query.executeQuery("SELECT current_user, sys.iam_session_user()")) {
+                assertTrue(row.next());
+                assertEquals("user_role", row.getString(1));
+                assertEquals(userArn, row.getString(2));
+            }
 
-        PSQLException adminAction = assertThrows(PSQLException.class, () ->
-                connect("app_role", token("DbConnectAdmin", "test", "test", Instant.now(), 900, null)).close());
-        assertEquals("08006", adminAction.getSQLState());
-        assertEquals("Wrong user to action mapping. user: app_role, action: DbConnectAdmin",
-                adminAction.getServerErrorMessage().getHint());
+            PSQLException group = assertThrows(PSQLException.class, () ->
+                    statement.execute("AWS IAM GRANT user_role TO 'arn:aws:iam::" + ACCOUNT + ":group/g'"));
+            assertEquals("0P000", group.getSQLState());
+            statement.execute("AWS IAM REVOKE user_role FROM '" + userArn + "'");
+            statement.execute("DROP ROLE user_role");
+        }
+    }
+
+    @Test
+    void nothingASessionRunsChangesWhoItIs() throws Exception {
+        try (Connection connection = connect("admin", adminToken()); Statement statement = connection.createStatement()) {
+            statement.execute("CREATE FUNCTION spoof() RETURNS text LANGUAGE sql AS"
+                    + " $$ SELECT set_config('dsql.iam_session_user', 'spoofed', false) $$");
+            statement.execute("SELECT spoof()");
+            try (ResultSet row = statement.executeQuery("SELECT sys.iam_session_user()")) {
+                assertTrue(row.next());
+                assertEquals("arn:aws:iam::" + ACCOUNT + ":root", row.getString(1));
+            }
+            PSQLException written = assertThrows(PSQLException.class, () ->
+                    statement.execute("UPDATE sys.session_identity SET iam_session_user = 'spoofed'"));
+            assertEquals("42501", written.getSQLState());
+            statement.execute("DROP FUNCTION spoof()");
+        }
+    }
+
+    @Test
+    void aRoleDroppedInsideAFunctionTakesItsMappingsWithIt() throws Exception {
+        try (Connection connection = connect("admin", adminToken()); Statement statement = connection.createStatement()) {
+            statement.execute("CREATE ROLE dropped_role");
+            statement.execute("AWS IAM GRANT dropped_role TO '" + ROLE_ARN + "'");
+            statement.execute("CREATE FUNCTION drop_it() RETURNS void LANGUAGE sql AS 'DROP ROLE dropped_role'");
+            statement.execute("SELECT drop_it()");
+            statement.execute("CREATE ROLE dropped_role");
+
+            String mappings = "SELECT count(*) FROM sys.iam_pg_role_mappings WHERE arn = '" + ROLE_ARN + "'"
+                    + " AND pg_role_name = 'dropped_role'";
+            try (ResultSet row = statement.executeQuery(mappings)) {
+                assertTrue(row.next());
+                assertEquals(0, row.getInt(1));
+            }
+            PSQLException none = assertThrows(PSQLException.class, () ->
+                    statement.execute("AWS IAM REVOKE dropped_role FROM '" + ROLE_ARN + "'"));
+            assertEquals("42704", none.getSQLState());
+            statement.execute("AWS IAM GRANT dropped_role TO '" + ROLE_ARN + "'");
+            try (ResultSet row = statement.executeQuery(mappings)) {
+                assertTrue(row.next());
+                assertEquals(1, row.getInt(1));
+            }
+            statement.execute("AWS IAM REVOKE dropped_role FROM '" + ROLE_ARN + "'");
+            statement.execute("DROP ROLE dropped_role");
+            statement.execute("DROP FUNCTION drop_it()");
+        }
+    }
+
+    /**
+     * What a pipelining client sends before reading any answer: each statement shows its own command
+     * tag, and a Parse the database refuses leaves the statement it named as it was.
+     */
+    @Test
+    void pipelinedStatementsShowTheirOwnCommandTags() throws Exception {
+        try (Connection admin = connect("admin", adminToken()); Statement statement = admin.createStatement()) {
+            statement.execute("CREATE ROLE pipelined_role");
+        }
+        String grant = "AWS IAM GRANT pipelined_role TO '" + ROLE_ARN + "'";
+        String revoke = "AWS IAM REVOKE pipelined_role FROM '" + ROLE_ARN + "'";
+        try (WireClient client = new WireClient("admin", adminToken())) {
+            client.send(query("SELECT 1"), query(grant), query(revoke + "; SELECT 2"));
+            assertEquals(List.of("SELECT 1"), client.untilReady());
+            assertEquals(List.of("AWS IAM GRANT"), client.untilReady());
+            assertEquals(List.of("AWS IAM REVOKE", "SELECT 1"), client.untilReady());
+
+            client.send(parse("s1", "SELECT 1"), sync(), parse("s1", grant), sync(),
+                    bind("s1"), execute(), sync());
+            assertEquals(List.of(), client.untilReady());
+            assertEquals(List.of("ERROR 42P05"), client.untilReady());
+            assertEquals(List.of("SELECT 1"), client.untilReady());
+
+            client.send(close("s1"), parse("s1", grant), bind("s1"), execute(), parse("s2", revoke), bind("s2"),
+                    execute(), sync(), query("SELECT 3"));
+            assertEquals(List.of("AWS IAM GRANT", "AWS IAM REVOKE"), client.untilReady());
+            assertEquals(List.of("SELECT 1"), client.untilReady());
+        }
+        try (Connection admin = connect("admin", adminToken()); Statement statement = admin.createStatement()) {
+            statement.execute("DROP ROLE pipelined_role");
+        }
+    }
+
+    @Test
+    void dsqlsParametersAreReservedAsDsqlReservesThem() throws Exception {
+        try (Connection connection = connect("admin", adminToken()); Statement statement = connection.createStatement()) {
+            for (String sql : List.of("SET dsql.x = 1", "RESET dsql.x", "SELECT set_config('dsql.x', '1', false)",
+                    "ALTER ROLE admin SET dsql.x = 1",
+                    "CREATE FUNCTION reserved() RETURNS int LANGUAGE sql SET dsql.x = 1 AS 'SELECT 1'")) {
+                PSQLException reserved = assertThrows(PSQLException.class, () -> statement.execute(sql), sql);
+                assertEquals("42602", reserved.getSQLState(), sql);
+                assertEquals("invalid configuration parameter name \"dsql.x\"",
+                        reserved.getServerErrorMessage().getMessage(), sql);
+                assertEquals("\"dsql\" is a reserved prefix.", reserved.getServerErrorMessage().getDetail(), sql);
+            }
+            PSQLException shown = assertThrows(PSQLException.class, () -> statement.execute("SHOW dsql.session_id"));
+            assertEquals("42704", shown.getSQLState());
+            assertEquals("unrecognized configuration parameter \"dsql.session_id\"",
+                    shown.getServerErrorMessage().getMessage());
+
+            PSQLException custom = assertThrows(PSQLException.class, () ->
+                    statement.execute("SELECT set_config('myapp.foo', 'x', false)"));
+            assertEquals("0A000", custom.getSQLState());
+            assertEquals("setting configuration parameter \"myapp.foo\" not supported",
+                    custom.getServerErrorMessage().getMessage());
+            statement.execute("SET myapp.foo = 'x'");
+        }
     }
 
     @Test
@@ -185,12 +378,14 @@ class DsqlDataPlaneIntegrationTest {
         assertEquals(null, fromTheDatabase.getServerErrorMessage().getFile());
 
         Properties ignored = properties("admin", adminToken());
-        ignored.setProperty("options", "--search_path=elsewhere -c search_path=first -c search_path=second");
+        ignored.setProperty("options", "--dsql.iam_session_user=spoofed --search_path=elsewhere"
+                + " -c search_path=first -c search_path=second");
         try (Connection connection = DriverManager.getConnection(url(), ignored);
              Statement statement = connection.createStatement();
-             ResultSet row = statement.executeQuery("SELECT current_setting('search_path')")) {
+             ResultSet row = statement.executeQuery("SELECT current_setting('search_path'), sys.iam_session_user()")) {
             assertTrue(row.next());
             assertEquals("first", row.getString(1));
+            assertEquals("arn:aws:iam::" + ACCOUNT + ":root", row.getString(2));
         }
     }
 
@@ -209,6 +404,91 @@ class DsqlDataPlaneIntegrationTest {
                 other.accessKeyId(), other.secretAccessKey(), Instant.now(), 900, null)).close());
         assertEquals("08006", foreign.getSQLState());
         assertEquals("unable to accept connection, access denied", foreign.getServerErrorMessage().getMessage());
+    }
+
+    /** A client that writes the wire protocol itself, to send what JDBC sends one message at a time. */
+    private final class WireClient implements AutoCloseable {
+
+        private final Socket socket;
+        private final InputStream in;
+        private final OutputStream out;
+
+        WireClient(String user, String password) throws Exception {
+            Socket plain = new Socket("127.0.0.1", endpoint.port());
+            plain.getOutputStream().write(PostgresWire.int32(8));
+            plain.getOutputStream().write(PostgresWire.int32(PostgresWire.SSL_REQUEST));
+            assertEquals('S', plain.getInputStream().read());
+            socket = new NonValidatingFactory(null).createSocket(plain, host, endpoint.port(), true);
+            in = new BufferedInputStream(socket.getInputStream());
+            out = socket.getOutputStream();
+            Map<String, String> startup = new LinkedHashMap<>();
+            startup.put("user", user);
+            startup.put("database", "postgres");
+            out.write(PostgresWire.startupMessage(startup));
+            assertEquals('R', PostgresWire.read(in, Integer.MAX_VALUE, "message").type());
+            send(message('p', PostgresWire.cStringBytes(password)));
+            untilReady();
+        }
+
+        void send(byte[]... messages) throws IOException {
+            for (byte[] message : messages) {
+                out.write(message);
+            }
+            out.flush();
+        }
+
+        /** The command tags, and the SQLSTATE of an error, up to the next ReadyForQuery. */
+        List<String> untilReady() throws IOException {
+            List<String> answers = new ArrayList<>();
+            while (true) {
+                PostgresWire.Message message = PostgresWire.read(in, Integer.MAX_VALUE, "message");
+                switch (message.type()) {
+                    case 'C' -> answers.add(PostgresWire.cString(message.body(), 0).value());
+                    case 'E' -> answers.add("ERROR " + PostgresWire.parseFields(message.body(), 0).get('C'));
+                    case 'Z' -> {
+                        return answers;
+                    }
+                    default -> {
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+        }
+    }
+
+    private static byte[] query(String sql) throws IOException {
+        return message('Q', PostgresWire.cStringBytes(sql));
+    }
+
+    private static byte[] parse(String statement, String sql) throws IOException {
+        return message('P', PostgresWire.cStringBytes(statement), PostgresWire.cStringBytes(sql), new byte[2]);
+    }
+
+    /** The unnamed portal for {@code statement}, with no parameters and text results. */
+    private static byte[] bind(String statement) throws IOException {
+        return message('B', PostgresWire.cStringBytes(""), PostgresWire.cStringBytes(statement), new byte[6]);
+    }
+
+    private static byte[] execute() throws IOException {
+        return message('E', PostgresWire.cStringBytes(""), PostgresWire.int32(0));
+    }
+
+    private static byte[] close(String statement) throws IOException {
+        return message('C', new byte[] {'S'}, PostgresWire.cStringBytes(statement));
+    }
+
+    private static byte[] sync() throws IOException {
+        return message('S');
+    }
+
+    private static byte[] message(int type, byte[]... parts) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        PostgresWire.write(bytes, type, parts);
+        return bytes.toByteArray();
     }
 
     /** A new IAM user's access key in {@code account}, removed with the user after the test. */
