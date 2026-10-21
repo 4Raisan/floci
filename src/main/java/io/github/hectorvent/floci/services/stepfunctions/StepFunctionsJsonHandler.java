@@ -552,14 +552,18 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleListActivities(JsonNode request, String region) {
-        List<Activity> list = service.listActivities(region);
+        PaginatedResult<Activity> page = service.listActivities(region,
+                parseOptionalInt(request, "maxResults"), optionalText(request, "nextToken"));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("activities");
-        for (Activity a : list) {
+        for (Activity a : page.items()) {
             ObjectNode item = array.addObject();
             item.put("activityArn", a.getActivityArn());
             item.put("name", a.getName());
             item.put("creationDate", a.getCreationDate());
+        }
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }
@@ -696,9 +700,9 @@ public class StepFunctionsJsonHandler {
 
     /**
      * Reads an optional integer field from the JSON request, rejecting wrong types
-     * with a typed ValidationException. JsonNode.asInt() silently coerces strings,
-     * fractional numbers, and explicit nulls to 0, which would let invalid payloads
-     * slip through as 0 (and thus be treated as "use default" by the service).
+     * with a typed ValidationException. JsonNode.intValue() silently truncates
+     * out-of-range integers, while asInt() also coerces wrong types to 0; either
+     * can make an invalid value look like "use default" to the service.
      * Returns null when the field is absent or explicitly null in the JSON.
      */
     private static Integer parseOptionalInt(JsonNode request, String fieldName) {
@@ -706,7 +710,7 @@ public class StepFunctionsJsonHandler {
         if (node == null || node.isNull()) {
             return null;
         }
-        if (!node.isIntegralNumber()) {
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
             throw new AwsException("ValidationException",
                     "Value '" + node + "' at '" + fieldName
                             + "' failed to satisfy constraint: Member must be an integer.", 400);
