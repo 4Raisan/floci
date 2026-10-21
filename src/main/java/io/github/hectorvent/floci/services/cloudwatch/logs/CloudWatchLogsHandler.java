@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.AccountPolicy;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogDestination;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
@@ -127,11 +128,23 @@ public class CloudWatchLogsHandler {
 
     private Response handleDescribeLogGroups(JsonNode request, String region) {
         String prefix = request.path("logGroupNamePrefix").asText(null);
-        List<LogGroup> groups = logsService.describeLogGroups(prefix, region);
+        int limit = 50;
+        if (request.hasNonNull("limit")) {
+            JsonNode value = request.get("limit");
+            if (!value.isIntegralNumber() || !value.canConvertToInt()) {
+                throw new AwsException("InvalidParameterException", "limit must be an integer.", 400);
+            }
+            limit = value.intValue();
+        }
+        String nextToken = request.path("nextToken").asText(null);
+        if (request.hasNonNull("nextToken") && !request.get("nextToken").isTextual()) {
+            throw CloudWatchLogsService.invalidNextToken();
+        }
+        PaginatedResult<LogGroup> page = logsService.describeLogGroups(prefix, region, limit, nextToken);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode groupsArray = objectMapper.createArrayNode();
-        for (LogGroup g : groups) {
+        for (LogGroup g : page.items()) {
             ObjectNode node = objectMapper.createObjectNode();
             node.put("logGroupName", g.getLogGroupName());
             node.put("creationTime", g.getCreatedTime());
@@ -150,6 +163,9 @@ public class CloudWatchLogsHandler {
             groupsArray.add(node);
         }
         response.set("logGroups", groupsArray);
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
+        }
         return Response.ok(response).build();
     }
 
