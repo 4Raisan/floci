@@ -214,7 +214,10 @@ class ElbV2ServiceTest {
         verify(ec2Service, never()).describeSubnets(anyString(), anyList(), any());
     }
 
-    /** The message depends on the balancer's type, so a balancer that does not exist is reported first. */
+    /**
+     * Through the SetSubnets action with neither form: the message depends on the balancer's type, so a
+     * balancer that does not exist is reported first.
+     */
     @Test
     void setSubnetsForAMissingBalancerReportsItBeforeMissingSubnets() {
         MultivaluedHashMap<String, String> params = new MultivaluedHashMap<>();
@@ -226,22 +229,6 @@ class ElbV2ServiceTest {
         String xml = (String) response.getEntity();
         assertEquals(400, response.getStatus(), xml);
         assertTrue(xml.contains("<Code>LoadBalancerNotFound</Code>"), xml);
-    }
-
-    /**
-     * Only the SetSubnets action refuses an empty list. A CloudFormation rollback moves a kept
-     * balancer back onto the subnets it had before the update, and for a balancer an earlier Floci
-     * version saved without subnets that is none.
-     */
-    @Test
-    void aMoveBackOntoNoSubnetsIsStillTaken() {
-        LoadBalancer lb = service.createLoadBalancer(REGION, "moved-back", "internal", "application", "ipv4",
-                ALB_SUBNETS, List.of(), Map.of());
-
-        service.setSubnets(REGION, lb.getLoadBalancerArn(), List.of());
-
-        assertTrue(service.describeLoadBalancers(REGION, List.of(lb.getLoadBalancerArn()), null, null, null)
-                .getFirst().getAvailabilityZones().isEmpty());
     }
 
     /**
@@ -1020,5 +1007,85 @@ class ElbV2ServiceTest {
         assertEquals("vpc-b", moved.getVpcId());
         assertEquals(List.of("subnet-c", "subnet-d"),
                 moved.getAvailabilityZones().stream().map(AvailabilityZone::getSubnetId).toList());
+    }
+
+    /**
+     * SetSubnets counts the subnets the way CreateLoadBalancer does: one subnet for an Application Load
+     * Balancer gets the refusal CreateLoadBalancer gives it, before the subnet is looked up, and the
+     * balancer keeps its zones and its VPC.
+     */
+    @Test
+    void anApplicationLoadBalancerMovedOntoOneSubnetIsRefusedBeforeTheSubnetIsLookedUp() {
+        LoadBalancer lb = service.createLoadBalancer(REGION, "set-one-subnet", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of());
+        // Stubbed so that a lookup before the count would reach the zone check, not a SubnetNotFound from the mock.
+        lenient().when(ec2Service.describeSubnets(REGION, List.of("subnet-a"), Map.of()))
+                .thenReturn(List.of(subnet("subnet-a", REGION + "a")));
+        clearInvocations(ec2Service);
+
+        AwsException refusal = assertThrows(AwsException.class,
+                () -> service.setSubnets(REGION, lb.getLoadBalancerArn(), List.of("subnet-a")));
+
+        assertEquals("ValidationError", refusal.getErrorCode());
+        assertEquals("At least two subnets in two different Availability Zones must be specified",
+                refusal.getMessage());
+        assertEquals(400, refusal.getHttpStatus());
+        LoadBalancer kept = service.describeLoadBalancers(REGION, List.of(lb.getLoadBalancerArn()), null, null,
+                null).getFirst();
+        assertEquals(ALB_SUBNETS, kept.getAvailabilityZones().stream().map(AvailabilityZone::getSubnetId).toList());
+        assertEquals("vpc-a", kept.getVpcId());
+        verify(ec2Service, never()).describeSubnets(anyString(), anyList(), any());
+    }
+
+    /**
+     * A Network or Gateway Load Balancer can be in a single Availability Zone, so SetSubnets onto one
+     * subnet is taken: the Network Load Balancer leaves one of its two subnets, and the Gateway Load
+     * Balancer, which AWS lets add subnets but not drop them, is set onto the one it is on.
+     */
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {"network|subnet-a,subnet-b", "gateway|subnet-a"})
+    void aNetworkOrGatewayLoadBalancerCanBeSetOntoOneSubnet(String type, String createdOn) {
+        when(ec2Service.describeSubnets(REGION, List.of("subnet-a"), Map.of()))
+                .thenReturn(List.of(subnet("subnet-a", REGION + "a")));
+        LoadBalancer lb = service.createLoadBalancer(REGION, "set-one-" + type, "internal", type, "ipv4",
+                List.of(createdOn.split(",")), List.of(), Map.of());
+
+        service.setSubnets(REGION, lb.getLoadBalancerArn(), List.of("subnet-a"));
+
+        assertEquals(List.of("subnet-a"), service.describeLoadBalancers(REGION, List.of(lb.getLoadBalancerArn()),
+                null, null, null).getFirst().getAvailabilityZones().stream().map(AvailabilityZone::getSubnetId).toList());
+    }
+
+    /**
+     * setSubnets counts only a list that names subnets; the SetSubnets action refuses an empty one before
+     * it gets here. A CloudFormation update moves a balancer an earlier Floci version saved without
+     * subnets onto the template's subnets, and when the update rolls back, the move back onto none is taken.
+     */
+    @Test
+    void aRollbackOntoNoSubnetsIsNotCounted() {
+        LoadBalancer saved = service.createLoadBalancer(REGION, "saved-without-subnets", "internal", "application",
+                "ipv4", ALB_SUBNETS, List.of(), Map.of());
+        saved.setAvailabilityZones(new ArrayList<>());
+        saved.setVpcId(null);
+        service.setSubnets(REGION, saved.getLoadBalancerArn(), ALB_SUBNETS);
+
+        service.setSubnets(REGION, saved.getLoadBalancerArn(), List.of());
+
+        assertTrue(service.describeLoadBalancers(REGION, List.of(saved.getLoadBalancerArn()), null, null, null)
+                .getFirst().getAvailabilityZones().isEmpty());
+    }
+
+    /**
+     * Through setSubnets with one subnet: the count depends on the balancer's type, so a balancer that
+     * does not exist is reported first.
+     */
+    @Test
+    void setSubnetsOntoOneSubnetReportsAMissingBalancerFirst() {
+        AwsException refusal = assertThrows(AwsException.class, () -> service.setSubnets(REGION,
+                "arn:aws:elasticloadbalancing:" + REGION + ":000000000000:loadbalancer/app/missing/0123456789abcdef",
+                List.of("subnet-a")));
+
+        assertEquals("LoadBalancerNotFound", refusal.getErrorCode());
+        verify(ec2Service, never()).describeSubnets(anyString(), anyList(), any());
     }
 }
