@@ -29,7 +29,7 @@ public class ZipExtractor {
 
     private static final char BACKSLASH = '\\';
     public static final long DIRECT_UPLOAD_MAX_COMPRESSED_BYTES = 50L * 1024 * 1024;
-    private static final long S3_MAX_COMPRESSED_BYTES = 250L * 1024 * 1024;
+    static final long S3_MAX_COMPRESSED_BYTES = 250L * 1024 * 1024;
     static final long MAX_EXPANDED_BYTES = 250L * 1024 * 1024;
     static final long MAX_ENTRY_BYTES = 250L * 1024 * 1024;
     public static final int DEFAULT_MAX_ENTRIES = 100_000;
@@ -66,13 +66,17 @@ public class ZipExtractor {
 
     /** For an archive already on disk, which is opened in place instead of read into the heap and staged. */
     public void extractTo(Path zipFile, Path targetDir, int maxEntries) throws IOException {
+        extractTo(zipFile, targetDir, maxEntries, null);
+    }
+
+    public void extractTo(Path zipFile, Path targetDir, int maxEntries, Runnable beforeInstall) throws IOException {
         checkLimits(maxEntries, Files.size(zipFile));
         Path absTarget = targetDir.toAbsolutePath().normalize();
         Files.createDirectories(absTarget.getParent());
-        extract(zipFile, absTarget, maxEntries, null);
+        extract(zipFile, absTarget, maxEntries, beforeInstall);
     }
 
-    private static void checkLimits(int maxEntries, long compressedBytes) throws IOException {
+    static void checkLimits(int maxEntries, long compressedBytes) throws IOException {
         if (maxEntries < 1) {
             throw new IOException("ZIP archive entry limit must be at least 1: " + maxEntries);
         }
