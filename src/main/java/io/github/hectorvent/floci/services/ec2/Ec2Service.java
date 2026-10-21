@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -7411,20 +7412,33 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // ─── Key Pairs ─────────────────────────────────────────────────────────────
 
     public KeyPair createKeyPair(String region, String keyName) {
+        return createKeyPair(region, keyName, null, null);
+    }
+
+    /**
+     * Creates a key pair of {@code keyType}, {@code rsa} when null, and returns its private key in
+     * {@code keyFormat}, {@code pem} when null. A value outside either enum is refused with the message
+     * AWS's request validation gives; Floci checks the values after the name is found present and
+     * valid and before it is found taken.
+     */
+    public KeyPair createKeyPair(String region, String keyName, String keyType, String keyFormat) {
         ensureDefaultResources(region);
         requireKeyName(keyName);
+        String type = keyType != null ? keyType : "rsa";
+        String format = keyFormat != null ? keyFormat : "pem";
+        requireKeyTypeAndFormat(type, format);
         rejectDuplicateKeyName(region, keyName);
         String keyPairId = "key-" + randomHex(17);
         KeyPair kp = new KeyPair();
         kp.setKeyPairId(keyPairId);
         kp.setKeyName(keyName);
-        Ec2KeyMaterial.Generated generated = Ec2KeyMaterial.generateRsa();
+        Ec2KeyMaterial.Generated generated = Ec2KeyMaterial.generate(type, format, keyName);
         kp.setKeyFingerprint(generated.fingerprint());
         kp.setKeyMaterial(generated.privateKeyPem());
         // The public half is what RunInstances injects into the guest's authorized_keys.
         // Without storing it, a key pair created here could never authenticate anything.
         kp.setPublicKey(generated.openSshPublicKey());
-        kp.setKeyType("rsa");
+        kp.setKeyType(type);
         kp.setCreateTime(Instant.now());
         kp.setRegion(region);
         keyPairs.put(key(region, keyPairId), kp);
@@ -7480,26 +7494,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * The key type DescribeKeyPairs reports. A key pair stored before the type was recorded has it
-     * read from what it holds: rsa when CreateKeyPair made it, since that has only ever generated
-     * RSA keys, and otherwise the type of its imported key, or none when ImportKeyPair would now
-     * refuse that material or reading it fails, which is logged.
+     * read from the public key it holds, whether CreateKeyPair made it or ImportKeyPair took it. A
+     * created key pair saved before created key pairs kept their public key is rsa, the only type
+     * CreateKeyPair made then. Otherwise it has none, when ImportKeyPair would now refuse the
+     * material or reading it fails, which is logged.
      */
     static String keyTypeOf(KeyPair keyPair) {
         if (keyPair.getKeyType() != null) {
             return keyPair.getKeyType();
         }
-        if (keyPair.getKeyMaterial() != null) {
-            return "rsa";
-        }
         try {
-            Ec2KeyMaterial.Imported imported = Ec2KeyMaterial.readImportedKey(keyPair.getPublicKey());
-            return imported != null ? imported.keyType() : null;
+            Ec2KeyMaterial.Imported key = Ec2KeyMaterial.readImportedKey(keyPair.getPublicKey());
+            if (key != null) {
+                return key.keyType();
+            }
         } catch (RuntimeException e) {
             // The record may hold any text an earlier ImportKeyPair stored. Text the reader cannot
             // handle leaves the type out instead of failing every description in the region.
             LOG.warnv(e, "Could not read the key type of stored key pair {0}", keyPair.getKeyPairId());
             return null;
         }
+        return keyPair.getKeyMaterial() != null ? "rsa" : null;
     }
 
     /**
@@ -7628,6 +7643,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .anyMatch(k -> region.equals(k.getRegion()) && keyName.equals(k.getKeyName()));
         if (exists) {
             throw new AwsException("InvalidKeyPair.Duplicate", "The keypair '" + keyName + "' already exists", 400);
+        }
+    }
+
+    /** KeyType and KeyFormat take only the values AWS's model lists; each other value is reported. */
+    private static void requireKeyTypeAndFormat(String keyType, String keyFormat) {
+        List<String> violations = new ArrayList<>();
+        if (!List.of("rsa", "ed25519").contains(keyType)) {
+            violations.add("Value '" + keyType + "' at 'keyType' failed to satisfy constraint: "
+                    + "Member must satisfy enum value set: [rsa, ed25519]");
+        }
+        if (!List.of("ppk", "pem").contains(keyFormat)) {
+            violations.add("Value '" + keyFormat + "' at 'keyFormat' failed to satisfy constraint: "
+                    + "Member must satisfy enum value set: [ppk, pem]");
+        }
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.exception("InvalidParameterValue", violations);
         }
     }
 

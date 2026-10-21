@@ -2,16 +2,28 @@ package io.github.hectorvent.floci.services.ec2;
 
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
+import org.bouncycastle.crypto.params.AsymmetricKeyParameter;
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters;
+import org.bouncycastle.crypto.util.OpenSSHPrivateKeyUtil;
+import org.bouncycastle.crypto.util.OpenSSHPublicKeyUtil;
+import org.bouncycastle.util.io.pem.PemObject;
+import org.bouncycastle.util.io.pem.PemReader;
 
+import java.io.IOException;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HexFormat;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The key pair calls and the throwaway keys shared by the EC2 key pair tests. */
 final class Ec2KeyPairFixtures {
 
-    static final String AUTH = "AWS4-HMAC-SHA256 Credential=test/20261020/us-east-1/ec2/aws4_request";
+    static final String REGION = "us-east-1";
+    static final String AUTH = "AWS4-HMAC-SHA256 Credential=test/20261020/" + REGION + "/ec2/aws4_request";
 
     /** A throwaway 2048-bit RSA key. */
     static final String RSA_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCp7mGC9"
@@ -40,6 +52,15 @@ final class Ec2KeyPairFixtures {
      */
     static final String ED25519_FINGERPRINT = "UOyzahv0Ty520U89wfCvKdTlp2TbtpmnlpJHPW3MbMk=";
 
+    /**
+     * The throwaway ED25519 key of the version 2 key file in PuTTY's test suite (test/cryptsuite.py,
+     * testPPKLoadSave): its 32-byte private key, and its public key line.
+     */
+    static final byte[] PUTTY_TEST_KEY =
+            HexFormat.of().parseHex("6bef22997c8f2aa7f17b9f930eafdc59c41ad5c5dca5b0e7900fdff006101a58");
+    static final String PUTTY_TEST_PUBLIC_KEY =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHJCszOHaI9X/yGLtjn22f0hO6VPMQDVtctkym6FJH1W";
+
     /** A throwaway DSA key from {@code ssh-keygen -t dsa}. */
     static final String DSA_KEY = "ssh-dss AAAAB3NzaC1kc3MAAACBAOFToDsRbL7Z8AqAZOKXROc1Cy5SA1ZgM5odRC57"
             + "MSEruUjfUv2//jGbOLemgQBFsqZY1dyKlrpR3dm+tpfXGQR26Pkqm+5BF8kaykQZAYdwCzRhwzM7c8pei36Qi2XJ1s+MeLbIXZ2TTf"
@@ -66,7 +87,19 @@ final class Ec2KeyPairFixtures {
 
     /** CreateKeyPair with this name, whatever the answer. */
     static ValidatableResponse createKeyPair(String name) {
-        return ec2("CreateKeyPair").formParam("KeyName", name).post("/").then();
+        return createKeyPair(name, null, null);
+    }
+
+    /** CreateKeyPair with this name, and the KeyType and KeyFormat when they are not null. */
+    static ValidatableResponse createKeyPair(String name, String keyType, String keyFormat) {
+        RequestSpecification request = ec2("CreateKeyPair").formParam("KeyName", name);
+        if (keyType != null) {
+            request.formParam("KeyType", keyType);
+        }
+        if (keyFormat != null) {
+            request.formParam("KeyFormat", keyFormat);
+        }
+        return request.post("/").then();
     }
 
     /** ImportKeyPair with this name and material, the material base64-encoded as the API takes it. */
@@ -99,5 +132,26 @@ final class Ec2KeyPairFixtures {
     /** Deletes the key pair with this id, and checks DeleteKeyPair answered 200. */
     static void deleteKeyPair(String id) {
         ec2("DeleteKeyPair").formParam("KeyPairId", id).post("/").then().statusCode(200);
+    }
+
+    /** The ED25519 key of an OpenSSH private key file, read with Bouncy Castle's OpenSSH reader. */
+    static Ed25519PrivateKeyParameters openSshEd25519Key(String material) throws IOException {
+        try (PemReader reader = new PemReader(new StringReader(material))) {
+            PemObject pem = reader.readPemObject();
+            assertEquals("OPENSSH PRIVATE KEY", pem.getType());
+            AsymmetricKeyParameter key = OpenSSHPrivateKeyUtil.parsePrivateKeyBlob(pem.getContent());
+            assertTrue(key instanceof Ed25519PrivateKeyParameters, "expected an ED25519 key, got " + key);
+            return (Ed25519PrivateKeyParameters) key;
+        }
+    }
+
+    /** The OpenSSH public key blob of an ED25519 key. */
+    static byte[] sshEd25519Blob(Ed25519PrivateKeyParameters key) throws IOException {
+        return OpenSSHPublicKeyUtil.encodePublicKey(key.generatePublicKey());
+    }
+
+    /** The first line of key material, which a failure message can show without disclosing the key. */
+    static String firstLine(String material) {
+        return material.lines().findFirst().orElse("");
     }
 }

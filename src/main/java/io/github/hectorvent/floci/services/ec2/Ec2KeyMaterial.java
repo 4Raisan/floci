@@ -9,15 +9,20 @@ import org.bouncycastle.asn1.ASN1Primitive;
 import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters;
+import org.bouncycastle.crypto.util.OpenSSHPrivateKeyUtil;
+import org.bouncycastle.crypto.util.OpenSSHPublicKeyUtil;
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
 
 import java.io.IOException;
 import java.io.StringWriter;
+import java.io.UncheckedIOException;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.security.interfaces.RSAPublicKey;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -51,12 +56,18 @@ public final class Ec2KeyMaterial {
     private static final String RFC_4716_BEGIN = "---- BEGIN SSH2 PUBLIC KEY ----";
     private static final String RFC_4716_END = "---- END SSH2 PUBLIC KEY ----";
 
+    /** The base64 line length of ssh-keygen's private key files; readers take any. */
+    private static final int OPENSSH_LINE_LENGTH = 70;
+
     private Ec2KeyMaterial() {}
 
     /**
-     * @param privateKeyPem   PKCS#1 PEM, the "BEGIN RSA PRIVATE KEY" form AWS returns
-     * @param openSshPublicKey the matching "ssh-rsa AAAA..." line, for authorized_keys
-     * @param fingerprint     SHA-1 of the DER private key, colon-separated hex
+     * @param privateKeyPem    the private key as KeyMaterial returns it: for an RSA key as PEM, the PKCS#1
+     *                         "BEGIN RSA PRIVATE KEY" form AWS returns, for an ED25519 key as an OpenSSH
+     *                         private key, and for KeyFormat ppk as a PuTTY key file
+     * @param openSshPublicKey the matching "ssh-rsa AAAA..." or "ssh-ed25519 AAAA..." line, for authorized_keys
+     * @param fingerprint      for an RSA key the SHA-1 of the DER private key, colon-separated hex; for an
+     *                         ED25519 key the base64 SHA-256 of the public key blob
      */
     public record Generated(String privateKeyPem, String openSshPublicKey, String fingerprint) {}
 
@@ -198,8 +209,7 @@ public final class Ec2KeyMaterial {
                 || !fillsTheBlob(blob, type, key)) {
             return null;
         }
-        return new Imported("ed25519", Base64.getEncoder().encodeToString(Digests.sha256(blob)),
-                "ssh-ed25519 " + base64(blob));
+        return new Imported("ed25519", ed25519Fingerprint(blob), "ssh-ed25519 " + base64(blob));
     }
 
     private static Imported importedRsa(RSAPublicKey key, String openSshPublicKey) {
@@ -290,7 +300,64 @@ public final class Ec2KeyMaterial {
         return Base64.getEncoder().encodeToString(bytes);
     }
 
-    private static String colonHex(byte[] digest) {
+    static String colonHex(byte[] digest) {
         return HexFormat.of().withDelimiter(":").formatHex(digest);
+    }
+
+    /**
+     * The fingerprint EC2 gives an ED25519 key, created or imported: the base64-encoded SHA-256 of the
+     * public key blob, the value {@code ssh-keygen -l} prints after {@code SHA256:}, with the {@code =}
+     * padding AWS keeps and ssh-keygen drops.
+     */
+    private static String ed25519Fingerprint(byte[] blob) {
+        return base64(Digests.sha256(blob));
+    }
+
+    /** A new ED25519 key pair for CreateKeyPair's {@code KeyType=ed25519}. */
+    static Generated generateEd25519() {
+        return ed25519(new Ed25519PrivateKeyParameters(new SecureRandom()));
+    }
+
+    /**
+     * The material CreateKeyPair returns for an ED25519 private key: the key in OpenSSH's own private
+     * key format, the {@code BEGIN OPENSSH PRIVATE KEY} block AWS returns for one, since PKCS#1, the
+     * RSA form, has no ED25519 encoding.
+     */
+    static Generated ed25519(Ed25519PrivateKeyParameters privateKey) {
+        byte[] blob;
+        byte[] encoded;
+        try {
+            blob = OpenSSHPublicKeyUtil.encodePublicKey(privateKey.generatePublicKey());
+            encoded = OpenSSHPrivateKeyUtil.encodePrivateKey(privateKey);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Could not encode an ED25519 key pair", e);
+        }
+        String body = base64(encoded);
+        StringBuilder pem = new StringBuilder("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+        for (int i = 0; i < body.length(); i += OPENSSH_LINE_LENGTH) {
+            pem.append(body, i, Math.min(i + OPENSSH_LINE_LENGTH, body.length())).append('\n');
+        }
+        pem.append("-----END OPENSSH PRIVATE KEY-----\n");
+        return new Generated(pem.toString(), "ssh-ed25519 " + base64(blob), ed25519Fingerprint(blob));
+    }
+
+    /**
+     * The key pair CreateKeyPair returns for a KeyType, {@code rsa} or {@code ed25519}, and a
+     * KeyFormat, {@code pem} or {@code ppk}: a new key of that type, its private half in that format.
+     * The request has already been refused for any other value.
+     *
+     * @param keyName the key pair's name, which a PuTTY key file carries as its comment
+     */
+    public static Generated generate(String keyType, String keyFormat, String keyName) {
+        Generated pem = switch (keyType) {
+            case "rsa" -> generateRsa();
+            case "ed25519" -> generateEd25519();
+            default -> throw new IllegalArgumentException("Unsupported key type: " + keyType);
+        };
+        return switch (keyFormat) {
+            case "pem" -> pem;
+            case "ppk" -> Ec2PuttyKeys.of(pem, keyName);
+            default -> throw new IllegalArgumentException("Unsupported key format: " + keyFormat);
+        };
     }
 }
