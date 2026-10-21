@@ -22,6 +22,7 @@ import jakarta.inject.Inject;
 
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -95,7 +96,7 @@ public class EmrService {
                 ? "INSTANCE_GROUP" : "INSTANCE_FLEET");
         cluster.setAutoTerminate(!cluster.isKeepJobFlowAliveWhenNoSteps());
         cluster.setMasterPublicDnsName(masterDnsName(region));
-        cluster.setCreationDateTime(Instant.now());
+        cluster.setCreationDateTime(Instant.now().truncatedTo(ChronoUnit.MILLIS));
         for (EmrInstanceGroup g : cluster.getInstanceGroups()) {
             g.setId("ig-" + randomId(13));
             g.setRunningInstanceCount(g.getRequestedInstanceCount());
@@ -137,6 +138,9 @@ public class EmrService {
                 continue;
             }
             Instant createdAt = c.getCreationDateTime();
+            if (createdAt != null) {
+                createdAt = createdAt.truncatedTo(ChronoUnit.MILLIS);
+            }
             if (createdAfter != null && (createdAt == null || !createdAt.isAfter(createdAfter))) {
                 continue;
             }

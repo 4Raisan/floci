@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.emr;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.emr.model.EmrCluster;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
@@ -23,6 +25,9 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * EMR cluster lifecycle over the AWS JSON 1.1 wire protocol: run job flow → describe →
@@ -38,6 +43,9 @@ class EmrIntegrationTest {
 
     @Inject
     EmrService emrService;
+
+    @Inject
+    ObjectMapper objectMapper;
 
     @BeforeAll
     static void configure() {
@@ -84,7 +92,7 @@ class EmrIntegrationTest {
 
     @Test
     @Order(3)
-    void listClustersFilteredByStateAndCreationTime() {
+    void listClustersFilteredByStateAndCreationTime() throws Exception {
         emr("ListClusters", "{\"ClusterStates\":[\"WAITING\"]}")
                 .then().statusCode(200)
                 .body("Clusters.find { it.Id == '" + clusterId + "' }.Name", equalTo("floci-emr"));
@@ -101,6 +109,7 @@ class EmrIntegrationTest {
                 .body("Clusters.find { it.Id == '" + clusterId + "' }.Name", equalTo("floci-emr"));
 
         Instant createdAt = emrService.describeCluster(clusterId).getCreationDateTime();
+        assertEquals(0, createdAt.getNano() % 1_000_000);
         BigDecimal epochSeconds = BigDecimal.valueOf(createdAt.getEpochSecond())
                 .add(BigDecimal.valueOf(createdAt.getNano(), 9));
         String shortlyBefore = epochSeconds.subtract(new BigDecimal("0.1")).toPlainString();
@@ -132,6 +141,38 @@ class EmrIntegrationTest {
                     .then().statusCode(200)
                     .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
             emr("ListClusters", "{\"CreatedAfter\":1760999999.999999999}")
+                    .then().statusCode(200)
+                    .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
+        } finally {
+            cluster.setCreationDateTime(originalCreationTime);
+        }
+
+        cluster.setCreationDateTime(Instant.ofEpochSecond(1_761_000_000L, 123_456_789));
+        try {
+            JsonNode clusters = objectMapper.readTree(emr("ListClusters", "{}")
+                    .then().statusCode(200).extract().asString()).path("Clusters");
+            JsonNode listedTime = null;
+            for (JsonNode listed : clusters) {
+                if (clusterId.equals(listed.path("Id").asText())) {
+                    listedTime = listed.path("Status").path("Timeline").path("CreationDateTime");
+                    break;
+                }
+            }
+            assertNotNull(listedTime);
+            assertTrue(listedTime.isNumber());
+            assertEquals(0, new BigDecimal("1761000000.123").compareTo(listedTime.decimalValue()));
+
+            JsonNode describedTime = objectMapper.readTree(emr("DescribeCluster",
+                    "{\"ClusterId\":\"" + clusterId + "\"}")
+                    .then().statusCode(200).extract().asString())
+                    .path("Cluster").path("Status").path("Timeline").path("CreationDateTime");
+            assertTrue(describedTime.isNumber());
+            assertEquals(0, new BigDecimal("1761000000.123").compareTo(describedTime.decimalValue()));
+
+            emr("ListClusters", "{\"CreatedAfter\":" + listedTime.asText() + "}")
+                    .then().statusCode(200)
+                    .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
+            emr("ListClusters", "{\"CreatedBefore\":" + listedTime.asText() + "}")
                     .then().statusCode(200)
                     .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
         } finally {
@@ -234,7 +275,7 @@ class EmrIntegrationTest {
 
     @Test
     @Order(11)
-    void securityConfigurationRoundTrip() {
+    void securityConfigurationRoundTrip() throws Exception {
         emr("CreateSecurityConfiguration",
                 "{\"Name\":\"floci-emr-sec\",\"SecurityConfiguration\":\"{\\\"EncryptionConfiguration\\\":{}}\"}")
                 .then().statusCode(200)
@@ -245,7 +286,31 @@ class EmrIntegrationTest {
                 .then().statusCode(200)
                 .body("SecurityConfiguration", equalTo("{\"EncryptionConfiguration\":{}}"));
 
-        emr("DeleteSecurityConfiguration", "{\"Name\":\"floci-emr-sec\"}").then().statusCode(200);
+        emrService.describeSecurityConfiguration("floci-emr-sec")
+                .setCreationDateTime(Instant.ofEpochMilli(1_761_000_000_123L));
+        try {
+            JsonNode describedTime = objectMapper.readTree(emr("DescribeSecurityConfiguration",
+                    "{\"Name\":\"floci-emr-sec\"}")
+                    .then().statusCode(200).extract().asString()).path("CreationDateTime");
+            assertTrue(describedTime.isNumber());
+            assertEquals(0, new BigDecimal("1761000000.123").compareTo(describedTime.decimalValue()));
+
+            JsonNode configurations = objectMapper.readTree(emr("ListSecurityConfigurations", "{}")
+                    .then().statusCode(200).extract().asString()).path("SecurityConfigurations");
+            JsonNode listedTime = null;
+            for (JsonNode configuration : configurations) {
+                if ("floci-emr-sec".equals(configuration.path("Name").asText())) {
+                    listedTime = configuration.path("CreationDateTime");
+                    break;
+                }
+            }
+            assertNotNull(listedTime);
+            assertTrue(listedTime.isNumber());
+            assertEquals(0, new BigDecimal("1761000000.123").compareTo(listedTime.decimalValue()));
+        } finally {
+            emr("DeleteSecurityConfiguration", "{\"Name\":\"floci-emr-sec\"}")
+                    .then().statusCode(200);
+        }
     }
 
     @Test

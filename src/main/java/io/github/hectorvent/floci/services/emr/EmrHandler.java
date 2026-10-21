@@ -22,6 +22,7 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -879,13 +880,13 @@ public class EmrHandler {
         }
     }
 
-    private long epoch(Instant instant) {
-        return instant == null ? 0L : instant.getEpochSecond();
+    private BigDecimal epoch(Instant instant) {
+        return instant == null ? BigDecimal.ZERO : BigDecimal.valueOf(instant.toEpochMilli(), 3);
     }
 
     private void putEpoch(ObjectNode node, String field, Instant instant) {
         if (instant != null) {
-            node.put(field, instant.getEpochSecond());
+            node.put(field, epoch(instant));
         }
     }
 }
