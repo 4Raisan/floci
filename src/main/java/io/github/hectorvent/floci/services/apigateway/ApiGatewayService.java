@@ -130,6 +130,7 @@ public class ApiGatewayService implements ResourceProvider {
      * also keeps a mapping from being created under a domain that is being deleted at that moment.
      */
     private final Object domainNameLock = new Object();
+    private final Object vpcLinkTagLock = new Object();
     private final TlsCertificateManager certificateManager;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -4655,6 +4656,31 @@ public class ApiGatewayService implements ResourceProvider {
     public VpcLink getVpcLink(String region, String vpcLinkId) {
         return vpcLinkStore.get(vpcLinkKey(region, vpcLinkId))
                 .orElseThrow(() -> new AwsException("NotFoundException", "Invalid VPC link identifier specified", 404));
+    }
+
+    /**
+     * Serialize tag writers and replace the map so readers and persistence can safely iterate
+     * previously returned maps, as with custom-domain tags.
+     */
+    public void tagVpcLink(String region, String vpcLinkId, Map<String, String> tags) {
+        ReservedTags.rejectApiGatewayReservedTagsOnUpdate(tags);
+        synchronized (vpcLinkTagLock) {
+            VpcLink link = getVpcLink(region, vpcLinkId);
+            Map<String, String> merged = new LinkedHashMap<>(link.getTags());
+            merged.putAll(tags);
+            link.setTags(merged);
+            vpcLinkStore.put(vpcLinkKey(region, vpcLinkId), link);
+        }
+    }
+
+    public void untagVpcLink(String region, String vpcLinkId, List<String> tagKeys) {
+        synchronized (vpcLinkTagLock) {
+            VpcLink link = getVpcLink(region, vpcLinkId);
+            Map<String, String> remaining = new LinkedHashMap<>(link.getTags());
+            tagKeys.forEach(remaining::remove);
+            link.setTags(remaining);
+            vpcLinkStore.put(vpcLinkKey(region, vpcLinkId), link);
+        }
     }
 
     public List<VpcLink> getVpcLinks(String region) {
