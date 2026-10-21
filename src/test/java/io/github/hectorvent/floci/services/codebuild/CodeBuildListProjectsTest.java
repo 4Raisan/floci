@@ -53,6 +53,7 @@ class CodeBuildListProjectsTest {
         AwsException error = assertThrows(AwsException.class, () -> list(Map.of(parameter, value)));
         assertEquals("InvalidInputException", error.getErrorCode());
         assertEquals(400, error.getHttpStatus());
+        assertEquals("Invalid " + parameter + ": " + value, error.getMessage());
     }
 
     @Test
@@ -61,6 +62,7 @@ class CodeBuildListProjectsTest {
         createProject(REGION, "alpha", 2.0, 3.0);
         assertEquals(service.listProjects(REGION), list(Map.of()));
         assertEquals(List.of("alpha", "zeta"), list(Map.of("sortBy", "NAME")));
+        assertEquals(List.of("alpha", "zeta"), list(Map.of("sortOrder", "ASCENDING")));
         assertEquals(List.of("zeta", "alpha"), list(Map.of("sortOrder", "DESCENDING")));
     }
 

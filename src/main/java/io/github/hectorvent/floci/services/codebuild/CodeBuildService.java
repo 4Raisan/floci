@@ -262,10 +262,7 @@ public class CodeBuildService {
                     Comparator.nullsFirst(Comparator.naturalOrder()));
             default -> throw new AwsException("InvalidInputException", "Invalid sortBy: " + sortBy, 400);
         };
-        if (sortOrder != null && !"ASCENDING".equals(sortOrder) && !"DESCENDING".equals(sortOrder)) {
-            throw new AwsException("InvalidInputException", "Invalid sortOrder: " + sortOrder, 400);
-        }
-        if ("DESCENDING".equals(sortOrder)) {
+        if (isDescendingSortOrder(sortOrder, false)) {
             comparator = comparator.reversed();
         }
         return projectsFor(region).values().stream()
@@ -522,23 +519,35 @@ public class CodeBuildService {
                 .collect(Collectors.toList());
     }
 
-    public List<String> listBuilds(String region, String account) {
-        return buildsFor(account, region).values().stream()
-                .sorted((a, b) -> Double.compare(
-                        b.getStartTime() != null ? b.getStartTime() : 0,
-                        a.getStartTime() != null ? a.getStartTime() : 0))
-                .map(Build::getId)
-                .collect(Collectors.toList());
+    public List<String> listBuilds(String region, String account, String sortOrder) {
+        Comparator<String> comparator = Comparator.naturalOrder();
+        if (isDescendingSortOrder(sortOrder, true)) {
+            comparator = comparator.reversed();
+        }
+        return buildsFor(account, region).keySet().stream()
+                .sorted(comparator)
+                .toList();
     }
 
-    public List<String> listBuildsForProject(String region, String account, String projectName) {
+    public List<String> listBuildsForProject(String region, String account, String projectName,
+                                             String sortOrder) {
+        Comparator<Build> comparator = Comparator.comparing(Build::getBuildNumber)
+                .thenComparing(Build::getId);
+        if (isDescendingSortOrder(sortOrder, true)) {
+            comparator = comparator.reversed();
+        }
         return buildsFor(account, region).values().stream()
                 .filter(b -> projectName.equals(b.getProjectName()))
-                .sorted((a, b) -> Double.compare(
-                        b.getStartTime() != null ? b.getStartTime() : 0,
-                        a.getStartTime() != null ? a.getStartTime() : 0))
+                .sorted(comparator)
                 .map(Build::getId)
-                .collect(Collectors.toList());
+                .toList();
+    }
+
+    private boolean isDescendingSortOrder(String sortOrder, boolean defaultDescending) {
+        if (sortOrder != null && !"ASCENDING".equals(sortOrder) && !"DESCENDING".equals(sortOrder)) {
+            throw new AwsException("InvalidInputException", "Invalid sortOrder: " + sortOrder, 400);
+        }
+        return sortOrder == null ? defaultDescending : "DESCENDING".equals(sortOrder);
     }
 
     public void stopBuild(String region, String account, String buildId) {
