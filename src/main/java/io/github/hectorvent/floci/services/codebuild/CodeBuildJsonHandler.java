@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.codebuild;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.codebuild.CodeBuildService.ProjectPage;
 import io.github.hectorvent.floci.services.codebuild.model.Build;
 import io.github.hectorvent.floci.services.codebuild.model.Project;
 import io.github.hectorvent.floci.services.codebuild.model.ProjectArtifacts;
@@ -130,9 +131,20 @@ public class CodeBuildJsonHandler {
     }
 
     private Response listProjects(JsonNode req, String region) {
-        List<String> names = service.listProjects(region,
-                req.path("sortBy").asText(null), req.path("sortOrder").asText(null));
-        return Response.ok(Map.of("projects", names)).build();
+        String sortBy = req.path("sortBy").asText(null);
+        String sortOrder = req.path("sortOrder").asText(null);
+        JsonNode tokenNode = req.get("nextToken");
+        if (tokenNode != null && !tokenNode.isTextual()) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        String nextToken = tokenNode == null ? null : tokenNode.asText();
+        ProjectPage page = service.listProjectsPage(region, sortBy, sortOrder, nextToken);
+        Map<String, Object> result = new HashMap<>();
+        result.put("projects", page.projects());
+        if (page.nextToken() != null) {
+            result.put("nextToken", page.nextToken());
+        }
+        return Response.ok(result).build();
     }
 
     private Response createReportGroup(JsonNode req, String region, String account) throws Exception {

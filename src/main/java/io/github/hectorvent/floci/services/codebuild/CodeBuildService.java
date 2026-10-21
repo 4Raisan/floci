@@ -1,9 +1,13 @@
 package io.github.hectorvent.floci.services.codebuild;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.codebuild.model.Build;
@@ -18,11 +22,14 @@ import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -31,6 +38,9 @@ import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class CodeBuildService {
+
+    private static final int LIST_PROJECTS_PAGE_SIZE = 100;
+    private static final ObjectMapper PAGE_TOKEN_MAPPER = new ObjectMapper();
 
     // key: region -> name -> project
     private Map<String, Map<String, Project>> projects = new ConcurrentHashMap<>();
@@ -254,6 +264,95 @@ public class CodeBuildService {
         if (sortBy == null && sortOrder == null) {
             return listProjects(region);
         }
+        return listProjectRecords(region, sortBy, sortOrder).stream()
+                .map(Project::getName)
+                .toList();
+    }
+
+    public ProjectPage listProjectsPage(String region, String sortBy, String sortOrder, String nextToken) {
+        if (sortBy == null && sortOrder == null && nextToken == null) {
+            List<String> names = listProjects(region);
+            if (names.size() <= LIST_PROJECTS_PAGE_SIZE) {
+                return new ProjectPage(names, null);
+            }
+        }
+
+        List<Project> projects = listProjectRecords(region, sortBy, sortOrder);
+        int start = 0;
+        if (nextToken != null) {
+            Project anchor = decodeListProjectsToken(nextToken, region, sortBy, sortOrder);
+            Comparator<Project> comparator = projectComparator(sortBy, sortOrder);
+            while (start < projects.size() && comparator.compare(projects.get(start), anchor) <= 0) {
+                start++;
+            }
+        }
+
+        int end = Math.min(start + LIST_PROJECTS_PAGE_SIZE, projects.size());
+        List<String> names = projects.subList(start, end).stream().map(Project::getName).toList();
+        String resultToken = end < projects.size()
+                ? encodeListProjectsToken(projects.get(end - 1), region, sortBy, sortOrder)
+                : null;
+        return new ProjectPage(names, resultToken);
+    }
+
+    private Project decodeListProjectsToken(String token, String region, String sortBy, String sortOrder) {
+        if (token.isEmpty()) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        JsonNode cursor;
+        try {
+            cursor = PAGE_TOKEN_MAPPER.readTree(Base64.getUrlDecoder().decode(token));
+        } catch (IllegalArgumentException | IOException e) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        JsonNode lastName = cursor == null ? null : cursor.path("lastName");
+        JsonNode sortValue = cursor == null ? null : cursor.path("sortValue");
+        if (cursor == null || !"ListProjects".equals(cursor.path("action").asText(null))
+                || !region.equals(cursor.path("region").asText(null))
+                || !cursor.has("sortBy") || !Objects.equals(sortBy, cursor.path("sortBy").asText(null))
+                || !cursor.has("sortOrder") || !Objects.equals(sortOrder, cursor.path("sortOrder").asText(null))
+                || !lastName.isTextual() || lastName.asText().isEmpty()
+                || (sortBy == null || "NAME".equals(sortBy)) && !sortValue.isNull()
+                || !sortValue.isNull() && !sortValue.isNumber()) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        Double value = sortValue.isNull() ? null : sortValue.asDouble();
+        if (value != null && !Double.isFinite(value)) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        Project anchor = new Project();
+        anchor.setName(lastName.asText());
+        anchor.setCreated(value);
+        anchor.setLastModified(value);
+        return anchor;
+    }
+
+    private String encodeListProjectsToken(Project last, String region, String sortBy, String sortOrder) {
+        Double value = switch (sortBy == null ? "NAME" : sortBy) {
+            case "CREATED_TIME" -> last.getCreated();
+            case "LAST_MODIFIED_TIME" -> last.getLastModified();
+            default -> null;
+        };
+        ObjectNode cursor = PAGE_TOKEN_MAPPER.createObjectNode();
+        cursor.put("action", "ListProjects");
+        cursor.put("region", region);
+        cursor.put("sortBy", sortBy);
+        cursor.put("sortOrder", sortOrder);
+        cursor.put("lastName", last.getName());
+        cursor.put("sortValue", value);
+        return Base64Url.encode(cursor.toString());
+    }
+
+    public record ProjectPage(List<String> projects, String nextToken) {
+    }
+
+    private List<Project> listProjectRecords(String region, String sortBy, String sortOrder) {
+        return projectsFor(region).values().stream()
+                .sorted(projectComparator(sortBy, sortOrder))
+                .toList();
+    }
+
+    private Comparator<Project> projectComparator(String sortBy, String sortOrder) {
         Comparator<Project> comparator = switch (sortBy == null ? "NAME" : sortBy) {
             case "NAME" -> Comparator.comparing(Project::getName);
             case "CREATED_TIME" -> Comparator.comparing(Project::getCreated,
@@ -265,10 +364,7 @@ public class CodeBuildService {
         if (isDescendingSortOrder(sortOrder, false)) {
             comparator = comparator.reversed();
         }
-        return projectsFor(region).values().stream()
-                .sorted(comparator.thenComparing(Project::getName))
-                .map(Project::getName)
-                .toList();
+        return comparator.thenComparing(Project::getName);
     }
 
     // ---- Report Groups ----

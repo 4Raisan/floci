@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.codebuild;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.services.codebuild.model.Project;
 import io.github.hectorvent.floci.services.codebuild.model.ProjectArtifacts;
 import io.github.hectorvent.floci.services.codebuild.model.ProjectEnvironment;
@@ -11,11 +13,19 @@ import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
 
@@ -79,11 +89,153 @@ class CodeBuildListProjectsTest {
         assertEquals(List.of("alpha", "zeta"), list(Map.of("sortBy", sortBy, "sortOrder", "ASCENDING")));
     }
 
+    @Test
+    void paginatesWithoutChangingExistingSortOrder() throws Exception {
+        IntStream.range(0, 101).forEach(index -> createProject(REGION,
+                "project-%03d".formatted(index), (double) (101 - index), (double) index));
+
+        assertPagesMatchServiceOrder(Map.of(), service.listProjects(REGION).stream().sorted().toList());
+        assertPagesMatchServiceOrder(Map.of("sortBy", "NAME", "sortOrder", "DESCENDING"),
+                service.listProjects(REGION, "NAME", "DESCENDING"));
+        assertPagesMatchServiceOrder(Map.of("sortBy", "CREATED_TIME", "sortOrder", "ASCENDING"),
+                service.listProjects(REGION, "CREATED_TIME", "ASCENDING"));
+        assertPagesMatchServiceOrder(Map.of("sortBy", "LAST_MODIFIED_TIME", "sortOrder", "DESCENDING"),
+                service.listProjects(REGION, "LAST_MODIFIED_TIME", "DESCENDING"));
+    }
+
+    @Test
+    void onlyReturnsContinuationWhenMoreThanOneHundredProjectsExist() throws Exception {
+        assertFalse(listPage(Map.of()).containsKey("nextToken"));
+        IntStream.range(0, 100).forEach(index -> createProject(REGION,
+                "project-%03d".formatted(index), null, null));
+
+        Map<String, Object> page = listPage(Map.of("sortBy", "NAME"));
+        assertEquals(100, ((List<?>) page.get("projects")).size());
+        assertFalse(page.containsKey("nextToken"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void continuesThroughThreePages() throws Exception {
+        IntStream.range(0, 201).forEach(index -> createProject(REGION,
+                "project-%03d".formatted(index), null, null));
+
+        List<String> names = new ArrayList<>();
+        String token = null;
+        for (int pageIndex = 0; pageIndex < 3; pageIndex++) {
+            Map<String, String> request = new HashMap<>(Map.of("sortBy", "NAME"));
+            if (token != null) {
+                request.put("nextToken", token);
+            }
+            Map<String, Object> page = listPage(request);
+            List<String> projects = (List<String>) page.get("projects");
+            assertEquals(pageIndex < 2 ? 100 : 1, projects.size());
+            names.addAll(projects);
+            token = (String) page.get("nextToken");
+        }
+        assertNull(token);
+        assertEquals(service.listProjects(REGION, "NAME", null), names);
+    }
+
+    @Test
+    void rejectsInvalidAndMismatchedContinuationTokens() throws Exception {
+        IntStream.range(0, 101).forEach(index -> createProject(REGION,
+                "project-%03d".formatted(index), null, null));
+        String token = (String) listPage(Map.of("sortBy", "NAME", "sortOrder", "ASCENDING"))
+                .get("nextToken");
+        assertNotNull(token);
+
+        assertInvalidToken(Map.of("sortBy", "NAME", "sortOrder", "ASCENDING", "nextToken", "invalid?"),
+                REGION);
+        assertInvalidToken(Map.of("sortBy", "NAME", "sortOrder", "ASCENDING", "nextToken", ""),
+                REGION);
+        assertInvalidToken(Map.of("sortBy", "NAME", "sortOrder", "DESCENDING", "nextToken", token),
+                REGION);
+        assertInvalidToken(Map.of("sortBy", "NAME", "sortOrder", "ASCENDING", "nextToken", token),
+                "eu-west-1");
+
+        ObjectNode cursor = (ObjectNode) mapper.readTree(Base64.getUrlDecoder().decode(token));
+        cursor.put("sortValue", 1.0);
+        assertInvalidToken(Map.of("sortBy", "NAME", "sortOrder", "ASCENDING", "nextToken",
+                Base64Url.encode(mapper.writeValueAsBytes(cursor))), REGION);
+
+        String timeToken = (String) listPage(Map.of("sortBy", "CREATED_TIME"))
+                .get("nextToken");
+        ObjectNode timeCursor = (ObjectNode) mapper.readTree(Base64.getUrlDecoder().decode(timeToken));
+        timeCursor.put("sortValue", "invalid");
+        assertInvalidToken(Map.of("sortBy", "CREATED_TIME", "nextToken",
+                Base64Url.encode(mapper.writeValueAsBytes(timeCursor))), REGION);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"null", "123", "{}"})
+    void rejectsNonTextualContinuationTokens(String value) throws Exception {
+        ObjectNode request = mapper.createObjectNode();
+        request.set("nextToken", mapper.readTree(value));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("ListProjects", request, REGION, ACCOUNT));
+        assertEquals("InvalidInputException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"DEFAULT", "NAME", "CREATED_TIME"})
+    void continuesAfterDeletingTheLastProjectOnThePreviousPage(String sortBy) throws Exception {
+        IntStream.range(0, 101).forEach(index -> createProject(REGION,
+                "project-%03d".formatted(index), 1.0, null));
+        Map<String, String> request = switch (sortBy) {
+            case "NAME" -> Map.of("sortBy", "NAME", "sortOrder", "ASCENDING");
+            case "CREATED_TIME" -> Map.of("sortBy", "CREATED_TIME", "sortOrder", "DESCENDING");
+            default -> Map.of();
+        };
+        String token = (String) listPage(request).get("nextToken");
+        assertNotNull(token);
+
+        service.deleteProject(REGION, "project-099");
+        Map<String, String> nextRequest = new HashMap<>(request);
+        nextRequest.put("nextToken", token);
+        Map<String, Object> nextPage = listPage(nextRequest);
+        assertEquals(List.of("project-100"), nextPage.get("projects"));
+        assertFalse(nextPage.containsKey("nextToken"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertPagesMatchServiceOrder(Map<String, String> options, List<String> expected) throws Exception {
+        Map<String, Object> first = listPage(options);
+        assertEquals(100, ((List<?>) first.get("projects")).size());
+        String token = (String) first.get("nextToken");
+        assertNotNull(token);
+
+        Map<String, String> nextRequest = new HashMap<>(options);
+        nextRequest.put("nextToken", token);
+        Map<String, Object> second = listPage(nextRequest);
+        assertFalse(second.containsKey("nextToken"));
+        List<String> names = new ArrayList<>((List<String>) first.get("projects"));
+        names.addAll((List<String>) second.get("projects"));
+        assertEquals(expected, names);
+    }
+
+    private void assertInvalidToken(Map<String, String> request, String region) {
+        AwsException error = assertThrows(AwsException.class, () -> listPage(request, region));
+        assertEquals("InvalidInputException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+    }
+
     @SuppressWarnings("unchecked")
     private List<String> list(Map<String, String> request) throws Exception {
-        try (Response response = handler.handle("ListProjects", mapper.valueToTree(request), REGION, ACCOUNT)) {
+        return (List<String>) listPage(request).get("projects");
+    }
+
+    private Map<String, Object> listPage(Map<String, String> request) throws Exception {
+        return listPage(request, REGION);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> listPage(Map<String, String> request, String region) throws Exception {
+        try (Response response = handler.handle("ListProjects", mapper.valueToTree(request), region, ACCOUNT)) {
             assertEquals(200, response.getStatus());
-            return (List<String>) ((Map<?, ?>) response.getEntity()).get("projects");
+            return (Map<String, Object>) response.getEntity();
         }
     }
 
