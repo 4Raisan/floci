@@ -845,10 +845,16 @@ public class FirehoseService implements ResourceProvider {
         LOG.infov("Deleted Firehose delivery stream: {0}", name);
     }
 
-    public List<String> listDeliveryStreams() {
+    public record DeliveryStreamPage(List<String> names, boolean hasMore) {}
+
+    public DeliveryStreamPage listDeliveryStreams(int limit, String exclusiveStartName) {
         String regionPrefix = currentRegion() + "/";
-        return streamStore.scan(k -> k.startsWith(regionPrefix)).stream()
-                .map(DeliveryStreamDescription::getDeliveryStreamName).toList();
+        List<String> names = streamStore.scan(k -> k.startsWith(regionPrefix)).stream()
+                .map(DeliveryStreamDescription::getDeliveryStreamName)
+                .sorted()
+                .filter(name -> exclusiveStartName == null || name.compareTo(exclusiveStartName) > 0)
+                .toList();
+        return new DeliveryStreamPage(names.subList(0, Math.min(limit, names.size())), names.size() > limit);
     }
 
     /**

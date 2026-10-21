@@ -92,6 +92,22 @@ class FirehoseServiceTest {
         return newService(flushRecordCount, UnaryOperator.identity());
     }
 
+    @Test
+    void listDeliveryStreamsSortsAndPaginatesAfterExclusiveCursor() {
+        firehoseService.createDeliveryStream("z-stream", null);
+        firehoseService.createDeliveryStream("a-stream", null);
+        firehoseService.createDeliveryStream("m-stream", null);
+
+        assertEquals(new FirehoseService.DeliveryStreamPage(List.of("a-stream"), true),
+                firehoseService.listDeliveryStreams(1, null));
+        assertEquals(new FirehoseService.DeliveryStreamPage(List.of("m-stream"), true),
+                firehoseService.listDeliveryStreams(1, "a-stream"));
+        assertEquals(new FirehoseService.DeliveryStreamPage(List.of("m-stream", "z-stream"), false),
+                firehoseService.listDeliveryStreams(10, "b-stream"));
+        assertEquals(new FirehoseService.DeliveryStreamPage(List.of(), false),
+                firehoseService.listDeliveryStreams(1, "z-stream"));
+    }
+
     /**
      * @param kinesisDecorator applied to the source service before the poller sees it,
      *                         e.g. {@code Mockito::spy} to park a poll mid-way.
