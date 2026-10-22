@@ -90,10 +90,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(IamEnforcementFilter.class);
 
-    /** Extracts the credential-scope service name (e.g. "s3", "lambda"). */
-    private static final Pattern SERVICE_PATTERN =
-            Pattern.compile("Credential=\\S+/\\d{8}/[^/]+/([^/]+)/");
-
     /** AWS's wording for a credential it does not recognise. */
     private static final String INVALID_SECURITY_TOKEN = "The security token included in the request is invalid.";
 
@@ -842,9 +838,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * maps to an action: AppSync, CodeArtifact's package endpoints, Identity Store's SCIM endpoint
      * and API Gateway's authorizers take Bearer and Basic tokens of their own, and this filter
      * cannot tell the API Gateway execute path, Lambda function URLs and the other paths it sees
-     * that are unsigned by design from the rest. A SigV4a scope, which has no region segment, does
-     * not get here: {@link AccountContextFilter} reads its service name as the region and refuses
-     * it, unless unknown regions are allowed.
+     * that are unsigned by design from the rest. A SigV4a scope has no region segment; every
+     * service takes its region from the signed set (see {@link AccountContextFilter}), and the
+     * shared {@link SigV4HeaderSignatureFilter} turns non-S3 ones away when signature validation is on.
      */
     private void refuseUnreadableCredential(ContainerRequestContext ctx, String auth) {
         if (ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim
@@ -1556,8 +1552,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     }
 
     private String extractCredentialScope(String auth) {
-        Matcher m = SERVICE_PATTERN.matcher(auth);
-        return m.find() ? m.group(1) : null;
+        return SigV4CredentialScope.serviceName(auth).orElse(null);
     }
 
     /**
