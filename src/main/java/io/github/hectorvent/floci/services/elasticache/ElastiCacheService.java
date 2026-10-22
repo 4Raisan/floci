@@ -221,6 +221,7 @@ public class ElastiCacheService implements ResourceProvider {
         ReplicationGroupSettings settings = request.settings() != null
                 ? request.settings() : ReplicationGroupSettings.defaults();
         settings.validate();
+        settings.validateTransitEncryption(request.authMode() != AuthMode.NO_AUTH);
         // resolved with the other validations, before a port is taken or a container started
         ReplicationGroupSettings resolvedSettings =
                 settings.withKmsKeyId(resolveKmsKeyArn(settings.kmsKeyId(), request.region()));
@@ -1752,6 +1753,17 @@ public class ElastiCacheService implements ResourceProvider {
         settings.validate();
         synchronized (lockFor("rg:" + groupId)) {
             ReplicationGroup group = getReplicationGroup(groupId);
+            boolean encryptedInTransit = settings.transitEncryptionEnabled() != null
+                    ? settings.transitEncryptionEnabled() : group.isEncryptedInTransit();
+            settings.validateTransitEncryption(encryptedInTransit);
+            if (!group.isEncryptedInTransit() && encryptedInTransit
+                    && !"preferred".equals(settings.transitEncryptionMode())) {
+                throw new AwsException("InvalidParameterCombination",
+                        "TransitEncryptionMode must be preferred when enabling transit encryption.", 400);
+            }
+            if (group.isEncryptedInTransit() && !encryptedInTransit) {
+                throw new AwsException("InvalidParameterCombination", "Transit encryption cannot be disabled.", 400);
+            }
             // every check before any change: the store hands out its own object, so a mutation
             // made before a later refusal would stay visible
             synchronized (userGroupLock) {
@@ -1761,7 +1773,7 @@ public class ElastiCacheService implements ResourceProvider {
                     for (String id : userGroupIdsToAdd) {
                         Optional<ElastiCacheUserGroup> userGroup = userGroups.get(normalizeUserGroupId(id));
                         if (userGroup.isPresent()) {
-                            requireAssociable(userGroup.get(), group.isEncryptedInTransit(), group.getEngine());
+                            requireAssociable(userGroup.get(), encryptedInTransit, group.getEngine());
                             userGroupsToAdd.add(userGroup.get().getUserGroupId());
                         } else if (users.get(id).isPresent()) {
                             directUsersToAdd.add(id);
