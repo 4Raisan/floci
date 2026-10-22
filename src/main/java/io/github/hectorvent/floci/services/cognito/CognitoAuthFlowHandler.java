@@ -1881,7 +1881,10 @@ final class CognitoAuthFlowHandler {
         Map<String, Object> req = new HashMap<>();
         req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
         req.put("usernameParameter", user.getUsername());
-        req.put("clientMetadata", requestClientMetadata(clientMetadata));
+        Map<String, String> metadata = requestClientMetadata(clientMetadata);
+        if (metadata != null || "CustomMessage_Authentication".equals(triggerSource)) {
+            req.put("clientMetadata", metadata);
+        }
         return customMessageResponse(pool, client, user, triggerSource, req);
     }
 
@@ -1895,13 +1898,16 @@ final class CognitoAuthFlowHandler {
         Map<String, Object> req = new HashMap<>();
         req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
         req.put("usernameParameter", CUSTOM_MESSAGE_USERNAME_PARAMETER);
-        req.put("clientMetadata", requestClientMetadata(clientMetadata));
+        Map<String, String> metadata = requestClientMetadata(clientMetadata);
+        if (metadata != null) {
+            req.put("clientMetadata", metadata);
+        }
         return customMessageResponse(pool, null, user, "CustomMessage_AdminCreateUser", req);
     }
 
     /**
-     * A custom message or sender event's {@code clientMetadata}: the request's, or null when it
-     * carries none, as Cognito sends it (measured, eu-west-1, 2026-10-16 and 2026-10-20).
+     * Normalizes absent or empty ClientMetadata for each trigger's event shape. CustomMessage
+     * omits the member for measured sources; CustomEmailSender includes it with null.
      */
     private static Map<String, String> requestClientMetadata(Map<String, String> clientMetadata) {
         return clientMetadata == null || clientMetadata.isEmpty() ? null : clientMetadata;

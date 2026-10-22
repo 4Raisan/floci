@@ -2357,20 +2357,64 @@ class CognitoLambdaTriggersTest {
         assertEquals(Map.of("source", "forgot"), ((Map<String, Object>) event.get("request")).get("clientMetadata"));
     }
 
-    /** Measured (eu-west-1, 2026-10-20): a request without ClientMetadata gives the event a null one, not {}. */
+    /** Measured (eu-west-1, 2026-10-21): no ClientMetadata omits the key, including an empty map. */
     @Test
-    void customMessageWithoutClientMetadataCarriesANullOne() throws Exception {
+    void customMessageSignUpOmitsMissingOrEmptyClientMetadata() throws Exception {
         CognitoService svc = customMessageService(mock(SesService.class),
                 VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
         UserPoolClient client = customMessageClient(svc,
                 customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
         ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
 
-        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), null);
 
         JsonNode request = MAPPER.readTree(events.getValue()).path("request");
-        assertTrue(request.has("clientMetadata"));
-        assertTrue(request.path("clientMetadata").isNull());
+        assertFalse(request.has("clientMetadata"));
+
+        svc.signUp(client.getClientId(), "spike2", "Spike@Test1", Map.of("email", "spike2@example.com"),
+                Map.of(), Map.of());
+        request = MAPPER.readTree(events.getValue()).path("request");
+        assertFalse(request.has("clientMetadata"));
+    }
+
+    @Test
+    void customMessageResendAndForgotPasswordOmitMissingClientMetadata() throws Exception {
+        VerificationCodeService codes = inlineMock(VerificationCodeService.class);
+        when(codes.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
+                .thenReturn("111222");
+        when(codes.issue(any(), any(), eq(VerificationCode.Purpose.PASSWORD_RESET), any()))
+                .thenReturn("333444");
+        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class), codes);
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"),
+                Map.of(), Map.of());
+
+        svc.resendConfirmationCode(client.getClientId(), "spike");
+        JsonNode event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_ResendCode", event.path("triggerSource").asText());
+        assertFalse(event.path("request").has("clientMetadata"));
+
+        svc.confirmSignUp(client.getClientId(), "spike", "111222");
+        svc.forgotPassword(client.getClientId(), "spike");
+        event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_ForgotPassword", event.path("triggerSource").asText());
+        assertFalse(event.path("request").has("clientMetadata"));
+    }
+
+    @Test
+    void customMessageAdminCreateUserOmitsMissingClientMetadata() throws Exception {
+        CognitoService svc = customMessageService(mock(SesService.class), null, null);
+        UserPool pool = customMessagePool(svc, Map.of());
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
+
+        svc.adminCreateUser(pool.getId(), "spike", Map.of("email", "spike@example.com"), "Spike@Test1", null,
+                false, List.of("EMAIL"), Map.of(), null);
+
+        JsonNode event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_AdminCreateUser", event.path("triggerSource").asText());
+        assertFalse(event.path("request").has("clientMetadata"));
     }
 
     /** Measured (eu-west-1, 2026-10-20): a sign-in code's event carries no ClientMetadata, though InitiateAuth sends one. */
