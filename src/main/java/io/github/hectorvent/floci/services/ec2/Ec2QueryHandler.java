@@ -395,14 +395,6 @@ public class Ec2QueryHandler {
         }
     }
 
-    private Map<String, List<String>> getFilters(MultivaluedMap<String, String> p) {
-        Map<String, List<String>> filters = new LinkedHashMap<>();
-        for (Map.Entry<String, List<String>> filter : getFiltersList(p)) {
-            filters.put(filter.getKey(), filter.getValue());
-        }
-        return filters;
-    }
-
     /**
      * Returns filters as a list of entries to preserve multiple filters with the same name
      * (AND semantics across filters, OR within values of the same filter).
@@ -1260,8 +1252,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeIamInstanceProfileAssociations(MultivaluedMap<String, String> p, String region) {
         List<String> associationIds = getList(p, "AssociationId");
-        Map<String, List<String>> filters = getFilters(p);
-        List<String> instanceFilter = filters.get("instance-id");
+        List<List<String>> instanceFilters = Ec2Service.filterValues(getFiltersList(p), "instance-id");
 
         List<Reservation> reservations = service.describeInstances(region, List.of(), Map.of());
         XmlBuilder xml = new XmlBuilder()
@@ -1274,7 +1265,7 @@ public class Ec2QueryHandler {
                     continue;
                 }
                 String assocId = Ec2Service.iamInstanceProfileAssociationId(inst.getInstanceId());
-                if (instanceFilter != null && !instanceFilter.contains(inst.getInstanceId())) {
+                if (instanceFilters.stream().anyMatch(values -> !values.contains(inst.getInstanceId()))) {
                     continue;
                 }
                 if (!associationIds.isEmpty() && !associationIds.contains(assocId)) {
@@ -1357,7 +1348,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeInstances(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "InstanceId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<Reservation> reservations = service.describeInstances(region, ids, filters);
 
         XmlBuilder xml = new XmlBuilder()
@@ -1497,7 +1488,7 @@ public class Ec2QueryHandler {
      */
     private Response handleDescribeInstanceCreditSpecifications(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "InstanceId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         int maxResults = parseIntParam(p, "MaxResults", 0);
         String nextToken = p.getFirst("NextToken");
 
@@ -1650,7 +1641,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeVpcs(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "VpcId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         // Resolve the lookup first so unsupported filters retain their error precedence.
         List<Vpc> vpcs = service.describeVpcs(region, ids, filters);
         // Shared service callers decide their own missing-resource behavior, as with subnets.
@@ -2298,7 +2289,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeVpcEndpoints(MultivaluedMap<String, String> p, String region) {
         List<String> endpointIds = getList(p, "VpcEndpointId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<VpcEndpoint> endpoints = service.describeVpcEndpoints(region, endpointIds, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVpcEndpointsResponse", AwsNamespaces.EC2)
@@ -2313,7 +2304,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribePrefixLists(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "PrefixListId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<PrefixList> lists = service.describePrefixLists(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribePrefixListsResponse", AwsNamespaces.EC2)
@@ -2351,7 +2342,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeManagedPrefixLists(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "PrefixListId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<ManagedPrefixList> lists = service.describeManagedPrefixLists(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeManagedPrefixListsResponse", AwsNamespaces.EC2)
@@ -2426,7 +2417,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeTransitGateways(MultivaluedMap<String, String> p, String region) {
         List<TransitGateway> gateways = service.describeTransitGateways(
-                region, getList(p, "TransitGatewayIds"), getFilters(p));
+                region, getList(p, "TransitGatewayIds"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeTransitGatewaysResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -2501,7 +2492,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeTransitGatewayVpcAttachments(MultivaluedMap<String, String> p, String region) {
         List<TransitGatewayVpcAttachment> attachments = service.describeTransitGatewayVpcAttachments(
-                region, getList(p, "TransitGatewayAttachmentIds"), getFilters(p));
+                region, getList(p, "TransitGatewayAttachmentIds"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeTransitGatewayVpcAttachmentsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -2520,7 +2511,7 @@ public class Ec2QueryHandler {
      */
     private Response handleDescribeTransitGatewayAttachments(MultivaluedMap<String, String> p, String region) {
         List<TransitGatewayVpcAttachment> attachments = service.describeTransitGatewayVpcAttachments(
-                region, getList(p, "TransitGatewayAttachmentIds"), getFilters(p));
+                region, getList(p, "TransitGatewayAttachmentIds"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeTransitGatewayAttachmentsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -2550,7 +2541,7 @@ public class Ec2QueryHandler {
 
     /** floci does not yet support creating Connect attachments, so this is always an empty list. */
     private Response handleDescribeTransitGatewayConnects(MultivaluedMap<String, String> p, String region) {
-        service.describeTransitGatewayConnects(region, getList(p, "TransitGatewayAttachmentIds"), getFilters(p));
+        service.describeTransitGatewayConnects(region, getList(p, "TransitGatewayAttachmentIds"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeTransitGatewayConnectsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -2608,7 +2599,7 @@ public class Ec2QueryHandler {
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("transitGatewayPeeringAttachments");
         for (TransitGatewayPeeringAttachment attachment : service.describeTransitGatewayPeeringAttachments(
-                region, getList(p, "TransitGatewayAttachmentIds"), getFilters(p))) {
+                region, getList(p, "TransitGatewayAttachmentIds"), getFiltersList(p))) {
             xml.start("item").raw(peeringAttachmentXml(attachment)).end("item");
         }
         xml.end("transitGatewayPeeringAttachments").end("DescribeTransitGatewayPeeringAttachmentsResponse");
@@ -2671,7 +2662,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeTransitGatewayRouteTables(MultivaluedMap<String, String> p, String region) {
         List<TransitGatewayRouteTable> routeTables = service.describeTransitGatewayRouteTables(
-                region, getList(p, "TransitGatewayRouteTableIds"), getFilters(p));
+                region, getList(p, "TransitGatewayRouteTableIds"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeTransitGatewayRouteTablesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -2724,7 +2715,7 @@ public class Ec2QueryHandler {
             MultivaluedMap<String, String> p, String region) {
         String routeTableId = p.getFirst("TransitGatewayRouteTableId");
         List<TransitGatewayVpcAttachment> associated =
-                service.associationsOf(region, routeTableId, getFilters(p));
+                service.associationsOf(region, routeTableId, getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("GetTransitGatewayRouteTableAssociationsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -2763,7 +2754,7 @@ public class Ec2QueryHandler {
     private Response handleGetTransitGatewayRouteTablePropagations(
             MultivaluedMap<String, String> p, String region) {
         List<TransitGatewayRouteTablePropagation> propagations =
-                service.propagationsOf(region, p.getFirst("TransitGatewayRouteTableId"), getFilters(p));
+                service.propagationsOf(region, p.getFirst("TransitGatewayRouteTableId"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("GetTransitGatewayRouteTablePropagationsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -2817,7 +2808,7 @@ public class Ec2QueryHandler {
 
     private Response handleSearchTransitGatewayRoutes(MultivaluedMap<String, String> p, String region) {
         List<TransitGatewayRoute> routes = service.searchTransitGatewayRoutes(
-                region, p.getFirst("TransitGatewayRouteTableId"), getFilters(p));
+                region, p.getFirst("TransitGatewayRouteTableId"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("SearchTransitGatewayRoutesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -3042,7 +3033,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeEgressOnlyInternetGateways(MultivaluedMap<String, String> p, String region) {
         EgressOnlyInternetGatewayListResult result = service.describeEgressOnlyInternetGateways(
-                region, getList(p, "EgressOnlyInternetGatewayId"), getFilters(p),
+                region, getList(p, "EgressOnlyInternetGatewayId"), getFiltersList(p),
                 p.getFirst("MaxResults") == null ? null : parseIntParam(p, "MaxResults", 0),
                 p.getFirst("NextToken"));
         XmlBuilder xml = new XmlBuilder()
@@ -3181,7 +3172,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeSubnets(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "SubnetId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         // A requested id that does not exist is an error, not an omission from the result. Returning
         // an empty list tells a caller the subnet is gone when the id may simply be wrong, and a
         // waiter polling for a subnet it just created cannot tell "not yet" from "never".
@@ -3260,7 +3251,7 @@ public class Ec2QueryHandler {
     private Response handleDescribeSecurityGroups(MultivaluedMap<String, String> p, String region) {
         List<String> groupIds = getList(p, "GroupId");
         List<String> groupNames = getList(p, "GroupName");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<SecurityGroup> sgs = service.describeSecurityGroups(region, groupIds, groupNames, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeSecurityGroupsResponse", AwsNamespaces.EC2)
@@ -3275,7 +3266,7 @@ public class Ec2QueryHandler {
 
     private Response handleGetSecurityGroupsForVpc(MultivaluedMap<String, String> p, String region) {
         String vpcId = p.getFirst("VpcId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<SecurityGroup> sgs = service.getSecurityGroupsForVpc(region, vpcId, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("GetSecurityGroupsForVpcResponse", AwsNamespaces.EC2)
@@ -3353,20 +3344,19 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeSecurityGroupRules(MultivaluedMap<String, String> p, String region) {
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         // The AWS SDK sends the security group id as a filter with name "group-id". Rule ids can
         // arrive as the SecurityGroupRuleId.N parameter or the "security-group-rule-id" filter;
-        // filters are conjunctive with parameters, so intersect rather than union when both appear.
-        List<String> paramRuleIds = getList(p, "SecurityGroupRuleId");
-        List<String> filterRuleIds = filters.getOrDefault("security-group-rule-id", List.of());
-        List<String> ruleIds = paramRuleIds.isEmpty() || filterRuleIds.isEmpty()
-                ? (paramRuleIds.isEmpty() ? filterRuleIds : paramRuleIds)
-                : paramRuleIds.stream().filter(filterRuleIds::contains).toList();
-        boolean unsatisfiable = !paramRuleIds.isEmpty() && !filterRuleIds.isEmpty() && ruleIds.isEmpty();
-        List<String> groupIds = filters.getOrDefault("group-id", List.of());
-        List<SecurityGroupRule> rules = unsatisfiable
-                ? List.of()
-                : service.describeSecurityGroupRules(region, groupIds, ruleIds);
+        // filters are conjunctive with parameters and with each other, so each one narrows the
+        // rules the parameter names. A filter without values narrows nothing.
+        List<List<String>> ruleIdFilters = Ec2Service.filterValues(filters, "security-group-rule-id");
+        List<List<String>> groupIdFilters = Ec2Service.filterValues(filters, "group-id");
+        List<SecurityGroupRule> named = service.describeSecurityGroupRules(
+                region, List.of(), getList(p, "SecurityGroupRuleId"));
+        List<SecurityGroupRule> rules = named.stream()
+                .filter(rule -> Ec2Service.everyFilterContains(ruleIdFilters, rule.getSecurityGroupRuleId()))
+                .filter(rule -> Ec2Service.everyFilterContains(groupIdFilters, rule.getGroupId()))
+                .toList();
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeSecurityGroupRulesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -3539,21 +3529,26 @@ public class Ec2QueryHandler {
     private Response handleDescribeImages(MultivaluedMap<String, String> p, String region) {
         List<String> imageIds = getList(p, "ImageId");
         List<String> owners = getList(p, "Owner");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<Image> images = service.describeImages(region, imageIds, owners, filters);
         // CDK's MachineImage.lookup is a synth-time context provider that queries
         // by a `name` wildcard and aborts `cdk deploy` if the response is empty.
         // When a wildcard name filter matches no seeded AMI, synthesize one that
         // satisfies it, so the lookup resolves — the exact id is a runtime detail.
-        if (images.isEmpty() && imageIds.isEmpty() && filters.containsKey("name")) {
+        List<List<String>> nameFilters = Ec2Service.filterValues(filters, "name");
+        if (images.isEmpty() && imageIds.isEmpty() && !nameFilters.isEmpty()) {
             // A filter's values are an OR, so the wildcard is whichever value carries one rather
             // than whichever comes first. Taking the first outright meant an exact value ahead of
-            // a wildcard skipped synthesis and the lookup got nothing.
-            String namePattern = filters.get("name").stream()
-                    .filter(v -> v != null && (v.contains("*") || v.contains("?")))
-                    .findFirst()
-                    .orElse(null);
-            if (namePattern != null) {
+            // a wildcard skipped synthesis and the lookup got nothing. Each name filter offers its
+            // first wildcard in turn, since the image one builds may fail another.
+            for (List<String> nameFilter : nameFilters) {
+                String namePattern = nameFilter.stream()
+                        .filter(v -> v != null && (v.contains("*") || v.contains("?")))
+                        .findFirst()
+                        .orElse(null);
+                if (namePattern == null) {
+                    continue;
+                }
                 Image synthesized = synthesizeLookupImage(namePattern, filters, owners);
                 // Only hand it back if it satisfies everything that was asked for. Returning an
                 // AMI that violates the request is worse than the empty result the lookup would
@@ -3562,6 +3557,7 @@ public class Ec2QueryHandler {
                 if (service.imageMatchesFilters(synthesized, filters)
                         && service.imageMatchesOwners(synthesized, owners)) {
                     images = List.of(synthesized);
+                    break;
                 }
             }
         }
@@ -3615,13 +3611,19 @@ public class Ec2QueryHandler {
      * through verbatim produced an image owned by the literal string. AWS always reports an account
      * id in {@code imageOwnerId}, so each alias resolves to the account it names.
      */
-    private String resolveSynthOwner(Map<String, List<String>> filters, List<String> owners) {
+    private String resolveSynthOwner(List<Map.Entry<String, List<String>>> filters, List<String> owners) {
         // An owner-alias filter names an account just as much as Owner.N does, so it is consulted
         // before the default. Without that, filtering on owner-alias alone produced an image
         // carrying that alias beside the default Amazon account id, contradicting itself the same
         // way an unresolved alias did in the other direction.
-        String requested = filters.getOrDefault("owner-id", owners == null ? List.of() : owners)
-                .stream().findFirst()
+        List<List<String>> ownerIdFilters = Ec2Service.filterValues(filters, "owner-id");
+        List<String> ownerIds = ownerIdFilters.isEmpty()
+                ? (owners == null ? List.of() : owners)
+                : ownerIdFilters.stream()
+                        .flatMap(List::stream)
+                        .filter(v -> Ec2Service.everyFilterAdmits(ownerIdFilters, v))
+                        .toList();
+        String requested = ownerIds.stream().findFirst()
                 .orElseGet(() -> firstFilterValue(filters, "owner-alias", AMAZON_OWNER_ID));
         return switch (requested) {
             case "self" -> service.callerAccountId();
@@ -3644,10 +3646,17 @@ public class Ec2QueryHandler {
         };
     }
 
-    /** The requested value for a scalar filter, so the synthesized image satisfies it. */
-    private static String firstFilterValue(Map<String, List<String>> filters, String name, String fallback) {
-        return filters.getOrDefault(name, List.of()).stream()
+    /**
+     * The requested value for a scalar filter, so the synthesized image satisfies it: the first
+     * value without a wildcard that every filter of that name admits.
+     */
+    private static String firstFilterValue(List<Map.Entry<String, List<String>>> filters, String name,
+                                           String fallback) {
+        List<List<String>> named = Ec2Service.filterValues(filters, name);
+        return named.stream()
+                .flatMap(List::stream)
                 .filter(v -> v != null && !v.contains("*") && !v.contains("?"))
+                .filter(v -> Ec2Service.everyFilterAdmits(named, v))
                 .findFirst()
                 .orElse(fallback);
     }
@@ -3656,7 +3665,8 @@ public class Ec2QueryHandler {
      * Builds an AMI that satisfies a lookup's name wildcard and its owner and architecture filters.
      * The id is a hash of the pattern, so repeated lookups resolve to the same image.
      */
-    private Image synthesizeLookupImage(String namePattern, Map<String, List<String>> filters, List<String> owners) {
+    private Image synthesizeLookupImage(String namePattern, List<Map.Entry<String, List<String>>> filters,
+                                        List<String> owners) {
         Image img = new Image();
         // 17 hex chars after "ami-", deterministic from the pattern.
         String hash = String.format("%08x", namePattern.hashCode() & 0x7fffffff);
@@ -3769,7 +3779,7 @@ public class Ec2QueryHandler {
     private Response handleDescribeSnapshots(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "SnapshotId");
         List<String> owners = getList(p, "Owner", "OwnerId", "OwnerIds");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<Snapshot> snapshots = service.describeSnapshots(region, ids, owners, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeSnapshotsResponse", AwsNamespaces.EC2)
@@ -3856,7 +3866,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeInternetGateways(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "InternetGatewayId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<InternetGateway> igws = service.describeInternetGateways(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeInternetGatewaysResponse", AwsNamespaces.EC2)
@@ -3900,13 +3910,13 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeVpnGateways(MultivaluedMap<String, String> p) {
-        service.describeVpnGatewayIds(getList(p, "VpnGatewayId"), getFilters(p));
+        service.describeVpnGatewayIds(getList(p, "VpnGatewayId"), getFiltersList(p));
         return emptyDescribeResponse("DescribeVpnGateways", "vpnGatewaySet");
     }
 
     private Response handleDescribeRouteTables(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "RouteTableId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<RouteTable> rts = service.describeRouteTables(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeRouteTablesResponse", AwsNamespaces.EC2)
@@ -4038,7 +4048,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeVpcPeeringConnections(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "VpcPeeringConnectionId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<VpcPeeringConnection> connections = service.describeVpcPeeringConnections(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVpcPeeringConnectionsResponse", AwsNamespaces.EC2)
@@ -4129,7 +4139,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeNetworkAcls(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "NetworkAclId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<NetworkAcl> acls = service.describeNetworkAcls(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeNetworkAclsResponse", AwsNamespaces.EC2)
@@ -4201,7 +4211,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeNatGateways(MultivaluedMap<String, String> p, String region) {
         List<String> natGatewayIds = getList(p, "NatGatewayId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<NatGateway> natGateways = service.describeNatGateways(region, natGatewayIds, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeNatGatewaysResponse", AwsNamespaces.EC2)
@@ -4254,7 +4264,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeCapacityReservations(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "CapacityReservationId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<CapacityReservation> reservations = service.describeCapacityReservations(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeCapacityReservationsResponse", AwsNamespaces.EC2)
@@ -4338,7 +4348,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeHosts(MultivaluedMap<String, String> p, String region) {
-        List<Host> found = service.describeHosts(region, getList(p, "HostId"), getFilters(p));
+        List<Host> found = service.describeHosts(region, getList(p, "HostId"), getFiltersList(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeHostsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -4486,7 +4496,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeAddresses(MultivaluedMap<String, String> p, String region) {
         List<String> allocationIds = getList(p, "AllocationId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<Address> addrs = service.describeAddresses(region, allocationIds, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAddressesResponse", AwsNamespaces.EC2)
@@ -4648,7 +4658,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeInstanceTypeOfferings(MultivaluedMap<String, String> p, String region) {
         List<String> typeNames = getList(p, "InstanceType");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<Map<String, String>> offerings = service.describeInstanceTypeOfferings(
                 region, typeNames, p.getFirst("LocationType"), filters);
         XmlBuilder xml = new XmlBuilder()
@@ -4702,7 +4712,7 @@ public class Ec2QueryHandler {
     private Response handleDescribeLaunchTemplates(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "LaunchTemplateId");
         List<String> names = getList(p, "LaunchTemplateName");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<LaunchTemplate> launchTemplates = service.describeLaunchTemplates(region, ids, names, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeLaunchTemplatesResponse", AwsNamespaces.EC2)
@@ -4763,7 +4773,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeNetworkInterfaces(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "NetworkInterfaceId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
 
         // Phase 5: pagination parameters
         int maxResults = parseIntParam(p, "MaxResults", 0);
@@ -6191,7 +6201,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeVolumes(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "VolumeId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<Volume> volList = service.describeVolumes(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVolumesResponse", AwsNamespaces.EC2)
@@ -6237,7 +6247,7 @@ public class Ec2QueryHandler {
     private Response handleDescribeVolumesModifications(MultivaluedMap<String, String> p, String region) {
         checkDryRun(p);
         List<String> ids = getList(p, "VolumeId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<VolumeModification> modList = service.describeVolumesModifications(region, ids, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVolumesModificationsResponse", AwsNamespaces.EC2)
@@ -6456,7 +6466,7 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeSpotInstanceRequests(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "SpotInstanceRequestId");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<SpotInstanceRequest> requests = service.describeSpotInstanceRequests(region, ids, filters);
 
         XmlBuilder xml = new XmlBuilder()
@@ -6510,7 +6520,7 @@ public class Ec2QueryHandler {
         }
         Instant startTime = instantOrNull(p, "StartTime");
         Instant endTime = instantOrNull(p, "EndTime");
-        Map<String, List<String>> filters = getFilters(p);
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         String nextToken = p.getFirst("NextToken");
 
         int maxResults = 0;

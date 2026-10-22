@@ -247,6 +247,12 @@ Floci seeds the following resources on first use in each region so Terraform, th
 
 ## Supported Actions
 
+Where an action reads `Filter.N`, every filter is joined with an AND and the values of one filter
+with an OR, as the [Filter](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_Filter.html)
+reference describes. A name given twice counts as two filters, so `tag-key` with `Env` and
+`tag-key` with `Team` find only the resources that carry both tag keys, and two `vpc-id` filters
+naming different VPCs find nothing.
+
 ### Instances
 
 | Action | Description |
@@ -799,7 +805,7 @@ regions, for which AWS publishes no zone id, keep the whole region as the prefix
 | Action | Description |
 |--------|-------------|
 | DescribeInstanceTypes | Returns instance type metadata known to the local EC2 service, including `burstablePerformanceSupported` for the T families. |
-| DescribeInstanceTypeOfferings | Returns instance type offerings for the requested location filters. |
+| DescribeInstanceTypeOfferings | Returns instance type offerings for the requested location filters. An `instance-type` filter value may hold `*` and `?` wildcards, such as `t3.*`. |
 
 ### Launch Templates
 

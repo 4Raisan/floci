@@ -1477,6 +1477,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<NetworkAcl> describeNetworkAcls(String region, List<String> ids, Map<String, List<String>> filters) {
+        return describeNetworkAcls(region, ids, filterList(filters));
+    }
+
+    List<NetworkAcl> describeNetworkAcls(String region, List<String> ids,
+                                         List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         return networkAcls.scan(k -> true).stream()
                 .filter(a -> region.equals(a.getRegion()))
@@ -1485,8 +1490,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .collect(Collectors.toList());
     }
 
-    private boolean matchesNetworkAclFilters(NetworkAcl acl, Map<String, List<String>> filters) {
-        for (Map.Entry<String, List<String>> f : filters.entrySet()) {
+    private boolean matchesNetworkAclFilters(NetworkAcl acl, List<Map.Entry<String, List<String>>> filters) {
+        for (Map.Entry<String, List<String>> f : filters) {
             List<String> values = f.getValue();
             boolean matches = switch (f.getKey()) {
                 case "network-acl-id" -> values.contains(acl.getNetworkAclId());
@@ -1604,12 +1609,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // DescribeManagedPrefixLists serves, so the two APIs cannot report different CIDRs for the
     // same list.
     public List<PrefixList> describePrefixLists(String region, List<String> ids, Map<String, List<String>> filters) {
-        List<String> names = filters.getOrDefault("prefix-list-name", List.of());
-        List<String> filterIds = filters.getOrDefault("prefix-list-id", List.of());
+        return describePrefixLists(region, ids, filterList(filters));
+    }
+
+    List<PrefixList> describePrefixLists(String region, List<String> ids,
+                                         List<Map.Entry<String, List<String>>> filters) {
+        List<List<String>> names = filterValues(filters, "prefix-list-name");
+        List<List<String>> filterIds = filterValues(filters, "prefix-list-id");
         return awsManagedPrefixLists(region).stream()
                 .filter(pl -> ids.isEmpty() || ids.contains(pl.getPrefixListId()))
-                .filter(pl -> filterIds.isEmpty() || filterIds.contains(pl.getPrefixListId()))
-                .filter(pl -> names.isEmpty() || names.contains(pl.getPrefixListName()))
+                .filter(pl -> everyFilterContains(filterIds, pl.getPrefixListId()))
+                .filter(pl -> everyFilterContains(names, pl.getPrefixListName()))
                 .map(pl -> new PrefixList(pl.getPrefixListId(), pl.getPrefixListName(),
                         pl.currentEntries().stream()
                                 .map(PrefixListEntry::getCidr)
@@ -1717,6 +1727,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<ManagedPrefixList> describeManagedPrefixLists(String region, List<String> prefixListIds,
                                                               Map<String, List<String>> filters) {
+        return describeManagedPrefixLists(region, prefixListIds, filterList(filters));
+    }
+
+    List<ManagedPrefixList> describeManagedPrefixLists(String region, List<String> prefixListIds,
+                                                       List<Map.Entry<String, List<String>>> filters) {
         List<ManagedPrefixList> all = new ArrayList<>(awsManagedPrefixLists(region));
         managedPrefixLists.scan(k -> true).stream()
                 .filter(list -> region.equals(list.getRegion()))
@@ -2091,6 +2106,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<TransitGateway> describeTransitGateways(String region, List<String> transitGatewayIds,
                                                         Map<String, List<String>> filters) {
+        return describeTransitGateways(region, transitGatewayIds, filterList(filters));
+    }
+
+    List<TransitGateway> describeTransitGateways(String region, List<String> transitGatewayIds,
+                                                 List<Map.Entry<String, List<String>>> filters) {
         transitGatewayIds.forEach(Ec2Service::requireWellFormedTransitGatewayId);
         List<TransitGateway> all = transitGateways.scan(k -> true).stream()
                 .filter(gateway -> region.equals(gateway.getRegion()))
@@ -2535,6 +2555,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<TransitGatewayVpcAttachment> describeTransitGatewayVpcAttachments(
             String region, List<String> attachmentIds, Map<String, List<String>> filters) {
+        return describeTransitGatewayVpcAttachments(region, attachmentIds, filterList(filters));
+    }
+
+    List<TransitGatewayVpcAttachment> describeTransitGatewayVpcAttachments(
+            String region, List<String> attachmentIds, List<Map.Entry<String, List<String>>> filters) {
         attachmentIds.forEach(Ec2Service::requireWellFormedAttachmentId);
         List<TransitGatewayVpcAttachment> all = transitGatewayVpcAttachments.scan(k -> true).stream()
                 .filter(attachment -> region.equals(attachment.getRegion()))
@@ -2560,6 +2585,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public void describeTransitGatewayConnects(
             String region, List<String> attachmentIds, Map<String, List<String>> filters) {
+        describeTransitGatewayConnects(region, attachmentIds, filterList(filters));
+    }
+
+    void describeTransitGatewayConnects(
+            String region, List<String> attachmentIds, List<Map.Entry<String, List<String>>> filters) {
         attachmentIds.forEach(Ec2Service::requireWellFormedAttachmentId);
         if (!attachmentIds.isEmpty()) {
             throw new AwsException("InvalidTransitGatewayConnectID.NotFound",
@@ -2702,6 +2732,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<TransitGatewayPeeringAttachment> describeTransitGatewayPeeringAttachments(
             String region, List<String> attachmentIds, Map<String, List<String>> filters) {
+        return describeTransitGatewayPeeringAttachments(region, attachmentIds, filterList(filters));
+    }
+
+    List<TransitGatewayPeeringAttachment> describeTransitGatewayPeeringAttachments(
+            String region, List<String> attachmentIds, List<Map.Entry<String, List<String>>> filters) {
         attachmentIds.forEach(Ec2Service::requireWellFormedAttachmentId);
         String account = callerAccountId();
         List<TransitGatewayPeeringAttachment> visible = allPeeringAttachments().stream()
@@ -2912,6 +2947,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<TransitGatewayRouteTable> describeTransitGatewayRouteTables(
             String region, List<String> routeTableIds, Map<String, List<String>> filters) {
+        return describeTransitGatewayRouteTables(region, routeTableIds, filterList(filters));
+    }
+
+    List<TransitGatewayRouteTable> describeTransitGatewayRouteTables(
+            String region, List<String> routeTableIds, List<Map.Entry<String, List<String>>> filters) {
         routeTableIds.forEach(Ec2Service::requireWellFormedRouteTableId);
         List<TransitGatewayRouteTable> all = transitGatewayRouteTables.scan(k -> true).stream()
                 .filter(routeTable -> region.equals(routeTable.getRegion()))
@@ -3002,8 +3042,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     /** The attachments associated with a route table, which is where an association is recorded. */
     public List<TransitGatewayVpcAttachment> associationsOf(
             String region, String routeTableId, Map<String, List<String>> filters) {
-        Map<String, List<String>> modeledFilters = new LinkedHashMap<>(filters);
-        modeledFilters.keySet().retainAll(ROUTE_TABLE_MEMBERSHIP_FILTER_NAMES);
+        return associationsOf(region, routeTableId, filterList(filters));
+    }
+
+    List<TransitGatewayVpcAttachment> associationsOf(
+            String region, String routeTableId, List<Map.Entry<String, List<String>>> filters) {
+        List<Map.Entry<String, List<String>>> modeledFilters = membershipFilters(filters);
         return transitGatewayVpcAttachments.scan(k -> true).stream()
                 .filter(attachment -> region.equals(attachment.getRegion()))
                 .filter(attachment -> routeTableId.equals(attachment.getAssociationRouteTableId()))
@@ -3057,13 +3101,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<TransitGatewayRouteTablePropagation> propagationsOf(
             String region, String routeTableId, Map<String, List<String>> filters) {
-        Map<String, List<String>> modeledFilters = new LinkedHashMap<>(filters);
-        modeledFilters.keySet().retainAll(ROUTE_TABLE_MEMBERSHIP_FILTER_NAMES);
+        return propagationsOf(region, routeTableId, filterList(filters));
+    }
+
+    List<TransitGatewayRouteTablePropagation> propagationsOf(
+            String region, String routeTableId, List<Map.Entry<String, List<String>>> filters) {
+        List<Map.Entry<String, List<String>>> modeledFilters = membershipFilters(filters);
         return transitGatewayPropagations.scan(k -> true).stream()
                 .filter(propagation -> region.equals(propagation.getRegion()))
                 .filter(propagation -> routeTableId.equals(propagation.getTransitGatewayRouteTableId()))
                 .filter(propagation -> matchesFilters(propagation, modeledFilters, region))
                 .collect(Collectors.toList());
+    }
+
+    private static List<Map.Entry<String, List<String>>> membershipFilters(
+            List<Map.Entry<String, List<String>>> filters) {
+        return filters.stream()
+                .filter(filter -> ROUTE_TABLE_MEMBERSHIP_FILTER_NAMES.contains(filter.getKey()))
+                .toList();
     }
 
     public TransitGatewayRoute createTransitGatewayRoute(String region, String routeTableId,
@@ -3165,6 +3220,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public List<TransitGatewayRoute> searchTransitGatewayRoutes(String region, String routeTableId,
                                                                 Map<String, List<String>> filters) {
+        return searchTransitGatewayRoutes(region, routeTableId, filterList(filters));
+    }
+
+    List<TransitGatewayRoute> searchTransitGatewayRoutes(String region, String routeTableId,
+                                                         List<Map.Entry<String, List<String>>> filters) {
         getRequiredTransitGatewayRouteTable(region, routeTableId);
         List<TransitGatewayRoute> routes = new ArrayList<>(routesOf(region, routeTableId));
         for (TransitGatewayRouteTablePropagation propagation : propagationsOf(region, routeTableId)) {
@@ -3214,12 +3274,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * answer a question that was never asked.
      */
     private List<TransitGatewayRoute> applyRouteFilters(List<TransitGatewayRoute> routes,
-                                                        Map<String, List<String>> filters) {
+                                                        List<Map.Entry<String, List<String>>> filters) {
         if (filters == null || filters.isEmpty()) {
             return routes;
         }
         List<TransitGatewayRoute> matched = new ArrayList<>(routes);
-        for (Map.Entry<String, List<String>> filter : filters.entrySet()) {
+        for (Map.Entry<String, List<String>> filter : filters) {
             String name = filter.getKey();
             List<String> values = filter.getValue();
             switch (name) {
@@ -4353,6 +4413,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<Reservation> describeInstances(String region, List<String> instanceIds, Map<String, List<String>> filters) {
+        return describeInstances(region, instanceIds, filterList(filters));
+    }
+
+    List<Reservation> describeInstances(String region, List<String> instanceIds,
+                                        List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         if (!instanceIds.isEmpty()) {
             for (String id : instanceIds) {
@@ -4961,6 +5026,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .collect(Collectors.toList());
     }
 
+    public InstanceCreditSpecificationListResult describeInstanceCreditSpecifications(
+            String region, List<String> instanceIds, Map<String, List<String>> filters,
+            int maxResults, String nextToken) {
+        return describeInstanceCreditSpecifications(region, instanceIds, filterList(filters), maxResults, nextToken);
+    }
+
     /**
      * The credit option for CPU usage of burstable performance instances.
      *
@@ -4991,8 +5062,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * @param maxResults  page size, or 0 for no pagination. AWS rejects it together with ids
      * @param nextToken   the cursor from a previous page, or null
      */
-    public InstanceCreditSpecificationListResult describeInstanceCreditSpecifications(
-            String region, List<String> instanceIds, Map<String, List<String>> filters,
+    InstanceCreditSpecificationListResult describeInstanceCreditSpecifications(
+            String region, List<String> instanceIds, List<Map.Entry<String, List<String>>> filters,
             int maxResults, String nextToken) {
         validateInstanceCreditSpecificationsPagination(instanceIds, maxResults);
         ensureDefaultResources(region);
@@ -5522,11 +5593,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<Vpc> describeVpcs(String region, List<String> vpcIds, Map<String, List<String>> filters) {
+        return describeVpcs(region, vpcIds, filterList(filters));
+    }
+
+    List<Vpc> describeVpcs(String region, List<String> vpcIds, List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         // matchesFilters answers true for a name it does not recognise, so without this an
         // unsupported filter matches every VPC instead of narrowing anything. Real EC2 rejects the
         // name outright, which is the difference between a wrong result and an error.
-        requireSupportedFilters(filters.keySet(), VPC_FILTERS);
+        requireSupportedFilters(filterNames(filters), VPC_FILTERS);
         return vpcs.scan(k -> true).stream()
                 .filter(v -> v.getRegion().equals(region))
                 .filter(v -> vpcIds.isEmpty() || vpcIds.contains(v.getVpcId()))
@@ -5536,7 +5611,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<String> describeVpnGatewayIds(
             List<String> gatewayIds, Map<String, List<String>> filters) {
-        requireSupportedFilters(filters.keySet(), VPN_GATEWAY_FILTERS);
+        return describeVpnGatewayIds(gatewayIds, filterList(filters));
+    }
+
+    List<String> describeVpnGatewayIds(
+            List<String> gatewayIds, List<Map.Entry<String, List<String>>> filters) {
+        requireSupportedFilters(filterNames(filters), VPN_GATEWAY_FILTERS);
         if (!gatewayIds.isEmpty()) {
             throw new AwsException("InvalidVpnGatewayID.NotFound",
                     "The vpnGateway ID '" + gatewayIds.getFirst() + "' does not exist", 400);
@@ -5592,7 +5672,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // the Terraform provider treat the empty result as "not found".
     public List<EgressOnlyInternetGateway> describeEgressOnlyInternetGateways(String region, List<String> ids,
                                                                              Map<String, List<String>> filters) {
-        requireSupportedFilters(filters.keySet(), EGRESS_ONLY_INTERNET_GATEWAY_FILTERS);
+        return describeEgressOnlyInternetGateways(region, ids, filterList(filters));
+    }
+
+    List<EgressOnlyInternetGateway> describeEgressOnlyInternetGateways(String region, List<String> ids,
+                                                                      List<Map.Entry<String, List<String>>> filters) {
+        requireSupportedFilters(filterNames(filters), EGRESS_ONLY_INTERNET_GATEWAY_FILTERS);
         return egressOnlyInternetGateways.scan(k -> k.startsWith(region + "::")).stream()
                 .filter(eigw -> ids.isEmpty() || ids.contains(eigw.getEgressOnlyInternetGatewayId()))
                 .filter(eigw -> matchesFilters(eigw, filters, region))
@@ -5606,6 +5691,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public EgressOnlyInternetGatewayListResult describeEgressOnlyInternetGateways(
             String region, List<String> ids, Map<String, List<String>> filters, Integer maxResults,
+            String nextToken) {
+        return describeEgressOnlyInternetGateways(region, ids, filterList(filters), maxResults, nextToken);
+    }
+
+    EgressOnlyInternetGatewayListResult describeEgressOnlyInternetGateways(
+            String region, List<String> ids, List<Map.Entry<String, List<String>>> filters, Integer maxResults,
             String nextToken) {
         if (maxResults != null && (maxResults < 5 || maxResults > 255)) {
             throw new AwsException("InvalidMaxResults",
@@ -6234,6 +6325,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<VpcEndpoint> describeVpcEndpoints(String region, List<String> endpointIds,
                                                   Map<String, List<String>> filters) {
+        return describeVpcEndpoints(region, endpointIds, filterList(filters));
+    }
+
+    List<VpcEndpoint> describeVpcEndpoints(String region, List<String> endpointIds,
+                                           List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         if (!endpointIds.isEmpty()) {
             for (String endpointId : endpointIds) {
@@ -6858,6 +6954,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<Subnet> describeSubnets(String region, List<String> subnetIds, Map<String, List<String>> filters) {
+        return describeSubnets(region, subnetIds, filterList(filters));
+    }
+
+    List<Subnet> describeSubnets(String region, List<String> subnetIds, List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         List<Subnet> result = subnets.scan(k -> true).stream()
                 .filter(s -> s.getRegion().equals(region))
@@ -6998,6 +7098,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<SecurityGroup> describeSecurityGroups(String region, List<String> groupIds,
                                                        List<String> groupNames, Map<String, List<String>> filters) {
+        return describeSecurityGroups(region, groupIds, groupNames, filterList(filters));
+    }
+
+    List<SecurityGroup> describeSecurityGroups(String region, List<String> groupIds, List<String> groupNames,
+                                               List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         return securityGroups.scan(k -> true).stream()
                 .filter(sg -> sg.getRegion().equals(region))
@@ -7009,6 +7114,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<SecurityGroup> getSecurityGroupsForVpc(String region, String vpcId,
                                                         Map<String, List<String>> filters) {
+        return getSecurityGroupsForVpc(region, vpcId, filterList(filters));
+    }
+
+    List<SecurityGroup> getSecurityGroupsForVpc(String region, String vpcId,
+                                                List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         getRequiredVpc(region, vpcId);
         return securityGroups.scan(k -> true).stream()
@@ -7679,6 +7789,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<Image> describeImages(String region, List<String> imageIds, List<String> owners, Map<String, List<String>> filters) {
+        return describeImages(region, imageIds, owners, filterList(filters));
+    }
+
+    List<Image> describeImages(String region, List<String> imageIds, List<String> owners,
+                               List<Map.Entry<String, List<String>>> filters) {
         List<Image> catalogImages = imageCatalog.images().stream()
                 .filter(Ec2ImageCatalog.CatalogImage::advertised)
                 .filter(img -> img.matchesIdOrAlias(imageIds))
@@ -7712,7 +7827,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // create (the aws provider reports "collecting instance settings: empty result"). Mirror the launch-time
     // fallback so a describe of a launchable id returns a matching image instead of nothing.
     private void addFallbackLaunchableImages(String region, List<Image> images, List<String> imageIds,
-                                             List<String> owners, Map<String, List<String>> filters) {
+                                             List<String> owners, List<Map.Entry<String, List<String>>> filters) {
         if (imageIds == null || imageIds.isEmpty()) {
             return;
         }
@@ -8319,6 +8434,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<Snapshot> describeSnapshots(String region, List<String> snapshotIds,
                                             List<String> ownerIds, Map<String, List<String>> filters) {
+        return describeSnapshots(region, snapshotIds, ownerIds, filterList(filters));
+    }
+
+    List<Snapshot> describeSnapshots(String region, List<String> snapshotIds, List<String> ownerIds,
+                                     List<Map.Entry<String, List<String>>> filters) {
         if (snapshotIds != null && !snapshotIds.isEmpty()) {
             for (String id : snapshotIds) {
                 if (snapshots.get(key(region, id)).isEmpty()) {
@@ -8533,7 +8653,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 region,
                 id != null && !id.isBlank() ? List.of(id) : List.of(),
                 name != null && !name.isBlank() ? List.of(name) : List.of(),
-                Map.of());
+                List.of());
         List<LaunchTemplate> versions = new ArrayList<>();
         for (LaunchTemplate launchTemplate : templates) {
             List<String> effectiveVersions = requestedVersions == null || requestedVersions.isEmpty()
@@ -8578,9 +8698,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public List<LaunchTemplate> describeLaunchTemplates(String region, List<String> ids,
                                                         List<String> names, Map<String, List<String>> filters) {
+        return describeLaunchTemplates(region, ids, names, filterList(filters));
+    }
+
+    List<LaunchTemplate> describeLaunchTemplates(String region, List<String> ids, List<String> names,
+                                                 List<Map.Entry<String, List<String>>> filters) {
         if (!names.isEmpty() || !ids.isEmpty()) {
             List<LaunchTemplate> regionTemplates =
-                    matchingLaunchTemplates(region, List.of(), List.of(), Map.of());
+                    matchingLaunchTemplates(region, List.of(), List.of(), List.of());
             for (String name : names) {
                 if (regionTemplates.stream().noneMatch(lt -> name.equals(lt.getLaunchTemplateName()))) {
                     throw new AwsException("InvalidLaunchTemplateName.NotFoundException",
@@ -8597,8 +8722,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return matchingLaunchTemplates(region, ids, names, filters);
     }
 
-    private List<LaunchTemplate> matchingLaunchTemplates(String region, List<String> ids,
-                                                         List<String> names, Map<String, List<String>> filters) {
+    private List<LaunchTemplate> matchingLaunchTemplates(String region, List<String> ids, List<String> names,
+                                                         List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         return launchTemplates.scan(k -> true).stream()
                 .filter(lt -> lt.getRegion().equals(region))
@@ -8786,11 +8911,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return copy;
     }
 
-    private boolean matchesImageFilters(Ec2ImageCatalog.CatalogImage image, Map<String, List<String>> filters) {
+    private boolean matchesImageFilters(Ec2ImageCatalog.CatalogImage image,
+                                        List<Map.Entry<String, List<String>>> filters) {
         if (filters == null || filters.isEmpty()) {
             return true;
         }
-        for (Map.Entry<String, List<String>> filter : filters.entrySet()) {
+        for (Map.Entry<String, List<String>> filter : filters) {
             if (!matchesImageFilter(image, filter.getKey(), filter.getValue())) {
                 return false;
             }
@@ -8849,7 +8975,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * Whether an image satisfies a DescribeImages filter set. Exposed so a synthesized lookup image
      * can be checked against the request that produced it before being returned.
      */
-    public boolean imageMatchesFilters(Image image, Map<String, List<String>> filters) {
+    public boolean imageMatchesFilters(Image image, List<Map.Entry<String, List<String>>> filters) {
         return matchesRegisteredImageFilters(image, filters);
     }
 
@@ -8862,11 +8988,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return matchesImageOwners(image, owners);
     }
 
-    private boolean matchesRegisteredImageFilters(Image image, Map<String, List<String>> filters) {
+    private boolean matchesRegisteredImageFilters(Image image, List<Map.Entry<String, List<String>>> filters) {
         if (filters == null || filters.isEmpty()) {
             return true;
         }
-        for (Map.Entry<String, List<String>> filter : filters.entrySet()) {
+        for (Map.Entry<String, List<String>> filter : filters) {
             if (!matchesRegisteredImageFilter(image, filter.getKey(), filter.getValue())) {
                 return false;
             }
@@ -8939,7 +9065,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private boolean matchesImageTagFilter(Image image, String name, List<String> values) {
-        return matchesTagFilter(image.getTags(), name, values, this::matchesFilterValue);
+        return matchesTagFilter(image.getTags(), name, values, Ec2Service::matchesFilterValue);
     }
 
     private boolean matchesTagFilter(List<Tag> resourceTags, String filterName, List<String> values,
@@ -8967,11 +9093,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return snapshot;
     }
 
-    private boolean matchesSnapshotFilters(Snapshot snapshot, Map<String, List<String>> filters) {
+    private boolean matchesSnapshotFilters(Snapshot snapshot, List<Map.Entry<String, List<String>>> filters) {
         if (filters == null || filters.isEmpty()) {
             return true;
         }
-        for (Map.Entry<String, List<String>> filter : filters.entrySet()) {
+        for (Map.Entry<String, List<String>> filter : filters) {
             if (!matchesSnapshotFilter(snapshot, filter.getKey(), filter.getValue())) {
                 return false;
             }
@@ -9002,7 +9128,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         };
     }
 
-    private boolean matchesFilterValue(List<String> patterns, String value) {
+    private static boolean matchesFilterValue(List<String> patterns, String value) {
         if (patterns == null || patterns.isEmpty()) {
             return true;
         }
@@ -9020,7 +9146,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * caller-supplied pattern of many stars made the regex backtrack for seconds, and its dot
      * skipped line terminators that a tag value may hold.
      */
-    private boolean wildcardMatches(String pattern, String value) {
+    private static boolean wildcardMatches(String pattern, String value) {
         return IamPolicyEvaluator.caseSensitiveGlobMatches(pattern, value);
     }
 
@@ -9586,6 +9712,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<InternetGateway> describeInternetGateways(String region, List<String> igwIds, Map<String, List<String>> filters) {
+        return describeInternetGateways(region, igwIds, filterList(filters));
+    }
+
+    List<InternetGateway> describeInternetGateways(String region, List<String> igwIds,
+                                                   List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         return internetGateways.scan(k -> true).stream()
                 .filter(igw -> igw.getRegion().equals(region))
@@ -9689,6 +9820,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<CapacityReservation> describeCapacityReservations(String region, List<String> ids,
             Map<String, List<String>> filters) {
+        return describeCapacityReservations(region, ids, filterList(filters));
+    }
+
+    List<CapacityReservation> describeCapacityReservations(String region, List<String> ids,
+            List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         for (String id : ids) {
             getRequiredCapacityReservation(region, id);
@@ -9819,6 +9955,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<Host> describeHosts(String region, List<String> ids, Map<String, List<String>> filters) {
+        return describeHosts(region, ids, filterList(filters));
+    }
+
+    List<Host> describeHosts(String region, List<String> ids, List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         for (String id : ids) {
             getRequiredHost(region, id);
@@ -9965,10 +10105,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<RouteTable> describeRouteTables(String region, List<String> routeTableIds, Map<String, List<String>> filters) {
+        return describeRouteTables(callerAccountId(), region, routeTableIds, filterList(filters));
+    }
+
+    List<RouteTable> describeRouteTables(String region, List<String> routeTableIds,
+                                         List<Map.Entry<String, List<String>>> filters) {
         return describeRouteTables(callerAccountId(), region, routeTableIds, filters);
     }
 
     public List<RouteTable> describeRouteTables(String accountId, String region, List<String> routeTableIds, Map<String, List<String>> filters) {
+        return describeRouteTables(accountId, region, routeTableIds, filterList(filters));
+    }
+
+    List<RouteTable> describeRouteTables(String accountId, String region, List<String> routeTableIds,
+                                         List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         String safeAccount = accountId != null ? accountId : callerAccountId();
         List<RouteTable> accountRouteTables = routeTables instanceof AccountAwareStorageBackend<RouteTable> aware
@@ -10565,6 +10715,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<VpcPeeringConnection> describeVpcPeeringConnections(String region, List<String> ids,
                                                                      Map<String, List<String>> filters) {
+        return describeVpcPeeringConnections(region, ids, filterList(filters));
+    }
+
+    List<VpcPeeringConnection> describeVpcPeeringConnections(String region, List<String> ids,
+                                                             List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         String caller = callerAccountId();
         return allVpcPeeringConnections().stream()
@@ -10912,6 +11067,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<NatGateway> describeNatGateways(String region, List<String> natGatewayIds,
                                                 Map<String, List<String>> filters) {
+        return describeNatGateways(region, natGatewayIds, filterList(filters));
+    }
+
+    List<NatGateway> describeNatGateways(String region, List<String> natGatewayIds,
+                                         List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         if (!natGatewayIds.isEmpty()) {
             for (String natGatewayId : natGatewayIds) {
@@ -11340,6 +11500,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<Address> describeAddresses(String region, List<String> allocationIds, Map<String, List<String>> filters) {
+        return describeAddresses(region, allocationIds, filterList(filters));
+    }
+
+    List<Address> describeAddresses(String region, List<String> allocationIds,
+                                    List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
         List<Address> candidates = addresses.scan(k -> true).stream()
                 .filter(a -> a.getRegion().equals(region))
@@ -11517,10 +11682,28 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public List<Map<String, String>> describeInstanceTypeOfferings(String region, List<String> instanceTypeNames,
                                                                    String locationType,
                                                                    Map<String, List<String>> filters) {
+        return describeInstanceTypeOfferings(region, instanceTypeNames, locationType, filterList(filters));
+    }
+
+    List<Map<String, String>> describeInstanceTypeOfferings(String region, List<String> instanceTypeNames,
+                                                            String locationType,
+                                                            List<Map.Entry<String, List<String>>> filters) {
+        // The first instance-type filter names the types to look up beside InstanceType.N, as a
+        // lone one always has, or the whole catalog when one of its values holds a * or ?
+        // wildcard. Every filter must then match a looked-up type, so the answer is InstanceType.N
+        // plus the types every filter matches. A filter without values names nothing and narrows
+        // nothing, as a lone one never added a type.
+        List<List<String>> typeFilters = filterValues(filters, "instance-type").stream()
+                .filter(values -> !values.isEmpty())
+                .toList();
         List<String> effectiveTypeNames = new ArrayList<>(new LinkedHashSet<>(instanceTypeNames));
-        if (filters != null && filters.containsKey("instance-type")) {
-            effectiveTypeNames.addAll(filters.get("instance-type"));
-            effectiveTypeNames = new ArrayList<>(new LinkedHashSet<>(effectiveTypeNames));
+        if (!typeFilters.isEmpty()) {
+            if (typeFilters.getFirst().stream().anyMatch(value -> value.contains("*") || value.contains("?"))) {
+                effectiveTypeNames = List.of();
+            } else {
+                effectiveTypeNames.addAll(typeFilters.getFirst());
+                effectiveTypeNames = new ArrayList<>(new LinkedHashSet<>(effectiveTypeNames));
+            }
         }
         String effectiveLocationType = locationType != null && !locationType.isBlank()
                 ? locationType
@@ -11530,13 +11713,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 : describeAvailabilityZones(region, List.of(), List.of(), null).stream()
                         .map(zone -> zone.get("zoneName"))
                         .toList();
-        List<String> locationFilter = filters != null ? filters.get("location") : null;
+        List<List<String>> locationFilters = filterValues(filters, "location");
 
         List<Map<String, String>> offerings = new ArrayList<>();
         for (Map<String, Object> type : describeInstanceTypes(effectiveTypeNames)) {
             String instanceType = (String) type.get("instanceType");
+            if (!instanceTypeNames.contains(instanceType) && !everyFilterAdmits(typeFilters, instanceType)) {
+                continue;
+            }
             for (String location : locations) {
-                if (locationFilter != null && !matchesValue(location, locationFilter)) {
+                if (!everyFilterMatches(locationFilters, location)) {
                     continue;
                 }
                 Map<String, String> offering = new LinkedHashMap<>();
@@ -11550,6 +11736,52 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     // ─── Filter matching ───────────────────────────────────────────────────────
+
+    /**
+     * Filters of distinct names, as the Map overloads of the Describe methods take them from code
+     * that builds its own. A request's Filter.N reaches the list overloads instead, in request
+     * order: every filter is joined with an AND and a name may repeat, which a map, holding one
+     * filter per name, cannot carry.
+     */
+    private static List<Map.Entry<String, List<String>>> filterList(Map<String, List<String>> filters) {
+        return filters == null ? List.of() : List.copyOf(filters.entrySet());
+    }
+
+    private static List<String> filterNames(List<Map.Entry<String, List<String>>> filters) {
+        return filters.stream().map(Map.Entry::getKey).toList();
+    }
+
+    /** The values of every filter named {@code name}, in request order. */
+    static List<List<String>> filterValues(List<Map.Entry<String, List<String>>> filters, String name) {
+        if (filters == null) {
+            return List.of();
+        }
+        return filters.stream()
+                .filter(filter -> name.equals(filter.getKey()))
+                .map(Map.Entry::getValue)
+                .toList();
+    }
+
+    /**
+     * Whether every one of {@code filters} admits {@code value}, as the image matchers test a
+     * filter. A filter without values admits anything.
+     */
+    static boolean everyFilterAdmits(List<List<String>> filters, String value) {
+        return filters.stream().allMatch(values -> matchesFilterValue(values, value));
+    }
+
+    /** Whether every one of {@code filters} names {@code value} exactly. A filter without values admits anything. */
+    static boolean everyFilterContains(List<List<String>> filters, String value) {
+        return filters.stream().allMatch(values -> values.isEmpty() || values.contains(value));
+    }
+
+    /**
+     * Whether {@code value} matches a value of every one of {@code filters}, wildcards included, as
+     * {@link #matchesValue(String, List)} tests one. A filter without values matches nothing.
+     */
+    private boolean everyFilterMatches(List<List<String>> filters, String value) {
+        return filters.stream().allMatch(values -> matchesValue(value, values));
+    }
 
     private boolean matchesValue(String resourceValue, List<String> filterValues) {
         String normalizedResourceValue = Objects.toString(resourceValue, "");
@@ -11598,11 +11830,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .anyMatch(pattern -> normalizedValue.matches(wildcardToRegex(pattern)));
     }
 
-    private boolean matchesFilters(Object resource, Map<String, List<String>> filters, String region) {
+    private boolean matchesFilters(Object resource, List<Map.Entry<String, List<String>>> filters, String region) {
         if (filters == null || filters.isEmpty()) {
             return true;
         }
-        for (Map.Entry<String, List<String>> filter : filters.entrySet()) {
+        for (Map.Entry<String, List<String>> filter : filters) {
             String name = filter.getKey();
             List<String> values = filter.getValue();
             if (!matchesFilter(resource, name, values, region)) {
@@ -12062,6 +12294,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<Volume> describeVolumes(String region, List<String> volumeIds,
                                         Map<String, List<String>> filters) {
+        return describeVolumes(region, volumeIds, filterList(filters));
+    }
+
+    List<Volume> describeVolumes(String region, List<String> volumeIds,
+                                 List<Map.Entry<String, List<String>>> filters) {
         if (volumeIds != null && !volumeIds.isEmpty()) {
             for (String id : volumeIds) {
                 if (volumes.get(key(region, id)).orElse(null) == null) {
@@ -12305,6 +12542,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<VolumeModification> describeVolumesModifications(String region, List<String> volumeIds,
                                                                  Map<String, List<String>> filters) {
+        return describeVolumesModifications(region, volumeIds, filterList(filters));
+    }
+
+    List<VolumeModification> describeVolumesModifications(String region, List<String> volumeIds,
+                                                          List<Map.Entry<String, List<String>>> filters) {
         if (volumeIds != null && !volumeIds.isEmpty()) {
             for (String id : volumeIds) {
                 if (volumeModifications.get(key(region, id)).isEmpty()) {
@@ -12445,25 +12687,40 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public NetworkInterfaceListResult describeNetworkInterfaces(String region, List<String> networkInterfaceIds,
                                                                  Map<String, List<String>> filters) {
-        return describeNetworkInterfaces(callerAccountId(), region, networkInterfaceIds, filters, 0, null);
+        return describeNetworkInterfaces(callerAccountId(), region, networkInterfaceIds, filterList(filters), 0, null);
     }
 
     public NetworkInterfaceListResult describeNetworkInterfaces(String region, List<String> networkInterfaceIds,
                                                                    Map<String, List<String>> filters,
                                                                    int maxResults, String nextToken) {
+        return describeNetworkInterfaces(callerAccountId(), region, networkInterfaceIds, filterList(filters),
+                maxResults, nextToken);
+    }
+
+    NetworkInterfaceListResult describeNetworkInterfaces(String region, List<String> networkInterfaceIds,
+                                                         List<Map.Entry<String, List<String>>> filters,
+                                                         int maxResults, String nextToken) {
         return describeNetworkInterfaces(callerAccountId(), region, networkInterfaceIds, filters, maxResults, nextToken);
     }
 
     public NetworkInterfaceListResult describeNetworkInterfaces(String accountId, String region,
                                                                  List<String> networkInterfaceIds,
                                                                  Map<String, List<String>> filters) {
-        return describeNetworkInterfaces(accountId, region, networkInterfaceIds, filters, 0, null);
+        return describeNetworkInterfaces(accountId, region, networkInterfaceIds, filterList(filters), 0, null);
     }
 
     public NetworkInterfaceListResult describeNetworkInterfaces(String accountId, String region,
                                                                    List<String> networkInterfaceIds,
                                                                    Map<String, List<String>> filters,
                                                                    int maxResults, String nextToken) {
+        return describeNetworkInterfaces(accountId, region, networkInterfaceIds, filterList(filters),
+                maxResults, nextToken);
+    }
+
+    NetworkInterfaceListResult describeNetworkInterfaces(String accountId, String region,
+                                                         List<String> networkInterfaceIds,
+                                                         List<Map.Entry<String, List<String>>> filters,
+                                                         int maxResults, String nextToken) {
         // Validate pagination parameters
         if (maxResults > 0 && !networkInterfaceIds.isEmpty()) {
             throw new AwsException("InvalidParameterCombination",
@@ -13163,6 +13420,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public List<SpotInstanceRequest> describeSpotInstanceRequests(String region, List<String> spotRequestIds, Map<String, List<String>> filters) {
+        return describeSpotInstanceRequests(region, spotRequestIds, filterList(filters));
+    }
+
+    List<SpotInstanceRequest> describeSpotInstanceRequests(String region, List<String> spotRequestIds,
+                                                           List<Map.Entry<String, List<String>>> filters) {
         ensureDefaultResources(region);
 
         if (!spotRequestIds.isEmpty()) {
@@ -13209,8 +13471,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                          Instant startTime,
                                          Instant endTime,
                                          Map<String, List<String>> filters) {
+        validateSpotPriceHistory(productDescriptions, availabilityZone, availabilityZoneId, startTime, endTime,
+                filterList(filters));
+    }
+
+    void validateSpotPriceHistory(List<String> productDescriptions,
+                                  String availabilityZone,
+                                  String availabilityZoneId,
+                                  Instant startTime,
+                                  Instant endTime,
+                                  List<Map.Entry<String, List<String>>> filters) {
         if (filters != null && !filters.isEmpty()) {
-            requireSupportedFilters(filters.keySet(), SPOT_PRICE_HISTORY_FILTERS);
+            requireSupportedFilters(filterNames(filters), SPOT_PRICE_HISTORY_FILTERS);
         }
         if (productDescriptions != null) {
             for (String desc : productDescriptions) {
@@ -13245,6 +13517,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                           Map<String, List<String>> filters,
                                                           int maxResults,
                                                           String nextToken) {
+        return describeSpotPriceHistory(region, instanceTypes, productDescriptions, availabilityZone,
+                availabilityZoneId, startTime, endTime, filterList(filters), maxResults, nextToken);
+    }
+
+    SpotPriceHistoryResult describeSpotPriceHistory(String region,
+                                                   List<String> instanceTypes,
+                                                   List<String> productDescriptions,
+                                                   String availabilityZone,
+                                                   String availabilityZoneId,
+                                                   Instant startTime,
+                                                   Instant endTime,
+                                                   List<Map.Entry<String, List<String>>> filters,
+                                                   int maxResults,
+                                                   String nextToken) {
         ensureDefaultResources(region);
         validateSpotPriceHistory(productDescriptions, availabilityZone, availabilityZoneId, startTime, endTime, filters);
 
@@ -13272,14 +13558,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .filter(z -> availabilityZoneId.equals(z.get("zoneId")))
                     .toList();
         }
-        if (filters != null && filters.containsKey("availability-zone")) {
-            List<String> azFilter = filters.get("availability-zone");
+        for (List<String> azFilter : filterValues(filters, "availability-zone")) {
             zones = zones.stream()
                     .filter(z -> matchesValue(z.get("zoneName"), azFilter))
                     .toList();
         }
-        if (filters != null && filters.containsKey("availability-zone-id")) {
-            List<String> azIdFilter = filters.get("availability-zone-id");
+        for (List<String> azIdFilter : filterValues(filters, "availability-zone-id")) {
             zones = zones.stream()
                     .filter(z -> matchesValue(z.get("zoneId"), azIdFilter))
                     .toList();
@@ -13298,8 +13582,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .filter(t -> t.supportedUsageClasses.contains("spot"))
                     .toList();
         }
-        if (filters != null && filters.containsKey("instance-type")) {
-            List<String> itFilter = filters.get("instance-type");
+        for (List<String> itFilter : filterValues(filters, "instance-type")) {
             catalogTypes = catalogTypes.stream()
                     .filter(t -> matchesValue(t.instanceType, itFilter))
                     .toList();
@@ -13312,18 +13595,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .filter(requested::contains)
                     .toList();
         }
-        if (filters != null && filters.containsKey("product-description")) {
-            List<String> pdFilter = filters.get("product-description");
+        for (List<String> pdFilter : filterValues(filters, "product-description")) {
             targetProductDescs = targetProductDescs.stream()
                     .filter(pd -> matchesValue(pd, pdFilter))
                     .toList();
         }
 
-        List<String> priceFilter = filters != null ? filters.get("spot-price") : null;
-        List<String> timestampFilter = filters != null ? filters.get("timestamp") : null;
+        List<List<String>> priceFilters = filterValues(filters, "spot-price");
         String formattedTimestamp = ISO_FMT.format(effectiveTimestamp);
 
-        if (timestampFilter != null && !matchesValue(formattedTimestamp, timestampFilter)) {
+        if (!everyFilterMatches(filterValues(filters, "timestamp"), formattedTimestamp)) {
             return new SpotPriceHistoryResult(List.of(), null);
         }
 
@@ -13337,7 +13618,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 double priceVal = ((type.vcpu * 0.0016) + ((type.memoryMib / 1024.0) * 0.0012)) * multiplier;
                 String formattedPrice = String.format(Locale.ROOT, "%.6f", priceVal);
 
-                if (priceFilter != null && !matchesValue(formattedPrice, priceFilter)) {
+                if (!everyFilterMatches(priceFilters, formattedPrice)) {
                     continue;
                 }
 
