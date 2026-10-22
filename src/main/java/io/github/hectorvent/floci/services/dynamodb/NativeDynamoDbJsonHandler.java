@@ -33,7 +33,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
-import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -48,6 +47,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
+import static io.github.hectorvent.floci.services.dynamodb.DynamoDbTimestamps.epochSeconds;
+
 /**
  * DynamoDB JSON protocol handler of the native engine, reached through the native backend
  * behind the DynamoDB operation seam rather than directly from the controllers.
@@ -60,6 +61,9 @@ public class NativeDynamoDbJsonHandler {
     // The order AWS prints the enum constraint in.
     private static final List<String> BACKUP_TYPE_FILTERS = List.of("ALL", "AWS_BACKUP", "USER", "SYSTEM");
     private static final int MAX_LIST_BACKUPS_LIMIT = 100;
+    private static final int MIN_BACKUP_ARN_LENGTH = 37;
+    private static final int MAX_BACKUP_ARN_LENGTH = 1024;
+    private static final Instant MAX_TIME_RANGE_BOUND = Instant.ofEpochMilli(99_999_999_999_999L);
     private static final int MAX_RECOVERY_PERIOD_DAYS = 35;
 
     private final DynamoDbService dynamoDbService;
@@ -1961,6 +1965,15 @@ public class NativeDynamoDbJsonHandler {
             violations.add("Value '" + limit + "' at 'limit' failed to satisfy constraint: "
                     + "Member must have value less than or equal to " + MAX_LIST_BACKUPS_LIMIT);
         }
+        String exclusiveStartBackupArn = textOrNull(request, "ExclusiveStartBackupArn");
+        if (exclusiveStartBackupArn != null && exclusiveStartBackupArn.length() < MIN_BACKUP_ARN_LENGTH) {
+            violations.add("Value '" + exclusiveStartBackupArn + "' at 'exclusiveStartBackupArn' failed to satisfy "
+                    + "constraint: Member must have length greater than or equal to " + MIN_BACKUP_ARN_LENGTH);
+        }
+        if (exclusiveStartBackupArn != null && MAX_BACKUP_ARN_LENGTH < exclusiveStartBackupArn.length()) {
+            violations.add("Value '" + exclusiveStartBackupArn + "' at 'exclusiveStartBackupArn' failed to satisfy "
+                    + "constraint: Member must have length less than or equal to " + MAX_BACKUP_ARN_LENGTH);
+        }
         String backupType = request.hasNonNull("BackupType") ? request.get("BackupType").asText() : "USER";
         if (!BACKUP_TYPE_FILTERS.contains(backupType)) {
             violations.add("Value '" + backupType + "' at 'backupType' failed to satisfy constraint: "
@@ -1973,9 +1986,11 @@ public class NativeDynamoDbJsonHandler {
             throw new AwsException("ValidationException", "One or more parameter values were invalid: "
                     + "Time range lower bound must be less than or equal to upper bound", 400);
         }
+        checkTimeRangeBound("TimeRangeLowerBound", lowerBound);
+        checkTimeRangeBound("TimeRangeUpperBound", upperBound);
 
         DynamoDbService.ListBackupsResult result = dynamoDbService.listBackups(tableName, limit, lowerBound,
-                upperBound, textOrNull(request, "ExclusiveStartBackupArn"), backupType, region);
+                upperBound, exclusiveStartBackupArn, backupType, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode summaries = response.putArray("BackupSummaries");
@@ -2211,13 +2226,21 @@ public class NativeDynamoDbJsonHandler {
         return node.hasNonNull(member) ? node.get(member).asText() : null;
     }
 
-    private static Instant timestampOrNull(JsonNode request, String member) {
-        JsonNode node = request.path(member);
-        return node.isNumber() ? Instant.ofEpochMilli(node.decimalValue().movePointRight(3).longValue()) : null;
+    private static void checkTimeRangeBound(String member, Instant bound) {
+        if (bound != null && bound.isBefore(Instant.EPOCH)) {
+            throw new AwsException("ValidationException",
+                    "Invalid Request: The supplied " + member + " must not be before " + Instant.EPOCH, 400);
+        }
+        if (bound != null && MAX_TIME_RANGE_BOUND.isBefore(bound)) {
+            throw new AwsException("ValidationException",
+                    "Invalid Request: The supplied " + member + " must not be after " + MAX_TIME_RANGE_BOUND, 400);
+        }
     }
 
-    private static BigDecimal epochSeconds(Instant instant) {
-        return BigDecimal.valueOf(instant.toEpochMilli(), 3);
+    private static Instant timestampOrNull(JsonNode request, String member) {
+        JsonNode node = request.path(member);
+        // AWS rounds the seconds as a double, so a value beyond the long range of milliseconds saturates.
+        return node.isNumber() ? Instant.ofEpochMilli(Math.round(node.doubleValue() * 1000)) : null;
     }
 
     private ObjectNode backupDetailsNode(TableBackup backup, String status) {
@@ -3384,7 +3407,7 @@ public class NativeDynamoDbJsonHandler {
                 ? e.getValue().asText() : e.getValue()));
 
         io.github.hectorvent.floci.services.dynamodb.model.ExportDescription desc =
-                dynamoDbService.exportTable(params, region);
+                dynamoDbService.exportTable(params, timestampOrNull(request, "ExportTime"), region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.set("ExportDescription", objectMapper.valueToTree(desc));

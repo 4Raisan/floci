@@ -270,6 +270,33 @@ class DynamoDbBackupIntegrationTest {
     }
 
     @Test
+    void listBackupsChecksTheTimeRangeLimits() {
+        String before = "Invalid Request: The supplied %s must not be before 1970-01-01T00:00:00Z";
+        String after = "Invalid Request: The supplied %s must not be after 5138-11-16T09:46:39.999Z";
+
+        listBackupsBetween("-0.0005", "99999999999.9994").statusCode(200);
+        listBackupsBetween("-0.001", null)
+                .statusCode(400)
+                .body("message", equalTo(before.formatted("TimeRangeLowerBound")));
+        listBackupsBetween(null, "100000000000")
+                .statusCode(400)
+                .body("message", equalTo(after.formatted("TimeRangeUpperBound")));
+        listBackupsBetween("-1e20", "1e20")
+                .statusCode(400)
+                .body("message", equalTo(before.formatted("TimeRangeLowerBound")));
+        listBackupsBetween("0", "1e400")
+                .statusCode(400)
+                .body("message", equalTo(after.formatted("TimeRangeUpperBound")));
+        listBackupsBetween("1e21", "1e20")
+                .statusCode(400)
+                .body("message", equalTo(after.formatted("TimeRangeLowerBound")));
+        listBackupsBetween("100000000000", "-0.001")
+                .statusCode(400)
+                .body("message", equalTo("One or more parameter values were invalid: "
+                        + "Time range lower bound must be less than or equal to upper bound"));
+    }
+
+    @Test
     void listBackupsReportsEveryViolation() {
         ddb("ListBackups", "{\"Limit\": 0, \"BackupType\": \"BAD\"}")
                 .statusCode(400)
@@ -284,6 +311,22 @@ class DynamoDbBackupIntegrationTest {
         ddb("ListBackups", "{\"ExclusiveStartBackupArn\": \"" + "x".repeat(40) + "\"}")
                 .statusCode(400)
                 .body("message", equalTo("Invalid Backup ARN"));
+        String shortArn = "x".repeat(36);
+        ddb("ListBackups", """
+                {"Limit": 0, "ExclusiveStartBackupArn": "%s", "BackupType": "BAD"}
+                """.formatted(shortArn))
+                .statusCode(400)
+                .body("message", equalTo("3 validation errors detected: Value '0' at 'limit' failed to satisfy "
+                        + "constraint: Member must have value greater than or equal to 1; Value '" + shortArn
+                        + "' at 'exclusiveStartBackupArn' failed to satisfy constraint: Member must have length "
+                        + "greater than or equal to 37; Value 'BAD' at 'backupType' failed to satisfy constraint: "
+                        + "Member must satisfy enum value set: [ALL, AWS_BACKUP, USER, SYSTEM]"));
+        String longArn = "x".repeat(1025);
+        ddb("ListBackups", "{\"ExclusiveStartBackupArn\": \"" + longArn + "\"}")
+                .statusCode(400)
+                .body("message", equalTo("1 validation error detected: Value '" + longArn + "' at "
+                        + "'exclusiveStartBackupArn' failed to satisfy constraint: Member must have length "
+                        + "less than or equal to 1024"));
     }
 
     @Test
@@ -754,5 +797,11 @@ class DynamoDbBackupIntegrationTest {
         return ddb("RestoreTableFromBackup", """
                 {"BackupArn": "%s", "TargetTableName": "%s", %s}
                 """.formatted(backupArn, target, overrides));
+    }
+
+    private static ValidatableResponse listBackupsBetween(String lowerBound, String upperBound) {
+        return ddb("ListBackups", """
+                {"TimeRangeLowerBound": %s, "TimeRangeUpperBound": %s}
+                """.formatted(lowerBound, upperBound));
     }
 }
