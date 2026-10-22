@@ -17,6 +17,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -28,15 +29,16 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
 /**
  * One client connection to a DSQL endpoint, as Aurora DSQL serves it (measured on AWS, eu-west-1,
- * 2026-10-16): TLS is mandatory, the password is an IAM token for the endpoint, the startup is read
- * as DSQL reads it, DSQL's own statements become the {@code sys} calls that implement them, their
- * errors come back without the source locations and {@code sys} lines DSQL never shows, and a
- * connection lives an hour.
+ * 2026-10-16 to 2026-10-21): TLS is mandatory, the password is an IAM token for the endpoint, the
+ * startup is read as DSQL reads it, DSQL's own statements become the {@code sys} calls that
+ * implement them, their errors come back in DSQL's words, a transaction lives 300 seconds and a
+ * connection an hour.
  */
 final class DsqlSession {
 
@@ -44,6 +46,8 @@ final class DsqlSession {
     // A startup packet is refused above PostgreSQL's own limit, 10,000 bytes, and a message above 64 MB.
     private static final int MAX_STARTUP = 10_000;
     private static final int MAX_MESSAGE = 64 * 1024 * 1024;
+    private static final String SERIALIZATION_FAILURE = "40001";
+    private static final String QUERY_CANCELED = "57014";
     private static final String ACCESS_DENIED = "unable to accept connection, access denied";
 
     private final Socket socket;
@@ -61,10 +65,37 @@ final class DsqlSession {
     private volatile String principalArn;
     private volatile int backendPid;
     private volatile long cancelKey;
+    // What the age limit needs: where each side is written, whether a statement is still running
+    // (a Query or Sync whose ReadyForQuery has not come back), and the open transaction's start.
+    private final Object clientWrites = new Object();
+    private final Object databaseWrites = new Object();
+    private final AtomicInteger awaitingReady = new AtomicInteger();
+    private volatile OutputStream clientOut;
+    private volatile OutputStream databaseOut;
+    private volatile Socket clientSocket;
+    private volatile Socket databaseSocket;
+    private volatile Instant lastClientMessage;
+    private volatile Instant transactionStart;
+    // The session's one age check pending, by the endpoint's clock: replaced by the next, and
+    // cancelled when the transaction or the connection ends.
+    private DsqlEndpoint.ScheduledCheck ageCheck;
+    // When the database last answered a batch: a statement it runs next starts no earlier.
+    private volatile Instant lastReady;
+    // The startup's BackendKeyData, to cancel the session's statement with; and whether the
+    // statement being cancelled was cancelled for its transaction's age.
+    private volatile byte[] cancelKeyData;
+    private volatile boolean cancelledForAge;
+    private volatile char transactionStatus = 'I';
 
     DsqlSession(Socket socket, DsqlEndpoint endpoint) {
         this.socket = socket;
         this.endpoint = endpoint;
+        this.lastClientMessage = now();
+        this.lastReady = now();
+    }
+
+    private Instant now() {
+        return endpoint.clock().instant();
     }
 
     void serve() throws IOException {
@@ -163,6 +194,10 @@ final class DsqlSession {
             principalArn = admission.principalArn();
             backendOut.write(PostgresWire.startupMessage(backendStartup));
             backendOut.flush();
+            clientOut = out;
+            databaseOut = backendOut;
+            clientSocket = tls;
+            databaseSocket = backend;
 
             Thread toClient = Thread.ofVirtual().name("dsql-backend-" + sessionId)
                     .start(() -> relayToClient(backendIn, out, admission.route(), tls));
@@ -178,6 +213,7 @@ final class DsqlSession {
             try {
                 relayToBackend(in, backendOut);
             } finally {
+                cancelAgeCheck();
                 lifetime.interrupt();
                 closeQuietly(backend);
                 toClient.interrupt();
@@ -193,65 +229,246 @@ final class DsqlSession {
     private void relayToBackend(InputStream in, OutputStream backendOut) throws IOException {
         while (true) {
             PostgresWire.Message message = PostgresWire.read(in, MAX_MESSAGE, "message");
-            switch (message.type()) {
-                case 'Q' -> {
-                    String query = PostgresWire.cString(message.body(), 0).value();
-                    PostgresWire.write(backendOut, 'Q', PostgresWire.cStringBytes(rewriteSimpleQuery(query)));
-                }
-                case 'P' -> {
-                    PostgresWire.CString name = PostgresWire.cString(message.body(), 0);
-                    PostgresWire.CString query = PostgresWire.cString(message.body(), name.next());
-                    DsqlStatements.Query rewritten = DsqlStatements.rewriteQuery(query.value());
-                    String tag = rewritten.overridesTags() && rewritten.commandTags().size() == 1
-                            ? rewritten.commandTags().get(0) : null;
-                    synchronized (batches) {
-                        extendedBatch().parses.addLast(new Named(name.value(), tag));
-                    }
-                    PostgresWire.write(backendOut, 'P', PostgresWire.cStringBytes(name.value()),
-                            PostgresWire.cStringBytes(rewritten.sql()),
-                            Arrays.copyOfRange(message.body(), query.next(), message.body().length));
-                }
-                case 'B' -> {
-                    PostgresWire.CString portal = PostgresWire.cString(message.body(), 0);
-                    PostgresWire.CString statement = PostgresWire.cString(message.body(), portal.next());
-                    synchronized (batches) {
-                        extendedBatch().binds.addLast(new Named(portal.value(), statement.value()));
-                    }
-                    PostgresWire.write(backendOut, message);
-                }
-                case 'E' -> {
-                    String portal = PostgresWire.cString(message.body(), 0).value();
-                    synchronized (batches) {
-                        extendedBatch().results.addLast(new Named(portal, null));
-                    }
-                    PostgresWire.write(backendOut, message);
-                }
-                case 'C' -> {
-                    String kind = message.body()[0] == 'S' ? "S" : "P";
-                    synchronized (batches) {
-                        extendedBatch().closes.addLast(new Named(PostgresWire.cString(message.body(), 1).value(), kind));
-                    }
-                    PostgresWire.write(backendOut, message);
-                }
-                case 'S', 'F' -> {
-                    // A Sync, or a FunctionCall, is answered by a ReadyForQuery of its own.
-                    synchronized (batches) {
-                        extendedBatch();
-                        openBatch = null;
-                    }
-                    PostgresWire.write(backendOut, message);
-                }
-                case 'X' -> {
-                    PostgresWire.write(backendOut, message);
-                    backendOut.flush();
+            if (message.type() != 'X') {
+                lastClientMessage = now();
+                if (transactionStatus == 'T' && pastAgeLimit()) {
+                    // DSQL ends a transaction past its age at the client's next message, a ROLLBACK
+                    // included, and the connection with it (measured).
+                    terminate();
                     return;
                 }
-                default -> PostgresWire.write(backendOut, message);
+                if (message.type() == 'Q' || message.type() == 'S' || message.type() == 'F') {
+                    awaitingReady.incrementAndGet();
+                }
             }
-            if (in.available() == 0) {
-                backendOut.flush();
+            synchronized (databaseWrites) {
+                if (relayOne(message, backendOut)) {
+                    return;
+                }
+                if (in.available() == 0) {
+                    backendOut.flush();
+                }
             }
         }
+    }
+
+    /** Hands one client message to the database, DSQL's syntax rewritten; true once the client said goodbye. */
+    private boolean relayOne(PostgresWire.Message message, OutputStream backendOut) throws IOException {
+        switch (message.type()) {
+            case 'Q' -> {
+                String query = PostgresWire.cString(message.body(), 0).value();
+                PostgresWire.write(backendOut, 'Q', PostgresWire.cStringBytes(rewriteSimpleQuery(query)));
+            }
+            case 'P' -> {
+                PostgresWire.CString name = PostgresWire.cString(message.body(), 0);
+                PostgresWire.CString query = PostgresWire.cString(message.body(), name.next());
+                DsqlStatements.Query rewritten = DsqlStatements.rewriteQuery(query.value());
+                String tag = rewritten.overridesTags() && rewritten.commandTags().size() == 1
+                        ? rewritten.commandTags().get(0) : null;
+                synchronized (batches) {
+                    extendedBatch().parses.addLast(new Named(name.value(), tag));
+                }
+                PostgresWire.write(backendOut, 'P', PostgresWire.cStringBytes(name.value()),
+                        PostgresWire.cStringBytes(rewritten.sql()),
+                        Arrays.copyOfRange(message.body(), query.next(), message.body().length));
+            }
+            case 'B' -> {
+                PostgresWire.CString portal = PostgresWire.cString(message.body(), 0);
+                PostgresWire.CString statement = PostgresWire.cString(message.body(), portal.next());
+                synchronized (batches) {
+                    extendedBatch().binds.addLast(new Named(portal.value(), statement.value()));
+                }
+                PostgresWire.write(backendOut, message);
+            }
+            case 'E' -> {
+                String portal = PostgresWire.cString(message.body(), 0).value();
+                synchronized (batches) {
+                    extendedBatch().results.addLast(new Named(portal, null));
+                }
+                PostgresWire.write(backendOut, message);
+            }
+            case 'C' -> {
+                String kind = message.body()[0] == 'S' ? "S" : "P";
+                synchronized (batches) {
+                    extendedBatch().closes.addLast(new Named(PostgresWire.cString(message.body(), 1).value(), kind));
+                }
+                PostgresWire.write(backendOut, message);
+            }
+            case 'S', 'F' -> {
+                // A Sync, or a FunctionCall, is answered by a ReadyForQuery of its own.
+                synchronized (batches) {
+                    endBatch();
+                }
+                PostgresWire.write(backendOut, message);
+            }
+            case 'X' -> {
+                PostgresWire.write(backendOut, message);
+                backendOut.flush();
+                return true;
+            }
+            default -> PostgresWire.write(backendOut, message);
+        }
+        return false;
+    }
+
+    /** When {@code batch} could first run: once sent, and once the database had answered the batch before it. */
+    private Instant couldRun(Batch batch) {
+        Instant answeredBefore = lastReady;
+        return batch.sent.isAfter(answeredBefore) ? batch.sent : answeredBefore;
+    }
+
+    /** When the transaction the database is running started: the open one, or the batch's own. */
+    private Instant runningTransactionStart() {
+        Instant start = transactionStatus == 'T' ? transactionStart : null;
+        if (start == null) {
+            synchronized (batches) {
+                Batch answering = batches.peekFirst();
+                start = answering == null ? null : couldRun(answering);
+            }
+        }
+        return start;
+    }
+
+    private Duration ageOfRunning() {
+        Instant start = runningTransactionStart();
+        return start == null ? Duration.ZERO : Duration.between(start, now());
+    }
+
+    /** DSQL's age error for a transaction {@code age} old. */
+    private byte[] ageError(Duration age) {
+        long limit = endpoint.transactionAgeLimit().toSeconds();
+        return error("ERROR", "54000", "transaction age limit of " + limit + "s exceeded",
+                "Current transaction age " + age.toSeconds() + "s exceeds " + limit + "s", null);
+    }
+
+    private boolean pastAgeLimit() {
+        Instant start = transactionStart;
+        return start != null && Duration.between(start, now()).compareTo(endpoint.transactionAgeLimit()) > 0;
+    }
+
+    private Duration transactionAge() {
+        Instant start = transactionStart;
+        return start == null ? Duration.ZERO : Duration.between(start, now());
+    }
+
+    /**
+     * Follows the transaction the database reports. One that opens started when its batch could
+     * first run: once sent, and once the database had answered the batch before it, so a BEGIN
+     * queued behind a long statement does not count that wait. At its age limit a statement still
+     * running is stopped with the age error, which fails the transaction; idle past the limit and
+     * its grace the transaction is ended as DSQL ends it (measured: 315 s after BEGIN, whatever it
+     * last ran). One that fails stays until it idles as long, as DSQL's idle-in-transaction
+     * timeout lets it.
+     */
+    private void transactionStatus(char status, Instant batchCouldRun) {
+        transactionStatus = status;
+        if (status == 'I') {
+            transactionStart = null;
+            cancelAgeCheck();
+        } else if (status == 'T' && transactionStart == null) {
+            Instant start = batchCouldRun;
+            transactionStart = start;
+            schedule(start.plus(endpoint.transactionAgeLimit()), () -> {
+                if (start.equals(transactionStart) && transactionStatus == 'T') {
+                    cancelForAge();
+                    schedule(start.plus(endpoint.transactionAgeLimit()).plus(endpoint.transactionIdleGrace()), () -> {
+                        if (start.equals(transactionStart) && transactionStatus == 'T' && awaitingReady.get() == 0) {
+                            terminate();
+                        }
+                    });
+                }
+            });
+        } else if (status == 'E') {
+            closeWhenIdle(now());
+        }
+    }
+
+    /**
+     * Outside a transaction block, the batch the database runs next is a transaction of its own,
+     * under the same limit (measured): one still running at the limit is stopped with the age error.
+     */
+    private void watchImplicitTransaction(Batch running, Instant couldRun) {
+        schedule(couldRun.plus(endpoint.transactionAgeLimit()), () -> {
+            boolean stillRunning;
+            synchronized (batches) {
+                stillRunning = batches.peekFirst() == running;
+            }
+            if (stillRunning && transactionStatus == 'I') {
+                cancelForAge();
+            }
+        });
+    }
+
+    /**
+     * Stops the statement running at the transaction's age limit, with the cancel request a client
+     * would send; its {@code 57014} reaches the client as DSQL's age error. DSQL lets the statement
+     * finish and fails it then (measured); stopping it at the limit ends the same way, the error
+     * and nothing kept, the rest of its query, a COMMIT included, never run.
+     */
+    private void cancelForAge() {
+        byte[] keyData = cancelKeyData;
+        if (awaitingReady.get() > 0 && keyData != null) {
+            cancelledForAge = true;
+            endpoint.forwardCancel(keyData);
+        }
+    }
+
+    /**
+     * Closes a failed transaction's connection once the client has sent nothing for its idle time
+     * since {@code since}; a message in between moves the wait to start from it.
+     */
+    private void closeWhenIdle(Instant since) {
+        schedule(since.plus(endpoint.transactionAgeLimit()).plus(endpoint.transactionIdleGrace()), () -> {
+            Instant last = lastClientMessage;
+            if (transactionStatus != 'E' || awaitingReady.get() > 0) {
+                return;
+            }
+            if (last.isAfter(since)) {
+                closeWhenIdle(last);
+                return;
+            }
+            close("FATAL", "25P03", "terminating connection due to idle-in-transaction timeout", null);
+        });
+    }
+
+    /** Puts {@code check}, due at {@code when}, in place of the age check pending. */
+    private synchronized void schedule(Instant when, Runnable check) {
+        if (ageCheck != null) {
+            ageCheck.cancel();
+        }
+        ageCheck = endpoint.schedule(when, check);
+    }
+
+    private synchronized void cancelAgeCheck() {
+        if (ageCheck != null) {
+            ageCheck.cancel();
+            ageCheck = null;
+        }
+    }
+
+    /** DSQL's end of a transaction past its age: the age error, then the connection's (measured). */
+    private void terminate() {
+        try {
+            synchronized (clientWrites) {
+                PostgresWire.write(clientOut, 'E', ageError(transactionAge()));
+            }
+        } catch (IOException ignored) {
+            // The client left first; the connection is closed below either way.
+        }
+        close("FATAL", "08P01", "terminating connection because protocol synchronization was lost", null);
+    }
+
+    private void close(String severity, String state, String message, String detail) {
+        try {
+            synchronized (clientWrites) {
+                PostgresWire.write(clientOut, 'E', error(severity, state, message, detail, null));
+                clientOut.flush();
+            }
+        } catch (IOException ignored) {
+            // The client left first; both sides are closed below either way.
+        }
+        closeQuietly(clientSocket);
+        closeQuietly(databaseSocket);
     }
 
     /**
@@ -261,18 +478,30 @@ final class DsqlSession {
     private String rewriteSimpleQuery(String query) {
         DsqlStatements.Query rewritten = DsqlStatements.rewriteQuery(query);
         synchronized (batches) {
-            Batch batch = extendedBatch();
+            Batch batch = endBatch();
             rewritten.commandTags().forEach(tag -> batch.results.addLast(new Named(null, tag)));
-            openBatch = null;
         }
         return rewritten.sql();
+    }
+
+    /**
+     * The batch a Query, Sync or FunctionCall ends, the extended-protocol messages since the last
+     * Sync included, which its ReadyForQuery answers. Called holding {@code batches}.
+     */
+    private Batch endBatch() {
+        Batch batch = extendedBatch();
+        openBatch = null;
+        return batch;
     }
 
     /** The batch the extended-protocol messages since the last Sync belong to. Called holding {@code batches}. */
     private Batch extendedBatch() {
         if (openBatch == null) {
-            openBatch = new Batch();
+            openBatch = new Batch(now());
             batches.addLast(openBatch);
+            if (batches.size() == 1 && transactionStatus == 'I') {
+                watchImplicitTransaction(openBatch, couldRun(openBatch));
+            }
         }
         return openBatch;
     }
@@ -284,10 +513,15 @@ final class DsqlSession {
      * query statement's tag.
      */
     private static final class Batch {
+        final Instant sent;
         final Deque<Named> parses = new ArrayDeque<>();
         final Deque<Named> binds = new ArrayDeque<>();
         final Deque<Named> closes = new ArrayDeque<>();
         final Deque<Named> results = new ArrayDeque<>();
+
+        Batch(Instant sent) {
+            this.sent = sent;
+        }
     }
 
     /** A statement or portal name, and what goes with it; a simple query's result has no name. */
@@ -369,6 +603,7 @@ final class DsqlSession {
                         case 'K' -> {
                             cancelKey = endpoint.registerCancelKey(message.body(), route.backend());
                             backendPid = PostgresWire.int32(message.body(), 0);
+                            cancelKeyData = message.body();
                             startup.add(message);
                             continue;
                         }
@@ -408,23 +643,51 @@ final class DsqlSession {
                             (closed.value().equals("S") ? statementTags : portalStatements).remove(closed.name());
                         }
                     }
-                    case 'E', 'N' -> message = new PostgresWire.Message(message.type(),
-                            inDsqlWords(message.type(), message.body()));
-                    case 'Z' -> {
-                        synchronized (batches) {
-                            batches.pollFirst();
+                    case 'E', 'N' -> {
+                        if (message.type() == 'E') {
+                            String state = PostgresWire.parseFields(message.body(), 0).get('C');
+                            if (cancelledForAge && QUERY_CANCELED.equals(state)) {
+                                cancelledForAge = false;
+                                message = new PostgresWire.Message(message.type(), ageError(ageOfRunning()));
+                                break;
+                            }
                         }
+                        message = new PostgresWire.Message(message.type(), inDsqlWords(message.type(), message.body()));
+                    }
+                    case 'Z' -> {
+                        awaitingReady.updateAndGet(n -> Math.max(0, n - 1));
+                        // A cancel that reached no statement leaves nothing for a later one to inherit.
+                        cancelledForAge = false;
+                        Batch answered;
+                        synchronized (batches) {
+                            answered = batches.pollFirst();
+                        }
+                        Instant couldRun = answered != null ? couldRun(answered) : lastReady;
+                        lastReady = now();
                         if (message.body()[0] == 'I') {
                             // Outside a transaction no portal outlives its Sync.
                             portalStatements.clear();
+                        }
+                        char status = (char) message.body()[0];
+                        if (started) {
+                            transactionStatus(status, couldRun);
+                            Batch next;
+                            synchronized (batches) {
+                                next = batches.peekFirst();
+                            }
+                            if (status == 'I' && next != null) {
+                                watchImplicitTransaction(next, couldRun(next));
+                            }
                         }
                     }
                     default -> {
                     }
                 }
-                PostgresWire.write(out, message);
-                if (backendIn.available() == 0) {
-                    out.flush();
+                synchronized (clientWrites) {
+                    PostgresWire.write(out, message);
+                    if (backendIn.available() == 0) {
+                        out.flush();
+                    }
                 }
             }
         } catch (IOException ignored) {
@@ -434,14 +697,23 @@ final class DsqlSession {
     }
 
     /**
-     * An error or notice as DSQL words it (measured on AWS). An error carries no source location,
-     * PostgreSQL's own included, while a notice keeps its location. The context keeps what the
-     * client's SQL ran and drops what Floci's {@code sys} functions ran, as DSQL's context never
-     * shows its own: the context lists the innermost call first, so everything up to the last
+     * An error or notice as DSQL words it (measured on AWS). An optimistic concurrency conflict is
+     * DSQL's OC000. An error carries no source location, PostgreSQL's own included, while a notice
+     * keeps its location. The context keeps what the client's SQL ran, such as the statement a
+     * foreign key's cascade ran, and drops what Floci's {@code sys} functions ran, as DSQL's context
+     * never shows its own: the context lists the innermost call first, so everything up to the last
      * line of a {@code sys} function, the statements it ran included, is theirs.
      */
     static byte[] inDsqlWords(byte type, byte[] body) {
         Map<Character, String> fields = PostgresWire.parseFields(body, 0);
+        if (type == 'E' && SERIALIZATION_FAILURE.equals(fields.get('C'))) {
+            Map<Character, String> conflict = new LinkedHashMap<>();
+            conflict.put('S', fields.getOrDefault('S', "ERROR"));
+            conflict.put('V', fields.getOrDefault('V', "ERROR"));
+            conflict.put('C', SERIALIZATION_FAILURE);
+            conflict.put('M', "change conflicts with another transaction (OC000)");
+            return PostgresWire.fields(conflict);
+        }
         boolean changed = false;
         String where = fields.get('W');
         if (where != null) {
