@@ -79,6 +79,12 @@ public final class CfnRollback {
      */
     public static final String EVENT_INVOKE_CONFIG_SNAPSHOT_ATTR = "__FlociEventInvokeConfigSnapshot";
 
+    /** The prior WAFv2 logging configuration for an in-place update that may need rollback. */
+    public static final String WAF_LOGGING_UPDATE_SNAPSHOT_ATTR = "__FlociWafLoggingUpdateSnapshot";
+
+    /** Marks an absent WAFv2 logging configuration that an in-place update recreated. */
+    public static final String WAF_LOGGING_UPDATE_ABSENT_ATTR = "__FlociWafLoggingUpdateAbsent";
+
     /**
      * Holds what a custom resource had before an update sent its handler an {@code Update}: the
      * physical id, the old and the attempted properties, the region and the {@code Data} attributes,

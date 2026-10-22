@@ -770,6 +770,9 @@
     "Name",
     "Scope"
   ],
+  "AWS::WAFv2::LoggingConfiguration": [
+    "ResourceArn"
+  ],
   "AWS::WAFv2::WebACL": [
     "Name",
     "Scope"
