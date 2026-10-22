@@ -416,7 +416,7 @@ public class BackupController {
     @GET
     @Path("/backup-jobs/{backupJobId}")
     public Response describeBackupJob(@PathParam("backupJobId") String jobId) {
-        return Response.ok(service.describeBackupJob(jobId)).build();
+        return Response.ok(jobJson(service.describeBackupJob(jobId))).build();
     }
 
     @POST
@@ -435,8 +435,14 @@ public class BackupController {
         List<BackupJob> jobs = service.listBackupJobs(byVaultName, byState, byResourceArn, byResourceType);
         ObjectNode out = objectMapper.createObjectNode();
         ArrayNode list = out.putArray("BackupJobs");
-        jobs.forEach(list::addPOJO);
+        jobs.forEach(job -> list.add(jobJson(job)));
         return Response.ok(out).build();
+    }
+
+    private ObjectNode jobJson(BackupJob job) {
+        ObjectNode node = objectMapper.valueToTree(job);
+        node.remove(BackupVault.VAULT_ID_FIELD);
+        return node;
     }
 
     // ── Recovery Point ─────────────────────────────────────────────────────────
