@@ -1983,6 +1983,9 @@ public class NativeDynamoDbJsonHandler {
                     + "Member must satisfy enum value set: " + BACKUP_TYPE_FILTERS);
         }
         throwValidationErrors(violations);
+        if (exclusiveStartBackupArn != null) {
+            DynamoDbBackupArns.parse(exclusiveStartBackupArn);
+        }
         Instant lowerBound = timestampOrNull(request, "TimeRangeLowerBound");
         Instant upperBound = timestampOrNull(request, "TimeRangeUpperBound");
         if (lowerBound != null && upperBound != null && upperBound.isBefore(lowerBound)) {
@@ -2012,7 +2015,7 @@ public class NativeDynamoDbJsonHandler {
      */
     private Response handleRestoreTableFromBackup(JsonNode request, String region) {
         String backupArn = textOrNull(request, "BackupArn");
-        DynamoDbBackupArns.parse(backupArn);
+        dynamoDbService.requireOwnBackupArn(backupArn);
         String targetTableName = requireTableNameParameter(request, "TargetTableName");
         throwValidationErrors(restoreViolations(request, targetTableName));
 

@@ -5130,10 +5130,17 @@ public class DynamoDbService {
         return backup;
     }
 
-    public TableBackup describeBackup(String backupArn, String region) {
-        DynamoDbBackupArns.BackupArn arn = DynamoDbBackupArns.parse(backupArn);
-        if (!arn.accountId().equals(regionResolver.getAccountId())) {
+    /** AWS checks the account of a backup ARN before the rest of it. */
+    DynamoDbBackupArns.BackupArn requireOwnBackupArn(String backupArn) {
+        if (!DynamoDbBackupArns.split(backupArn).accountId().equals(regionResolver.getAccountId())) {
             throw new AwsException("AccessDeniedException", "Access is denied", 400);
+        }
+        return DynamoDbBackupArns.parse(backupArn);
+    }
+
+    public TableBackup describeBackup(String backupArn, String region) {
+        if (!requireOwnBackupArn(backupArn).isValid()) {
+            throw invalidBackupArnValue();
         }
         return backupStore.get(backupArn)
                 .filter(backup -> backup.getRegion().equals(region))
@@ -5161,7 +5168,7 @@ public class DynamoDbService {
     public ListBackupsResult listBackups(String tableName, Integer limit, Instant lowerBound, Instant upperBound,
                                          String exclusiveStartBackupArn, String backupType, String region) {
         DynamoDbBackupArns.BackupArn start = exclusiveStartBackupArn != null
-                ? DynamoDbBackupArns.parse(exclusiveStartBackupArn) : null;
+                ? exclusiveStart(exclusiveStartBackupArn, tableName, region) : null;
         Set<String> types = "ALL".equals(backupType) ? Set.of("USER", "SYSTEM") : Set.of(backupType);
         List<TableBackup> matching = backupStore.scan(key -> true).stream()
                 .filter(backup -> backup.getRegion().equals(region))
@@ -5222,6 +5229,33 @@ public class DynamoDbService {
 
     private boolean isUnexpired(TableBackup backup) {
         return backup.getExpiryDateTime() == null || clock.instant().isBefore(backup.getExpiryDateTime());
+    }
+
+    private DynamoDbBackupArns.BackupArn exclusiveStart(String exclusiveStartBackupArn, String tableName,
+                                                        String region) {
+        DynamoDbBackupArns.BackupArn start = DynamoDbBackupArns.parse(exclusiveStartBackupArn);
+        if (!start.isValid()) {
+            throw invalidExclusiveStart("is not a valid backup arn");
+        }
+        if (!start.region().equals(region)) {
+            throw invalidExclusiveStart("does not match the region");
+        }
+        if (!start.accountId().equals(regionResolver.getAccountId())) {
+            throw invalidExclusiveStart("does not match the account");
+        }
+        if (tableName != null && !tableName.equals(start.tableName())) {
+            throw invalidExclusiveStart("does not match the table name predicate");
+        }
+        return start;
+    }
+
+    private static AwsException invalidExclusiveStart(String problem) {
+        return new AwsException("ValidationException",
+                "Invalid Request: The supplied ExclusiveStartBackupArn " + problem, 400);
+    }
+
+    private static AwsException invalidBackupArnValue() {
+        return new AwsException("ValidationException", "Invalid Request: BackupArn is not valid", 400);
     }
 
     private static boolean isAfter(TableBackup backup, DynamoDbBackupArns.BackupArn start) {
