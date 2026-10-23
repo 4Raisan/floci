@@ -31,7 +31,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -52,7 +54,12 @@ import java.util.stream.Stream;
  *
  * <p>A {@link Mode#SYNC} store writes a shard's file before the mutating call returns, like
  * {@link PersistentStorage}. A {@link Mode#PERIODIC} store marks the shard dirty and writes every
- * dirty shard on the flush interval, like {@link HybridStorage}.
+ * dirty shard on the flush interval, like {@link HybridStorage}. A {@link Mode#JOURNAL} store
+ * appends one record per changed entry to {@value #JOURNAL_FILE} in the directory, like
+ * {@link WalStorage}, but its compaction rewrites only the shards changed since the last one
+ * instead of a snapshot of the whole store. Load replays the journal over the shard files. A
+ * store in another mode that finds a journal left by a journal-mode run writes its changes into
+ * the shard files on load and removes it.
  *
  * <p>While the directory holds no data, a legacy single-file store (the {@code Map<String,
  * Map<String, E>>} file the other backends write, or a {@code wal} snapshot and log) is migrated:
@@ -66,6 +73,7 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
     private static final Logger LOG = Logger.getLogger(PartitionedFileStorage.class);
 
     static final String FILE_SUFFIX = ".json";
+    static final String JOURNAL_FILE = "journal.wal";
     static final String MIGRATING_SUFFIX = ".migrating";
     private static final String KEY_FIELD = "key";
     private static final String ENTRIES_FIELD = "entries";
@@ -76,7 +84,12 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
         /** Its shard file is rewritten before the mutating call returns. */
         SYNC,
         /** Dirty shard files are rewritten on the flush interval. */
-        PERIODIC
+        PERIODIC,
+        /**
+         * One record per changed entry is appended to a journal before the mutating call returns;
+         * dirty shard files are rewritten and the journal emptied on the compaction interval.
+         */
+        JOURNAL
     }
 
     /** One shard of one key: the unit that is written to a file. */
@@ -116,16 +129,32 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
     private final ObjectReader entriesReader;
     private final ObjectWriter entriesWriter;
     private final ScheduledExecutorService scheduler;
-    // Shard writes hold the read lock, and load and clear hold the write lock, so a write that
-    // read a shard before a clear cannot put its file back afterwards, and the flush schedule,
-    // which starts with the constructor, cannot write while load is filling the store.
-    private final ReentrantReadWriteLock fileLock = new ReentrantReadWriteLock();
+    private final EntryJournal<E> journal;
+    // Outside journal mode: the journal a crashed journal-mode run may have left, read once on load.
+    private final EntryJournal<E> leftoverJournal;
+    // Journal mode: changes hold the read lock while they update memory and append their record,
+    // and compaction holds the write lock while it writes dirty shards and truncates the journal,
+    // so the journal never drops a record whose change is not yet in a shard file. In every mode,
+    // shard writes hold the read lock and load and clear hold the write lock.
+    private final ReentrantReadWriteLock compactionLock = new ReentrantReadWriteLock();
+    // Journal mode: a change holds its key's lock while it updates memory and appends its record,
+    // so two changes to one key are journaled in the order they were applied. Replay follows the
+    // journal's order; changes to different keys commute, so they need no common order.
+    private final ConcurrentHashMap<String, ReentrantLock> changeLocks = new ConcurrentHashMap<>();
+    // Runs inside a journaled change after memory was updated and before its record is appended:
+    // the moment a second change to the same key could overtake it. Tests use it to stage that.
+    private volatile Runnable beforeJournalAppend = () -> { };
+    // Runs inside compaction between the last shard write and emptying the journal: the moment a
+    // change that slipped past the lock would be lost. Tests use it to stage that change.
+    private volatile Runnable beforeJournalTruncate = () -> { };
     // Runs inside a shard write after the shard was read and before its file is replaced: the
     // moment a clear() that slipped past the lock would be undone. Tests use it to stage that.
     private volatile Runnable beforeShardWrite = () -> { };
     // Runs on load after superseded files were rewritten under their current names and before
     // the old files are removed. Tests use it to make only the removal fail.
     private volatile Runnable beforeSupersededDelete = () -> { };
+    // Set once load() has replayed the journal; compaction waits for it.
+    private volatile boolean loaded;
 
     /**
      * @param directory       where the shard files live
@@ -133,7 +162,8 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
      * @param entryType       the type of one map entry's value
      * @param shardCount      how many files each key is split into, at least one
      * @param mode            when a change reaches disk
-     * @param flushIntervalMs the flush interval of a {@link Mode#PERIODIC} store
+     * @param flushIntervalMs the flush interval of a {@link Mode#PERIODIC} store, or the
+     *                        compaction interval of a {@link Mode#JOURNAL} store
      */
     public PartitionedFileStorage(Path directory, Path legacyFile, Class<E> entryType, int shardCount,
                                   Mode mode, long flushIntervalMs) {
@@ -159,6 +189,10 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
         JavaType entriesType = mapper.getTypeFactory().constructMapType(Map.class, String.class, entryType);
         this.entriesReader = mapper.readerFor(entriesType);
         this.entriesWriter = mapper.writerFor(entriesType);
+        EntryJournal<E> journalFile = new EntryJournal<>(directory.resolve(JOURNAL_FILE),
+                mapper.constructType(entryType), entriesType);
+        this.journal = mode == Mode.JOURNAL ? journalFile : null;
+        this.leftoverJournal = mode == Mode.JOURNAL ? null : journalFile;
         this.scheduler = mode == Mode.SYNC
                 ? null
                 : StorageFiles.scheduleEvery("partitioned-storage-flush", flushIntervalMs, this::flushQuietly);
@@ -168,8 +202,15 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
 
     @Override
     public void put(String key, Map<String, E> value) {
-        applyPut(key, value);
-        persistChange(allShardsOf(key));
+        boolean journaled;
+        ReentrantLock lock = beginChange(key);
+        try {
+            applyPut(key, value);
+            journaled = journal == null || journalAppend(() -> journal.put(key, value));
+        } finally {
+            endChange(lock);
+        }
+        persistChange(journaled, allShardsOf(key));
     }
 
     @Override
@@ -186,8 +227,15 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
 
     @Override
     public void delete(String key) {
-        applyDelete(key);
-        persistChange(allShardsOf(key));
+        boolean journaled;
+        ReentrantLock lock = beginChange(key);
+        try {
+            applyDelete(key);
+            journaled = journal == null || journalAppend(() -> journal.delete(key));
+        } finally {
+            endChange(lock);
+        }
+        persistChange(journaled, allShardsOf(key));
     }
 
     @Override
@@ -204,14 +252,14 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
     }
 
     /**
-     * Writes every dirty shard.
+     * Writes every dirty shard; in journal mode this is a compaction.
      *
      * @throws UncheckedIOException when a shard could not be written; it stays dirty and is
      *                              written again by the next flush
      */
     @Override
     public void flush() {
-        int failed = writeDirtyShards();
+        int failed = journal != null ? compact() : writeDirtyShards();
         if (failed > 0) {
             throw new UncheckedIOException(new IOException(
                     "Could not write " + failed + " shards of " + directory + "; see the errors logged above"));
@@ -220,26 +268,79 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
 
     @Override
     public synchronized void load() {
-        // The flush schedule starts with the constructor: hold it off while the store is filled.
-        fileLock.writeLock().lock();
+        // The flush schedule starts with the constructor: hold compaction off until the journal
+        // has been replayed, or it could empty a journal whose records are not yet in memory.
+        compactionLock.writeLock().lock();
         try {
-            store.clear();
-            dirty.clear();
-            migrateLegacyFileIfNeeded();
-            if (Files.isDirectory(directory)) {
-                loadDirectory();
-            }
+            loadLocked();
         } finally {
-            fileLock.writeLock().unlock();
+            compactionLock.writeLock().unlock();
+        }
+    }
+
+    private void loadLocked() {
+        loaded = false;
+        store.clear();
+        dirty.clear();
+        migrateLegacyFileIfNeeded();
+        if (Files.isDirectory(directory)) {
+            loadDirectory();
+        }
+        if (journal != null) {
+            replayJournal(journal);
+            journal.open();
+        } else if (!leftoverJournal.isEmpty()) {
+            foldLeftoverJournal();
+        }
+        loaded = true;
+    }
+
+    private void replayJournal(EntryJournal<E> source) {
+        int replayed;
+        try {
+            replayed = source.replay(this::applyReplayed);
+        } catch (IOException e) {
+            // Compaction would write the partial state and empty the journal, losing the
+            // records not yet read: refuse to start instead, as a failed migration does.
+            throw new UncheckedIOException("Failed to replay the journal of " + directory
+                    + "; it is untouched, fix the cause and restart", e);
+        }
+        if (replayed > 0) {
+            LOG.infov("Replayed {0} journal records into {1}", replayed, directory);
+        }
+    }
+
+    /**
+     * Folds the journal of a journal-mode run that ended without compacting into the shard files,
+     * then removes it. Ignored, its changes would be lost now and replayed as stale ones over newer
+     * shard files once the store is back in journal mode.
+     */
+    private void foldLeftoverJournal() {
+        Path file = directory.resolve(JOURNAL_FILE);
+        LOG.warnv("Found {0}, left by a wal-mode run; writing its changes into the shard files", file);
+        replayJournal(leftoverJournal);
+        writeDirtyShards();
+        if (!dirty.isEmpty()) {
+            throw new IllegalStateException("Could not write " + dirty.size() + " shards of " + directory
+                    + " from " + file + "; it is kept, fix the cause and restart");
+        }
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to remove " + file
+                    + "; its changes are in the shard files, remove it and restart", e);
         }
     }
 
     @Override
     public synchronized void clear() {
-        fileLock.writeLock().lock();
+        compactionLock.writeLock().lock();
         try {
             store.clear();
             dirty.clear();
+            if (journal != null) {
+                journal.deleteFile();
+            }
             if (Files.isDirectory(directory)) {
                 try (DirectoryStream<Path> files = Files.newDirectoryStream(directory, "*" + FILE_SUFFIX)) {
                     for (Path file : files) {
@@ -249,8 +350,11 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
                     LOG.errorv(e, "Failed to clear {0}", directory);
                 }
             }
+            if (journal != null) {
+                journal.open();
+            }
         } finally {
-            fileLock.writeLock().unlock();
+            compactionLock.writeLock().unlock();
         }
     }
 
@@ -258,43 +362,70 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
 
     @Override
     public void putEntry(String key, String entryKey, E entryValue) {
-        persistChange(List.of(applyPutEntry(key, entryKey, entryValue)));
+        ShardId id;
+        boolean journaled;
+        ReentrantLock lock = beginChange(key);
+        try {
+            id = applyPutEntry(key, entryKey, entryValue);
+            journaled = journal == null || journalAppend(() -> journal.putEntry(key, entryKey, entryValue));
+        } finally {
+            endChange(lock);
+        }
+        persistChange(journaled, List.of(id));
     }
 
     @Override
     public void removeEntry(String key, String entryKey) {
-        ShardId id = applyRemoveEntry(key, entryKey);
+        ShardId id;
+        boolean journaled;
+        ReentrantLock lock = beginChange(key);
+        try {
+            id = applyRemoveEntry(key, entryKey);
+            journaled = id == null || journal == null || journalAppend(() -> journal.removeEntry(key, entryKey));
+        } finally {
+            endChange(lock);
+        }
         if (id != null) {
-            persistChange(List.of(id));
+            persistChange(journaled, List.of(id));
         }
     }
 
     // ---
 
-    /** Stops the flush schedule and writes what is still dirty. */
+    /** Stops the flush schedule and writes what is still dirty; a journal is compacted and closed. */
     public void shutdown() {
         if (scheduler != null) {
             StorageFiles.stop(scheduler);
         }
-        flush();
+        try {
+            flush();
+        } finally {
+            if (journal != null) {
+                journal.close();
+            }
+        }
     }
 
     /**
-     * Writes the changed shards of a sync store before the call returns; a periodic store leaves
-     * them to the next flush.
+     * Makes a change that is already in memory durable where its mode promises it: a sync store
+     * writes the changed shards now, and a journal store whose record could not be appended
+     * compacts now instead, so the change still reaches a shard file before the call returns.
+     * (Writing only the changed shard would put it ahead of older records still in the journal,
+     * which a replay would then apply over it.) A periodic store leaves it to the next flush.
      *
-     * @throws UncheckedIOException when a shard could not be written; the change stays in memory
+     * @throws UncheckedIOException when the change could not be made durable; it stays in memory
      *                              and dirty, so a later flush writes it
      */
-    private void persistChange(List<ShardId> changed) {
-        if (mode != Mode.SYNC) {
-            return;
-        }
+    private void persistChange(boolean journaled, List<ShardId> changed) {
         int failed = 0;
-        for (ShardId id : changed) {
-            if (!writeShard(id)) {
-                failed++;
+        if (mode == Mode.SYNC) {
+            for (ShardId id : changed) {
+                if (!writeShard(id)) {
+                    failed++;
+                }
             }
+        } else if (!journaled) {
+            failed = compact();
         }
         if (failed > 0) {
             throw new UncheckedIOException(new IOException(
@@ -303,7 +434,46 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
         }
     }
 
-    // The apply methods change memory and mark what they change dirty.
+    /**
+     * Writes every dirty shard and then empties the journal. A shard that fails to write keeps
+     * the journal intact, so the next load replays what that shard file is missing.
+     *
+     * @return how many shards could not be written, plus one when the journal could not be emptied
+     */
+    private int compact() {
+        compactionLock.writeLock().lock();
+        try {
+            // Before the first load the journal still holds the last run's records, unreplayed.
+            if (!loaded || (dirty.isEmpty() && journal.isEmpty())) {
+                return 0;
+            }
+            int failed = writeDirtyShards();
+            if (failed > 0) {
+                LOG.errorv("Could not write {0} shards of {1}; keeping the journal", failed, directory);
+                return failed;
+            }
+            beforeJournalTruncate.run();
+            journal.truncate();
+            return 0;
+        } catch (IOException e) {
+            LOG.errorv(e, "Failed to truncate the journal of {0}", directory);
+            return 1;
+        } finally {
+            compactionLock.writeLock().unlock();
+        }
+    }
+
+    private void applyReplayed(EntryJournal.Change<E> change) {
+        switch (change) {
+            case EntryJournal.PutEntry<E> put -> applyPutEntry(put.key(), put.entryKey(), put.value());
+            case EntryJournal.RemoveEntry<E> remove -> applyRemoveEntry(remove.key(), remove.entryKey());
+            case EntryJournal.Put<E> put -> applyPut(put.key(), put.value());
+            case EntryJournal.Delete<E> delete -> applyDelete(delete.key());
+        }
+    }
+
+    // The apply methods change memory and mark what they change dirty. Live changes call them
+    // under the change lock and then journal the change; replay calls them for journal records.
 
     private ShardId applyPutEntry(String key, String entryKey, E entryValue) {
         ShardId id = new ShardId(key, shardOf(entryKey));
@@ -333,6 +503,29 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
         markAll(key);
     }
 
+    /** Journal mode: takes the change side of the compaction lock, then the key's lock, and returns the latter. */
+    private ReentrantLock beginChange(String key) {
+        if (journal == null) {
+            return null;
+        }
+        compactionLock.readLock().lock();
+        ReentrantLock lock = changeLocks.computeIfAbsent(key, ignored -> new ReentrantLock());
+        lock.lock();
+        return lock;
+    }
+
+    private void endChange(ReentrantLock lock) {
+        if (lock != null) {
+            lock.unlock();
+            compactionLock.readLock().unlock();
+        }
+    }
+
+    private boolean journalAppend(BooleanSupplier append) {
+        beforeJournalAppend.run();
+        return append.getAsBoolean();
+    }
+
     /** Writes every dirty shard and returns how many could not be written. */
     private int writeDirtyShards() {
         int failed = 0;
@@ -342,6 +535,18 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
             }
         }
         return failed;
+    }
+
+    void setBeforeJournalAppend(Runnable hook) {
+        this.beforeJournalAppend = hook;
+    }
+
+    void setBeforeJournalWrite(EntryJournal.WriteHook hook) {
+        journal.setBeforeWrite(hook);
+    }
+
+    void setBeforeJournalTruncate(Runnable hook) {
+        this.beforeJournalTruncate = hook;
     }
 
     void setBeforeShardWrite(Runnable hook) {
@@ -438,13 +643,13 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
      */
     private boolean writeShard(ShardId id) {
         // clear() holds the write side, so a write that read a shard before the clear cannot put
-        // its file back after the clear removed it. Load already holds the write side, which lets
-        // it take the read side here.
-        fileLock.readLock().lock();
+        // its file back after the clear removed it. Compaction and load already hold the write
+        // side, which lets them take the read side here.
+        compactionLock.readLock().lock();
         try {
             return writeShardLocked(id);
         } finally {
-            fileLock.readLock().unlock();
+            compactionLock.readLock().unlock();
         }
     }
 
@@ -606,7 +811,8 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
                 }
             }
             if (Files.isDirectory(directory)) {
-                // Empty (holdsData said so): make way for the move.
+                // Empty apart from an empty journal (holdsData said so): make way for the move.
+                Files.deleteIfExists(directory.resolve(JOURNAL_FILE));
                 Files.delete(directory);
             }
             Files.move(staging, directory, StandardCopyOption.ATOMIC_MOVE);
@@ -629,13 +835,19 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
                 entries.size(), sources, directory);
     }
 
-    /** Whether {@code dir} holds anything at all. */
+    /** Whether {@code dir} holds a shard file or a journal with records in it. */
     private static boolean holdsData(Path dir) {
         if (!Files.isDirectory(dir)) {
             return false;
         }
         try (DirectoryStream<Path> files = Files.newDirectoryStream(dir)) {
-            return files.iterator().hasNext();
+            for (Path file : files) {
+                boolean emptyJournal = file.getFileName().toString().equals(JOURNAL_FILE) && Files.size(file) == 0;
+                if (!emptyJournal) {
+                    return true;
+                }
+            }
+            return false;
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to list " + dir, e);
         }
