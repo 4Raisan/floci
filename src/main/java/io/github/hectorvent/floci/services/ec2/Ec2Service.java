@@ -7454,6 +7454,31 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
+     * Revokes rules named by their {@code sgr-} ids ({@code SecurityGroupRuleId.N}). Every id must
+     * name a rule of the group in the requested direction before any is removed.
+     */
+    public void revokeSecurityGroupRulesByIds(String region, String groupId, List<String> ruleIds,
+                                              boolean egress) {
+        ensureDefaultResources(region);
+        getRequiredSecurityGroup(region, groupId);
+        synchronized (lockFor(key(region, groupId))) {
+            List<SecurityGroupRule> rules = new ArrayList<>();
+            for (String ruleId : ruleIds) {
+                SecurityGroupRule rule = securityGroupRules.get(key(region, ruleId)).orElse(null);
+                if (rule == null || !groupId.equals(rule.getGroupId()) || rule.isEgress() != egress) {
+                    throw new AwsException("InvalidSecurityGroupRuleId.NotFound",
+                            "The security group rule ID '" + ruleId + "' does not exist", 400);
+                }
+                rules.add(rule);
+            }
+            for (SecurityGroupRule rule : rules) {
+                removeRuleFromGroup(region, rule);
+            }
+        }
+        reconcileAfterRuleRemoval(region, groupId, egress);
+    }
+
+    /**
      * Deletes a rule by its {@code sgr-} id, which is what a standalone
      * {@code AWS::EC2::SecurityGroupIngress} or {@code Egress} resource holds as its physical id.
      * Returns false when the rule is already gone, so a stack delete stays idempotent.
@@ -7464,39 +7489,53 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (rule == null) {
             return false;
         }
-        securityGroupRules.delete(key(region, securityGroupRuleId));
         String groupId = rule.getGroupId();
         if (groupId == null) {
+            securityGroupRules.delete(key(region, securityGroupRuleId));
             return true;
         }
         synchronized (lockFor(key(region, groupId))) {
-            SecurityGroup sg = securityGroups.get(key(region, groupId)).orElse(null);
-            if (sg == null) {
-                return true;
+            if (securityGroupRules.get(key(region, securityGroupRuleId)).isEmpty()) {
+                return false;
             }
-            List<IpPermission> next = new ArrayList<>(rule.isEgress()
-                    ? sg.getIpPermissionsEgress() : sg.getIpPermissions());
-            if (removeRecordedPermission(next, rule)) {
-                if (rule.isEgress()) {
-                    sg.setIpPermissionsEgress(next);
-                } else {
-                    sg.setIpPermissions(next);
-                }
-                securityGroups.put(key(region, groupId), sg);
-            }
+            removeRuleFromGroup(region, rule);
         }
-        if (!rule.isEgress()) {
+        reconcileAfterRuleRemoval(region, groupId, rule.isEgress());
+        return true;
+    }
+
+    /** Deletes the rule record and its peer in the group's permissions. Callers hold the group lock. */
+    private void removeRuleFromGroup(String region, SecurityGroupRule rule) {
+        securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId()));
+        String groupId = rule.getGroupId();
+        SecurityGroup sg = securityGroups.get(key(region, groupId)).orElse(null);
+        if (sg == null) {
+            return;
+        }
+        List<IpPermission> next = new ArrayList<>(rule.isEgress()
+                ? sg.getIpPermissionsEgress() : sg.getIpPermissions());
+        if (removeRecordedPermission(next, rule)) {
+            if (rule.isEgress()) {
+                sg.setIpPermissionsEgress(next);
+            } else {
+                sg.setIpPermissions(next);
+            }
+            securityGroups.put(key(region, groupId), sg);
+        }
+    }
+
+    private void reconcileAfterRuleRemoval(String region, String groupId, boolean egress) {
+        if (!egress) {
             reconcilePublishedPortsForGroup(region, groupId);
         } else {
             reconcileFirewallPolicies(region);
         }
-        return true;
     }
 
     /**
-     * Drops exactly the peer a rule record names, its ipv4 cidr, ipv6 cidr or referenced group, and
-     * the whole permission only once nothing is left in it. Matching on protocol and ports alone
-     * would take out an unrelated rule that happens to share them.
+     * Drops exactly the peer a rule record names, its ipv4 cidr, ipv6 cidr, referenced group or
+     * prefix list, and the whole permission only once nothing is left in it. Matching on protocol
+     * and ports alone would take out an unrelated rule that happens to share them.
      */
     private boolean removeRecordedPermission(List<IpPermission> perms, SecurityGroupRule rule) {
         String referencedGroupId = rule.getReferencedGroupInfo() == null
@@ -7518,9 +7557,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 dropIfEmpty(perms, perm);
                 return true;
             }
-            if (referencedGroupId != null) {
+            if (rule.getReferencedGroupInfo() != null) {
+                // A reference by a name that matched no group was recorded without an id.
                 UserIdGroupPair matchPair = perm.getUserIdGroupPairs().stream()
-                        .filter(pair -> referencedGroupId.equals(pair.getGroupId()))
+                        .filter(pair -> Objects.equals(referencedGroupId, pair.getGroupId()))
                         .findFirst().orElse(null);
                 if (matchPair == null) {
                     continue;
@@ -7540,9 +7580,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 dropIfEmpty(perms, perm);
                 return true;
             }
+            if (rule.getPrefixListId() != null) {
+                PrefixListId matchList = perm.getPrefixListIds().stream()
+                        .filter(l -> rule.getPrefixListId().equals(l.getPrefixListId()))
+                        .findFirst().orElse(null);
+                if (matchList == null) {
+                    continue;
+                }
+                perm.getPrefixListIds().remove(matchList);
+                dropIfEmpty(perms, perm);
+                return true;
+            }
             // A record naming no peer matches only a permission that names none either.
-            if (perm.getIpRanges().isEmpty() && perm.getIpv6Ranges().isEmpty()
-                    && perm.getUserIdGroupPairs().isEmpty()) {
+            if (!hasSources(perm)) {
                 perms.remove(perm);
                 return true;
             }
@@ -7550,9 +7600,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return false;
     }
 
-    private static void dropIfEmpty(List<IpPermission> perms, IpPermission perm) {
-        if (perm.getIpRanges().isEmpty() && perm.getIpv6Ranges().isEmpty()
-                && perm.getUserIdGroupPairs().isEmpty()) {
+    private void dropIfEmpty(List<IpPermission> perms, IpPermission perm) {
+        if (!hasSources(perm)) {
             perms.remove(perm);
         }
     }
