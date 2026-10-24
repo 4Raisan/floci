@@ -644,6 +644,15 @@ public class S3Controller {
                         .type("application/xml")
                         .build();
             }
+            if (hasQueryParam(uriInfo, "policyStatus")) {
+                s3Service.authorizeBucketRead(bucket, "s3:GetBucketPolicyStatus", authorization);
+                XmlBuilder xml = new XmlBuilder()
+                        .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+                        .start("PolicyStatus")
+                        .elem("IsPublic", s3Service.isBucketPolicyPublic(bucket))
+                        .end("PolicyStatus");
+                return Response.ok(xml.build()).type(MediaType.APPLICATION_XML).build();
+            }
             if (hasQueryParam(uriInfo, "policy")) {
                 s3Service.authorizeBucketRead(bucket, "s3:GetBucketPolicy", authorization);
                 return Response.ok(s3Service.getBucketPolicy(bucket)).build();

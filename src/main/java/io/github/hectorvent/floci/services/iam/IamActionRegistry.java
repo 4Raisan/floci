@@ -688,6 +688,7 @@ public class IamActionRegistry {
             sub("website",           "s3:GetBucketWebsite"),
             sub("logging",           "s3:GetBucketLogging"),
             sub("policy",            "s3:GetBucketPolicy"),
+            sub("policyStatus",      "s3:GetBucketPolicyStatus"),
             sub("cors",              "s3:GetBucketCORS"),
             sub("lifecycle",         "s3:GetLifecycleConfiguration"),
             sub("acl",               "s3:GetBucketAcl"),
