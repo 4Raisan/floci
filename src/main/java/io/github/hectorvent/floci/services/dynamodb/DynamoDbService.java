@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.Totp;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -46,24 +47,28 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -74,6 +79,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -112,6 +118,7 @@ public class DynamoDbService {
     private final StorageBackend<String, TableBackup> backupStore;
     private final DynamoDbPointInTimeRecovery pointInTimeRecovery;
     private final Clock clock;
+    private final Executor exportExecutor;
     // Items stored per table: storageKey -> Map<itemKey, item>
     // itemKey is "pk" or "pk#sk" depending on table schema
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<String, JsonNode>> itemsByTable = new ConcurrentHashMap<>();
@@ -284,6 +291,27 @@ public class DynamoDbService {
                     int vectorIndexBackfillSeconds,
                     int latestRestorableLagSeconds,
                     Clock clock) {
+        this(tableStore, itemStore, exportStore, importStore, backupStore, pointInTimeStore, regionResolver,
+             streamService, kinesisForwarder, s3Service, objectMapper, vectorIndexAllocationSeconds,
+             vectorIndexBackfillSeconds, latestRestorableLagSeconds, clock, command -> Thread.ofVirtual().start(command));
+    }
+
+    DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                    StorageBackend<String, Map<String, JsonNode>> itemStore,
+                    StorageBackend<String, ExportDescription> exportStore,
+                    StorageBackend<String, ImportTableDescription> importStore,
+                    StorageBackend<String, TableBackup> backupStore,
+                    StorageBackend<String, PointInTimeChange> pointInTimeStore,
+                    RegionResolver regionResolver,
+                    DynamoDbStreamService streamService,
+                    KinesisStreamingForwarder kinesisForwarder,
+                    S3Service s3Service,
+                    ObjectMapper objectMapper,
+                    int vectorIndexAllocationSeconds,
+                    int vectorIndexBackfillSeconds,
+                    int latestRestorableLagSeconds,
+                    Clock clock,
+                    Executor exportExecutor) {
         this.tableStore = tableStore;
         this.itemStore = itemStore;
         this.exportStore = exportStore;
@@ -292,6 +320,7 @@ public class DynamoDbService {
         this.pointInTimeRecovery = new DynamoDbPointInTimeRecovery(pointInTimeStore, regionResolver.getAccountId(),
                 Duration.ofSeconds(latestRestorableLagSeconds), clock);
         this.clock = clock;
+        this.exportExecutor = exportExecutor;
         this.regionResolver = regionResolver;
         this.streamService = streamService;
         this.kinesisForwarder = kinesisForwarder;
@@ -4901,6 +4930,18 @@ public class DynamoDbService {
         String s3SseAlgorithm = request.containsKey("S3SseAlgorithm") ? (String) request.get("S3SseAlgorithm") : null;
         String s3BucketOwner = request.containsKey("S3BucketOwner") ? (String) request.get("S3BucketOwner") : null;
 
+        if (s3Prefix != null) {
+            int length = s3Prefix.codePointCount(0, s3Prefix.length());
+            if (1024 < length) {
+                throw SmithyValidationErrors.validationException("Value '" + s3Prefix
+                        + "' at 's3Prefix' failed to satisfy constraint: Member must have length less than or equal to 1024");
+            }
+            if (length < 3) {
+                throw new AwsException("ValidationException", "Invalid Request: " + SmithyValidationErrors.message(
+                        List.of("Value '" + s3Prefix + "' at 's3Prefix' failed to satisfy constraint: "
+                                + "Member must have length greater than or equal to 3")), 400);
+            }
+        }
         if ("INCREMENTAL_EXPORT".equals(exportType)) {
             throw new AwsException("ValidationException",
                     "ExportType INCREMENTAL_EXPORT is not supported", 400);
@@ -4916,6 +4957,9 @@ public class DynamoDbService {
         String storageKey = regionKey(tableRegion, tableName);
 
         TableDefinition table = requireBackupSource(storageKey, tableArn);
+        if (s3Prefix != null && 948 < s3Prefix.getBytes(StandardCharsets.UTF_8).length) {
+            throw new AwsException("ValidationException", "Invalid Request: S3 Prefix is too long", 400);
+        }
         Instant startTime = clock.instant().truncatedTo(ChronoUnit.MILLIS);
         // AWS cannot enable point-in-time recovery until seconds after the creation, so its
         // EarliestRestorableDateTime is never in the creation second.
@@ -4934,22 +4978,22 @@ public class DynamoDbService {
         }
         Instant time = exportTime != null ? exportTime : startTime;
 
-        var exportId = newJobId();
+        String exportId = DynamoDbBackupArns.timedId(startTime);
         String exportArn = AwsArnUtils.Arn.of("dynamodb", tableRegion, regionResolver.getAccountId(), "table/" + table.getTableName() + "/export/" + exportId).toString();
 
         ExportDescription desc = new ExportDescription();
         desc.setExportArn(exportArn);
         desc.setExportStatus("IN_PROGRESS");
         desc.setTableArn(table.getTableArn());
-        desc.setTableId(table.getTableName());
+        desc.setTableId(table.getTableId());
         desc.setS3Bucket(s3Bucket);
         desc.setS3Prefix(s3Prefix);
         desc.setExportFormat(exportFormat);
-        desc.setExportType("FULL_EXPORT");
+        desc.setExportType((String) request.get("ExportType"));
         desc.setExportTime(epochSeconds(time));
         desc.setStartTime(epochSeconds(startTime));
         desc.setClientToken(clientToken);
-        desc.setS3SseAlgorithm(s3SseAlgorithm);
+        desc.setS3SseAlgorithm(s3SseAlgorithm != null ? s3SseAlgorithm : "AES256");
         desc.setS3BucketOwner(s3BucketOwner);
 
         if (exportStore != null) {
@@ -4964,7 +5008,7 @@ public class DynamoDbService {
         // changes underneath the handler, and the request account so its writes land there.
         var accountId = regionResolver.getAccountId();
         var worker = objectMapper.convertValue(desc, ExportDescription.class);
-        Thread.ofVirtual().start(() -> RequestScopes.runAs(accountId, () -> runExport(worker, snapshot, exportArn)));
+        exportExecutor.execute(() -> RequestScopes.runAs(accountId, () -> runExport(worker, snapshot, exportArn)));
 
         return desc;
     }
@@ -4972,20 +5016,14 @@ public class DynamoDbService {
     private void runExport(ExportDescription desc, List<JsonNode> snapshot, String exportArn) {
         try {
             String s3Bucket = desc.getS3Bucket();
-            String s3Prefix = desc.getS3Prefix() != null ? desc.getS3Prefix() : "";
             String exportId = exportArn.substring(exportArn.lastIndexOf('/') + 1);
-            String dataFileUuid = UUID.randomUUID().toString();
-            String dataKey = (s3Prefix.isEmpty() ? "" : s3Prefix + "/")
-                    + "AWSDynamoDB/" + exportId + "/data/" + dataFileUuid + ".json.gz";
-            String manifestFilesKey = (s3Prefix.isEmpty() ? "" : s3Prefix + "/")
-                    + "AWSDynamoDB/" + exportId + "/manifest-files.json";
-            String manifestSummaryKey = (s3Prefix.isEmpty() ? "" : s3Prefix + "/")
-                    + "AWSDynamoDB/" + exportId + "/manifest-summary.json";
-
-            byte[] gzipData = buildGzipNdjson(snapshot);
+            String prefix = desc.getS3Prefix();
+            // AWS adds no slash after a prefix that ends with one.
+            String exportDir = (prefix == null ? "" : prefix.endsWith("/") ? prefix : prefix + "/")
+                    + "AWSDynamoDB/" + exportId + "/";
 
             try {
-                s3Service.putObject(s3Bucket, dataKey, gzipData, "application/octet-stream", Map.of());
+                writeExportFile(s3Bucket, exportDir + "_started", new byte[0]);
             } catch (AwsException e) {
                 if ("NoSuchBucket".equals(e.getErrorCode())) {
                     desc.setExportStatus("FAILED");
@@ -5000,33 +5038,28 @@ public class DynamoDbService {
                 throw e;
             }
 
-            String md5 = computeMd5Hex(gzipData);
-            String etag = md5;
+            byte[] gzipData = buildGzipNdjson(snapshot);
+            String dataKey = exportDir + "data/" + exportFileName() + ".json.gz";
+            ObjectNode dataFile = objectMapper.createObjectNode();
+            dataFile.put("itemCount", snapshot.size());
+            dataFile.put("md5Checksum", Base64.getEncoder().encodeToString(Digests.md5(gzipData)));
+            dataFile.put("etag", writeExportFile(s3Bucket, dataKey, gzipData));
+            dataFile.put("dataFileS3Key", dataKey);
+            String manifestFilesKey = exportDir + "manifest-files.json";
+            writeExportManifest(s3Bucket, manifestFilesKey, objectMapper.writeValueAsString(dataFile) + "\n");
 
-            String manifestFilesContent = dataKey + "\n";
-            s3Service.putObject(s3Bucket, manifestFilesKey,
-                    manifestFilesContent.getBytes(StandardCharsets.UTF_8),
-                    "application/json", Map.of());
-
-            long billedSize = gzipData.length;
-            long itemCount = snapshot.size();
-
-            String manifestSummaryContent = buildManifestSummary(
-                    desc, exportId, dataKey, itemCount, billedSize, md5, etag, manifestSummaryKey);
-            s3Service.putObject(s3Bucket, manifestSummaryKey,
-                    manifestSummaryContent.getBytes(StandardCharsets.UTF_8),
-                    "application/json", Map.of());
+            desc.setEndTime(epochSeconds(clock.instant()));
+            desc.setItemCount((long) snapshot.size());
+            desc.setBilledSizeBytes((long) gzipData.length);
+            String manifestSummaryKey = exportDir + "manifest-summary.json";
+            writeExportManifest(s3Bucket, manifestSummaryKey, manifestSummary(desc, manifestFilesKey));
 
             desc.setExportStatus("COMPLETED");
-            desc.setEndTime(epochSeconds(clock.instant()));
-            desc.setItemCount(itemCount);
-            desc.setBilledSizeBytes(billedSize);
             desc.setExportManifest(manifestSummaryKey);
-
             if (exportStore != null) {
                 exportStore.put(exportArn, desc);
             }
-            LOG.infov("Export completed: {0}, items={1}", exportArn, itemCount);
+            LOG.infov("Export completed: {0}, items={1}", exportArn, snapshot.size());
 
         } catch (Exception e) {
             LOG.errorv(e, "Export failed: {0}", exportArn);
@@ -5054,50 +5087,60 @@ public class DynamoDbService {
         return baos.toByteArray();
     }
 
-    private String computeMd5Hex(byte[] data) {
+    private static final DateTimeFormatter MANIFEST_TIME =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
+
+    /** AWS names a data file with 26 lower-case base32 characters. */
+    private static String exportFileName() {
+        UUID uuid = UUID.randomUUID();
+        byte[] bytes = ByteBuffer.allocate(16).putLong(uuid.getMostSignificantBits())
+                .putLong(uuid.getLeastSignificantBits()).array();
+        return Totp.base32Encode(bytes).toLowerCase(Locale.ROOT);
+    }
+
+    /** AWS uploads every export file in one part, so each ETag ends in "-1". */
+    private String writeExportFile(String bucket, String key, byte[] data) {
+        String uploadId = s3Service.initiateMultipartUpload(bucket, key, "application/octet-stream").getUploadId();
         try {
-            MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] digest = md.digest(data);
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            return "unknown";
+            s3Service.uploadPart(bucket, key, uploadId, 1, data);
+            String etag = s3Service.completeMultipartUpload(bucket, key, uploadId, List.of(1), null, null).getETag();
+            return etag.substring(1, etag.length() - 1);
+        } catch (RuntimeException e) {
+            try {
+                s3Service.abortMultipartUpload(bucket, key, uploadId);
+            } catch (RuntimeException abortFailure) {
+                LOG.warnv(abortFailure, "Could not abort the export upload of {0}/{1}", bucket, key);
+            }
+            throw e;
         }
     }
 
-    private String buildManifestSummary(ExportDescription desc, String exportId,
-                                         String dataKey, long itemCount, long billedSize,
-                                         String md5, String etag, String manifestSummaryKey) {
-        try {
-            ObjectNode root = objectMapper.createObjectNode();
-            root.put("version", "2020-06-30");
-            root.put("exportArn", desc.getExportArn());
-            root.put("startTime", instantOf(desc.getStartTime()).toString());
-            root.put("endTime", Instant.now().toString());
-            root.put("tableArn", desc.getTableArn());
-            root.put("tableId", desc.getTableId());
-            root.put("exportTime", instantOf(desc.getExportTime()).toString());
-            root.put("s3Bucket", desc.getS3Bucket());
-            root.putNull("s3Prefix");
-            if (desc.getS3Prefix() != null) {
-                root.put("s3Prefix", desc.getS3Prefix());
-            }
-            root.put("s3SseAlgorithm", desc.getS3SseAlgorithm() != null ? desc.getS3SseAlgorithm() : "AES256");
-            root.putNull("s3SseKmsKeyId");
-            root.put("exportFormat", desc.getExportFormat());
-            root.put("billedSizeBytes", billedSize);
-            root.put("itemCount", itemCount);
+    /** AWS writes the base64 MD5 of each manifest next to it. */
+    private void writeExportManifest(String bucket, String key, String content) {
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        writeExportFile(bucket, key, bytes);
+        writeExportFile(bucket, key.substring(0, key.length() - ".json".length()) + ".md5",
+                Base64.getEncoder().encodeToString(Digests.md5(bytes)).getBytes(StandardCharsets.UTF_8));
+    }
 
-            ArrayNode outputFiles = root.putArray("outputFiles");
-            ObjectNode fileEntry = outputFiles.addObject();
-            fileEntry.put("itemCount", itemCount);
-            fileEntry.put("md5Checksum", md5);
-            fileEntry.put("etag", etag);
-            fileEntry.put("dataFileS3Key", dataKey);
-
-            return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(root);
-        } catch (JsonProcessingException e) {
-            return "{}";
-        }
+    private String manifestSummary(ExportDescription desc, String manifestFilesKey) throws JsonProcessingException {
+        ObjectNode root = objectMapper.createObjectNode();
+        root.put("version", "2020-06-30");
+        root.put("exportArn", desc.getExportArn());
+        root.put("startTime", MANIFEST_TIME.format(instantOf(desc.getStartTime())));
+        root.put("endTime", MANIFEST_TIME.format(instantOf(desc.getEndTime())));
+        root.put("tableArn", desc.getTableArn());
+        root.put("tableId", desc.getTableId());
+        root.put("exportTime", MANIFEST_TIME.format(instantOf(desc.getExportTime())));
+        root.put("s3Bucket", desc.getS3Bucket());
+        root.put("s3Prefix", desc.getS3Prefix());
+        root.put("s3SseAlgorithm", desc.getS3SseAlgorithm());
+        root.putNull("s3SseKmsKeyId");
+        root.put("manifestFilesS3Key", manifestFilesKey);
+        root.put("billedSizeBytes", desc.getBilledSizeBytes());
+        root.put("itemCount", desc.getItemCount());
+        root.put("outputFormat", desc.getExportFormat());
+        return objectMapper.writeValueAsString(root);
     }
 
     public ExportDescription describeExport(String exportArn) {
