@@ -1111,7 +1111,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                   List<String> resources, List<Map<String, List<String>>> targetContexts,
                                   String region, String accountId, String akid) {
         for (String resource : resources) {
-            List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies = resolveResourcePolicies(credentialScope, resource);
+            List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies =
+                    resolveResourcePolicies(credentialScope, operationAction, resource);
             String resourceOwnerAccountId = resourcePolicies.isEmpty() ? null : resourcePolicies.getFirst().ownerAccountId();
             List<String> policyDocs = resourcePolicies.stream()
                     .map(ResourcePolicyProvider.ResourcePolicy::policyDocument)
@@ -1404,7 +1405,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 // signing alias such as s3express, would otherwise see no bucket policy at all.
                 String resourcePolicyScope = catalog.canonicalCredentialScope(action.split(":", 2)[0]);
                 List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies = resolveResourcePolicies(
-                        resourcePolicyScope, resource);
+                        resourcePolicyScope, action, resource);
                 effectiveOwnerAccountId = resourcePolicies.isEmpty()
                         ? null : resourcePolicies.getFirst().ownerAccountId();
                 policyDocs = resourcePolicies.stream()
@@ -1688,8 +1689,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return resolved;
     }
 
-    private List<ResourcePolicyProvider.ResourcePolicy> resolveResourcePolicies(String credentialScope, String resourceArn) {
-        return ResourcePolicyProviders.policiesFor(resourcePolicyProviders, credentialScope, resourceArn);
+    private List<ResourcePolicyProvider.ResourcePolicy> resolveResourcePolicies(
+            String credentialScope, String action, String resourceArn) {
+        return ResourcePolicyProviders.policiesFor(resourcePolicyProviders, credentialScope, action, resourceArn);
     }
 
     /**
