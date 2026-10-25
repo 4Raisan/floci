@@ -183,8 +183,8 @@ public class LambdaExecutorService implements Resettable {
         return invoke(fn, payload, type, chainDepth, null);
     }
 
-    InvokeResult invoke(LambdaFunction fn, byte[] payload, InvocationType type, int chainDepth,
-                        String invokedQualifier) {
+    public InvokeResult invoke(LambdaFunction fn, byte[] payload, InvocationType type, int chainDepth,
+                               String invokedQualifier) {
         return invoke(fn, payload, type, chainDepth, invokedQualifier, null);
     }
 
