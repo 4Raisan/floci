@@ -259,6 +259,39 @@ class CompositeAlarmServiceTest {
         assertEquals(remove ? Map.of() : Map.of("team", "new"), result.getTags());
     }
 
+    @Test
+    void supplementaryCharactersRespectAlarmAndRuleLengthBounds() {
+        String scalar = "\uD83D\uDE00";
+        put(scalar.repeat(255), "TRUE");
+        assertThrows(AwsException.class, () -> put(scalar.repeat(256), "TRUE"));
+        String rule = "ALARM(\"" + scalar.repeat(10231) + "\")";
+        assertDoesNotThrow(() -> CompositeAlarmRule.parse(rule));
+        assertThrows(AwsException.class, () -> CompositeAlarmRule.parse(rule + " "));
+    }
+
+    @Test
+    void blankAlarmFieldsRetainLengthErrorPrecedence() {
+        for (String name : List.of("", "   ", " ".repeat(256))) {
+            AwsException error = assertThrows(AwsException.class, () -> put(name, "TRUE"));
+            String bound = name.length() > 255 ? "less than or equal to 255" : "greater than or equal to 1";
+            assertEquals("1 validation error detected: Value '" + name
+                    + "' at 'alarmName' failed to satisfy constraint: Member must have length " + bound,
+                    error.getMessage());
+        }
+        for (String rule : List.of("", "   ", " ".repeat(10241))) {
+            AwsException error = assertThrows(AwsException.class, () -> CompositeAlarmRule.parse(rule));
+            String bound = rule.length() > 10240 ? "less than or equal to 10240" : "greater than or equal to 1";
+            assertEquals("1 validation error detected: Value '" + rule
+                    + "' at 'alarmRule' failed to satisfy constraint: Member must have length " + bound,
+                    error.getMessage());
+        }
+        assertEquals("1 validation error detected: Value null at 'alarmName' failed to satisfy constraint: "
+                + "Member must not be null", assertThrows(AwsException.class, () -> put(null, "TRUE")).getMessage());
+        assertEquals("1 validation error detected: Value null at 'alarmRule' failed to satisfy constraint: "
+                + "Member must not be null", assertThrows(AwsException.class,
+                        () -> CompositeAlarmRule.parse(null)).getMessage());
+    }
+
     private CompositeAlarm put(String name, String rule) {
         CompositeAlarm alarm = new CompositeAlarm();
         alarm.setAlarmName(name);
