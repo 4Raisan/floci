@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbApiStreamReader;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbStreamReader.CheckpointLifetime;
@@ -67,6 +68,72 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 class RedshiftServiceTest {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void loggingDestinationRegionSurvivesStorageAndRestart(boolean refresh) throws Exception {
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("warehouse");
+        cluster.setClusterStatus("available");
+        when(clusterBackend.get("warehouse")).thenReturn(Optional.of(cluster));
+        ObjectMapper mapper = new ObjectMapper();
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        RedshiftService original = new RedshiftService(sf, cm, config,
+                new RegionResolver("us-west-2", "111111111111"), proxyManager, dockerHostResolver,
+                credentialBroker, secretsManagerService, mapper, null, null);
+        original.enableLogging("warehouse", null, null, "cloudwatch", List.of("connectionlog"));
+
+        Cluster restored = mapper.readValue(mapper.writeValueAsBytes(cluster), Cluster.class);
+        when(clusterBackend.get("warehouse")).thenReturn(Optional.of(restored));
+        when(clusterBackend.scanAllAccountEntries(any())).thenReturn(List.of(
+                new AccountAwareStorageBackend.AccountEntry<>("111111111111", "warehouse", restored)));
+        when(cm.getContainer("111111111111", "warehouse")).thenReturn(Optional.of(
+                new RedshiftContainerHandle("container", "warehouse", "localhost", 5432)));
+        CloudWatchLogsService logs = mock(CloudWatchLogsService.class);
+        RedshiftAuditLogPublisher publisher = new RedshiftAuditLogPublisher(logs);
+        RedshiftService restarted = new RedshiftService(sf, cm, config, regionResolver,
+                proxyManager, dockerHostResolver, credentialBroker, secretsManagerService, mapper, null, publisher);
+
+        restarted.onStart(null);
+        if (refresh) {
+            restarted.modifyClusterIamRoles("warehouse", List.of(), List.of());
+        }
+        publisher.publishRegisteredConnection("111111111111", "warehouse", "dev", "alice",
+                "authenticated", "192.0.2.1", 54321);
+
+        verify(logs).putLogEventsForAccount(eq("111111111111"),
+                eq("/aws/redshift/cluster/warehouse/connectionlog"), eq("warehouse"), anyList(), eq("us-west-2"));
+        verify(logs, never()).createLogGroupForAccount(anyString(), anyString(), any(), anyMap(), eq("us-east-1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void activityParameterUpdatesStayWithinTheCallingAccount(boolean reset) {
+        ClusterParameterGroup group = new ClusterParameterGroup("shared", "redshift-1.0", "audit");
+        when(parameterGroupBackend.get("shared")).thenReturn(Optional.of(group));
+        Cluster owned = new Cluster();
+        owned.setClusterIdentifier("owned");
+        owned.setClusterParameterGroupName("shared");
+        owned.setUserActivityLoggingEnabled(reset);
+        Cluster foreign = new Cluster();
+        foreign.setClusterIdentifier("foreign");
+        foreign.setClusterParameterGroupName("shared");
+        foreign.setUserActivityLoggingEnabled(reset);
+        when(clusterBackend.scanAllAccountEntries(any())).thenReturn(List.of(
+                new AccountAwareStorageBackend.AccountEntry<>("111111111111", "owned", owned),
+                new AccountAwareStorageBackend.AccountEntry<>("222222222222", "foreign", foreign)));
+        when(clusterBackend.scan(any())).thenReturn(List.of(owned));
+
+        if (reset) {
+            service.resetClusterParameterGroup("shared", true, List.of());
+        } else {
+            service.modifyClusterParameterGroup("shared", List.of(new Parameter("enable_user_activity_logging", "true")));
+        }
+
+        assertEquals(!reset, owned.isUserActivityLoggingEnabled());
+        assertEquals(reset, foreign.isUserActivityLoggingEnabled());
+        verify(clusterBackend, never()).putForAccount(eq("222222222222"), anyString(), any());
+    }
 
     @Test
     void recoveryProxyFailureDoesNotDestructivelyStopAnAdoptedContainer() {
@@ -1942,8 +2009,9 @@ class RedshiftServiceTest {
         assertEquals("0", parameters.get(0).getParameterValue());
         assertEquals("engine-default", parameters.get(0).getSource());
         assertEquals("integer", parameters.get(0).getDataType());
-        assertEquals("custom", parameters.get(1).getParameterValue());
-        assertEquals("user", parameters.get(1).getSource());
+        assertEquals("false", parameters.get(1).getParameterValue());
+        assertEquals("custom", parameters.get(2).getParameterValue());
+        assertEquals("user", parameters.get(2).getSource());
         verify(parameterGroupBackend, times(2)).flush();
     }
 
@@ -1958,9 +2026,10 @@ class RedshiftServiceTest {
         service.resetClusterParameterGroup("reset-pg", true, List.of());
 
         List<Parameter> parameters = service.describeClusterParameters("reset-pg");
-        assertEquals(2, parameters.size());
+        assertEquals(3, parameters.size());
         assertEquals("0", parameters.get(0).getParameterValue());
-        assertEquals("{}", parameters.get(1).getParameterValue());
+        assertEquals("false", parameters.get(1).getParameterValue());
+        assertEquals("{}", parameters.get(2).getParameterValue());
         assertTrue(parameters.stream().allMatch(parameter -> "engine-default".equals(parameter.getSource())));
         assertEquals("analytics", group.getTags().get("owner"));
         assertEquals("description", group.getDescription());

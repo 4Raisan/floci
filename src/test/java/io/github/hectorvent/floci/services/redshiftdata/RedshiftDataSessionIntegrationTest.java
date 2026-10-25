@@ -171,6 +171,27 @@ class RedshiftDataSessionIntegrationTest {
         assertThrows(ResourceNotFoundException.class, () -> data.executeStatement(r -> r.waitTimeSeconds(30).sessionId(created.sessionId()).sql("SELECT 3")));
     }
 
+    @Test
+    void sdkBatchAcceptsSavepointsAndMultipleStatementsInAnEntry() {
+        ExecuteStatementResponse created = data.executeStatement(r -> r.waitTimeSeconds(30).clusterIdentifier("warehouse")
+                .dbUser("admin").database("dev").sessionKeepAliveSeconds(60)
+                .sql("CREATE LOCAL TEMPORARY TABLE batch_changes(id integer)"));
+        finished(created.id());
+        String batch = data.batchExecuteStatement(r -> r.waitTimeSeconds(30).sessionId(created.sessionId())
+                .sqls("SAVEPOINT s", "INSERT INTO batch_changes VALUES (1); ROLLBACK TO SAVEPOINT s",
+                        "INSERT INTO batch_changes VALUES (2)")).id();
+        finished(batch);
+        String query = data.executeStatement(r -> r.waitTimeSeconds(30).sessionId(created.sessionId())
+                .sql("SELECT id FROM batch_changes")).id();
+        finished(query);
+        assertEquals(1L, data.getStatementResult(r -> r.id(query)).totalNumRows());
+        assertEquals(2L, data.getStatementResult(r -> r.id(query)).records().getFirst().getFirst().longValue());
+        String multiResult = data.batchExecuteStatement(r -> r.waitTimeSeconds(30).sessionId(created.sessionId())
+                .sqls("SELECT 11; SELECT 22")).id();
+        finished(multiResult);
+        assertEquals(11L, data.getStatementResult(r -> r.id(multiResult)).records().getFirst().getFirst().longValue());
+    }
+
     private RedshiftDataClient client(String key, Region region) {
         return RedshiftDataClient.builder().endpointOverride(endpoint).region(region)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(key, "test"))).build();

@@ -11,6 +11,10 @@ import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SqlParameterParser.ParsedSql;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.redshift.RedshiftAuditLogPublisher;
+import io.github.hectorvent.floci.services.redshift.RedshiftAuditSql;
+import io.github.hectorvent.floci.services.redshift.RedshiftAuditSql.UserChange;
+import io.github.hectorvent.floci.services.redshift.RedshiftAuditSql.UserChanges;
 import io.github.hectorvent.floci.services.redshift.spectrum.BackendSql;
 import io.github.hectorvent.floci.services.redshift.spectrum.SpectrumQueryPreparation;
 import io.github.hectorvent.floci.services.redshift.spectrum.SpectrumReadException;
@@ -65,6 +69,7 @@ public class RedshiftDataService implements Resettable {
     private final SpectrumQueryPreparation preparation;
     private final RedshiftDataExecutor executor;
     private final RedshiftDataEventPublisher publisher;
+    private final RedshiftAuditLogPublisher auditLogPublisher;
     private final RequestContext requestContext;
     private final IamService iamService;
     private final RedshiftDataIdempotencyStore idempotency;
@@ -76,7 +81,16 @@ public class RedshiftDataService implements Resettable {
                         RedshiftDataExecutor executor, RedshiftDataEventPublisher publisher) {
         this(resolver, connectionFactory, store, objectMapper, preparation, executor, publisher, null,
                 null, new RedshiftDataIdempotencyStore(AccountAwareStorageBackend.inMemory("000000000000"),
-                        Clock.systemUTC()));
+                        Clock.systemUTC()), new RedshiftDataSessions(), null);
+    }
+
+    RedshiftDataService(RedshiftDataResourceResolver resolver, RedshiftDataConnectionFactory connectionFactory,
+                        RedshiftDataStatementStore store, ObjectMapper objectMapper, SpectrumQueryPreparation preparation,
+                        RedshiftDataExecutor executor, RedshiftDataEventPublisher publisher,
+                        RequestContext requestContext, IamService iamService, RedshiftDataIdempotencyStore idempotency,
+                        RedshiftDataSessions sessions) {
+        this(resolver, connectionFactory, store, objectMapper, preparation, executor, publisher, requestContext,
+                iamService, idempotency, sessions, null);
     }
 
     RedshiftDataService(RedshiftDataResourceResolver resolver, RedshiftDataConnectionFactory connectionFactory,
@@ -84,7 +98,7 @@ public class RedshiftDataService implements Resettable {
                                RedshiftDataExecutor executor, RedshiftDataEventPublisher publisher,
                                RequestContext requestContext, IamService iamService, RedshiftDataIdempotencyStore idempotency) {
         this(resolver, connectionFactory, store, objectMapper, preparation, executor, publisher,
-                requestContext, iamService, idempotency, new RedshiftDataSessions());
+                requestContext, iamService, idempotency, new RedshiftDataSessions(), null);
     }
 
     @Inject
@@ -92,7 +106,7 @@ public class RedshiftDataService implements Resettable {
                                RedshiftDataStatementStore store, ObjectMapper objectMapper, SpectrumQueryPreparation preparation,
                                RedshiftDataExecutor executor, RedshiftDataEventPublisher publisher,
                                RequestContext requestContext, IamService iamService, RedshiftDataIdempotencyStore idempotency,
-                               RedshiftDataSessions sessions) {
+                               RedshiftDataSessions sessions, RedshiftAuditLogPublisher auditLogPublisher) {
         this.resolver = resolver;
         this.connectionFactory = connectionFactory;
         this.store = store;
@@ -100,6 +114,7 @@ public class RedshiftDataService implements Resettable {
         this.preparation = preparation;
         this.executor = executor;
         this.publisher = publisher;
+        this.auditLogPublisher = auditLogPublisher;
         this.requestContext = requestContext;
         this.iamService = iamService;
         this.idempotency = idempotency;
@@ -406,14 +421,41 @@ public class RedshiftDataService implements Resettable {
 
     private ConnectionUse connection(RedshiftDataResourceResolver.DatabaseTarget target,
                                      RedshiftDataSessions.Reservation session) throws SQLException {
-        return new ConnectionUse(session == null ? connectionFactory.open(target) : session.connection(connectionFactory), session);
+        Runnable disconnected = () -> publishConnection(target, "disconnection", null);
+        try {
+            Connection connection;
+            if (session == null) {
+                connection = connectionFactory.open(target);
+                publishConnection(target, "authenticated", null);
+            } else {
+                connection = session.connection(connectionFactory,
+                        () -> publishConnection(target, "authenticated", null), disconnected);
+            }
+            return new ConnectionUse(connection, session, disconnected);
+        } catch (SQLException failure) {
+            publishConnection(target, "authentication failure", failure.getSQLState());
+            throw failure;
+        }
     }
 
-    private record ConnectionUse(Connection connection, RedshiftDataSessions.Reservation session) implements AutoCloseable {
+    private void publishConnection(RedshiftDataResourceResolver.DatabaseTarget target, String event, String error) {
+        if (auditLogPublisher != null && target.cluster() != null) {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(target.arn());
+            auditLogPublisher.publishConnection(target.cluster(), arn.accountId(), arn.region(), target.database(),
+                    target.auditUser(), event, null, error);
+        }
+    }
+
+    private record ConnectionUse(Connection connection, RedshiftDataSessions.Reservation session,
+                                 Runnable disconnected) implements AutoCloseable {
         @Override
         public void close() throws SQLException {
             if (session == null) {
-                connection.close();
+                try {
+                    connection.close();
+                } finally {
+                    disconnected.run();
+                }
                 return;
             }
             try {
@@ -443,7 +485,8 @@ public class RedshiftDataService implements Resettable {
             Connection connection = use.connection();
             execution.track(connection);
             try {
-                if (session != null && transactionControl(stored, sql, connection, session, execution)) {
+                publishActivity(stored, target, sql);
+                if (session != null && transactionControl(stored, target, sql, connection, session, execution)) {
                     return;
                 }
                 if (session != null && session.transactionFailed()) {
@@ -458,6 +501,7 @@ public class RedshiftDataService implements Resettable {
                     }
                     execution.commit(() -> runOnConnection(stored, connection, sql, parameters,
                             target.spectrum(), execution, true));
+                    successfulUserChange(stored, target, sql, session);
                 } else {
                     runOnConnection(stored, connection, sql, parameters, target.spectrum(), execution, false);
                     execution.commit(() -> {
@@ -465,6 +509,7 @@ public class RedshiftDataService implements Resettable {
                             connection.commit();
                         }
                     });
+                    successfulUserChange(stored, target, sql, session);
                 }
             } catch (SQLException failure) {
                 if (session != null && failure.getSQLState() != null && failure.getSQLState().startsWith("08")) {
@@ -490,7 +535,36 @@ public class RedshiftDataService implements Resettable {
         stored.updatedAt = Instant.now();
     }
 
-    private boolean transactionControl(RedshiftDataStatementStore.StoredStatement stored, String sql,
+    private void publishActivity(RedshiftDataStatementStore.StoredStatement stored,
+                                 RedshiftDataResourceResolver.DatabaseTarget target, String sql) {
+        if (auditLogPublisher != null && target.cluster() != null) {
+            auditLogPublisher.publishActivity(target.cluster(), stored.accountId, stored.region,
+                    target.database(), target.auditUser(), sql);
+        }
+    }
+
+    private void successfulUserChange(RedshiftDataStatementStore.StoredStatement stored,
+                                      RedshiftDataResourceResolver.DatabaseTarget target, String sql,
+                                      RedshiftDataSessions.Reservation session) {
+        if (session != null && session.inTransaction()) {
+            session.completeUserChanges(sql);
+        } else {
+            publishUserChanges(stored, target, RedshiftAuditSql.userChanges(sql));
+        }
+    }
+
+    private void publishUserChanges(RedshiftDataStatementStore.StoredStatement stored,
+                                    RedshiftDataResourceResolver.DatabaseTarget target, List<UserChange> changes) {
+        if (auditLogPublisher != null && target.cluster() != null) {
+            for (UserChange change : changes) {
+                auditLogPublisher.publishUserChange(target.cluster(), stored.accountId, stored.region,
+                        target.database(), change.username(), change.action(), change.oldUsername());
+            }
+        }
+    }
+
+    private boolean transactionControl(RedshiftDataStatementStore.StoredStatement stored,
+                                       RedshiftDataResourceResolver.DatabaseTarget target, String sql,
                                        Connection connection, RedshiftDataSessions.Reservation session,
                                        RedshiftDataExecution execution) throws SQLException {
         String normalized = TRANSACTION_COMMENTS.matcher(sql).replaceAll(" ").trim();
@@ -512,12 +586,17 @@ public class RedshiftDataService implements Resettable {
                     session.transaction(true);
                 }
                 case "COMMIT", "END" -> {
+                    boolean rolledBack = session.transactionFailed();
                     if (!connection.getAutoCommit()) {
                         if (session.transactionFailed()) {
                             connection.rollback();
                         } else {
                             connection.commit();
                         }
+                    }
+                    List<UserChange> changes = session.takeUserChanges();
+                    if (!rolledBack) {
+                        publishUserChanges(stored, target, changes);
                     }
                     session.transaction(false);
                     connection.setAutoCommit(true);
@@ -526,6 +605,7 @@ public class RedshiftDataService implements Resettable {
                     if (!connection.getAutoCommit()) {
                         connection.rollback();
                     }
+                    session.takeUserChanges();
                     session.transaction(false);
                     connection.setAutoCommit(true);
                 }
@@ -827,6 +907,7 @@ public class RedshiftDataService implements Resettable {
             Connection connection = use.connection();
             execution.track(connection);
             BackendSql batchBackend = new RedshiftDataBackendSql(connection, execution);
+            UserChanges userChanges = session == null ? new UserChanges() : session.takeUserChangeState();
             boolean committed = false;
             try {
                 connection.setAutoCommit(false);
@@ -847,7 +928,8 @@ public class RedshiftDataService implements Resettable {
                     sub.updatedAt = now;
                     try {
                         execution.checkCancellation();
-                        runOnConnection(sub, connection, sqls.get(n), parameters, target.spectrum(), execution, false);
+                        publishActivity(parent, target, sqls.get(n));
+                        runBatchEntry(sub, connection, sqls.get(n), parameters, target.spectrum(), execution, userChanges);
                     } catch (SQLException e) {
                         sub.status = RedshiftDataStatementStore.Status.FAILED;
                         sub.error = e.getMessage();
@@ -862,6 +944,9 @@ public class RedshiftDataService implements Resettable {
                             throw e;
                         }
                         connection.rollback();
+                        if (session != null) {
+                            session.takeUserChanges();
+                        }
                         failed = true;
                         break;
                     }
@@ -876,9 +961,17 @@ public class RedshiftDataService implements Resettable {
                 if (!failed) {
                     execution.commit(connection::commit);
                     committed = true;
+                    userChanges.commit();
                     parent.status = RedshiftDataStatementStore.Status.FINISHED;
                 }
             } finally {
+                if (!committed) {
+                    userChanges.rollback();
+                }
+                publishUserChanges(parent, target, userChanges.drainCommitted());
+                if (!committed && session != null) {
+                    session.takeUserChanges();
+                }
                 if (preparation != null) {
                     if (committed) {
                         preparation.finishCycle(batchBackend, true);
@@ -905,6 +998,34 @@ public class RedshiftDataService implements Resettable {
         }
         parent.durationNanos = totalDuration;
         parent.updatedAt = Instant.now();
+    }
+
+    private void runBatchEntry(RedshiftDataStatementStore.StoredStatement sub, Connection connection, String sql,
+                               Map<String, String> parameters, SpectrumSession context,
+                               RedshiftDataExecution execution, UserChanges userChanges)
+            throws SQLException {
+        List<String> commands = RedshiftAuditSql.statements(sql);
+        if (commands.isEmpty()) {
+            runOnConnection(sub, connection, sql, parameters, context, execution, false);
+            return;
+        }
+        long duration = 0;
+        for (int i = 0; i < commands.size(); i++) {
+            // JDBC exposes the first result of an entry; later commands still affect transaction audit state.
+            RedshiftDataStatementStore.StoredStatement result = i == 0 ? sub : new RedshiftDataStatementStore.StoredStatement();
+            try {
+                String command = commands.get(i);
+                if (RedshiftAuditSql.isCommit(command)) {
+                    execution.commit(() -> runOnConnection(result, connection, command, parameters, context, execution, false));
+                } else {
+                    runOnConnection(result, connection, command, parameters, context, execution, false);
+                }
+                userChanges.complete(command);
+            } finally {
+                duration += result.durationNanos;
+                sub.durationNanos = duration;
+            }
+        }
     }
 
     // ── ListStatements ─────────────────────────────────────────────────────

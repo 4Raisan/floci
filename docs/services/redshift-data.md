@@ -61,6 +61,13 @@ connection and its failure rolls it back, including any transaction opened by ea
 calls on that session. Transaction-control modifiers beyond optional `WORK` or `TRANSACTION`
 are rejected before execution. These cross-call transaction details have not been verified against live AWS.
 
+Batch audit records track successful user changes through transaction boundaries and savepoints.
+`ROLLBACK TO` discards changes after the named savepoint, while `RELEASE` keeps them pending until
+commit. A full rollback discards pending changes; changes committed earlier in the batch retain
+their audit records if a later statement fails. Batch entries support transaction-control commands
+and multiple SQL statements. Audit state advances after each successful command, while an entry's
+result metadata preserves its first command's result and its original SQL text.
+
 An omitted keep-alive on a reuse request preserves the previous idle timeout. A supplied value
 replaces it after successful admission, and the idle deadline starts when the query completes.
 Sending 0 with an existing `SessionId` closes the connection after that query. Omitting both

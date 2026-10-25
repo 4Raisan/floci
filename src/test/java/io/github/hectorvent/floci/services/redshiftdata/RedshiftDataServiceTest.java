@@ -311,6 +311,24 @@ class RedshiftDataServiceTest {
     }
 
     @Test
+    void batchParametersBindAcrossCommandsAndSavepointsInOneEntry() {
+        service.executeStatement(req("CREATE TABLE batch_savepoint (id INT)"), REGION);
+        ObjectNode request = batchReq("INSERT INTO batch_savepoint VALUES (:id); SAVEPOINT s; "
+                        + "INSERT INTO batch_savepoint VALUES (:discarded); ROLLBACK TO SAVEPOINT s; COMMIT",
+                "SELECT id FROM batch_savepoint WHERE id = :id");
+        request.putArray("Parameters").addObject().put("name", "id").put("value", "42");
+        request.withArray("Parameters").addObject().put("name", "discarded").put("value", "99");
+
+        String id = service.batchExecuteStatement(request, REGION).path("Id").asText();
+
+        ObjectNode description = service.describeStatement(idOf(id));
+        assertEquals("FINISHED", description.path("Status").asText(), description.toString());
+        assertEquals(42, service.getStatementResult(idOf(id)).path("Records").get(0).get(0).path("longValue").asInt());
+        String count = service.executeStatement(req("SELECT COUNT(*) FROM batch_savepoint"), REGION).path("Id").asText();
+        assertEquals(1, service.getStatementResult(idOf(count)).path("Records").get(0).get(0).path("longValue").asInt());
+    }
+
+    @Test
     void batchParametersRollBackEarlierWritesWhenALaterStatementFails() {
         service.executeStatement(req("CREATE TABLE batch_rollback(id integer)"), REGION);
         ObjectNode request = batchReq("INSERT INTO batch_rollback VALUES (:id)", "INSERT INTO nonexistent VALUES (:id)");
