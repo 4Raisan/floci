@@ -733,6 +733,8 @@ floci:
       enabled: true
       mock: false
       publish-awsvpc-ports-to-host: false
+      dynamic-awsvpc-host-ports: false
+      host-port-bind-address: "127.0.0.1"
       host-volume-roots: []
       allow-unsafe-host-volumes: false
       # Remove the ECS containers a previous run of this deployment left on the daemon before
