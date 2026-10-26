@@ -408,11 +408,6 @@ public class EcrService implements ResourceProvider {
 
     public BatchScanningConfigurationResult batchGetRepositoryScanningConfiguration(
             List<String> repositoryNames, String registryId, String region) {
-        if (repositoryNames == null || repositoryNames.isEmpty()) {
-            return new BatchScanningConfigurationResult(describeRepositories(repositoryNames, registryId, region),
-                    List.of());
-        }
-
         String account = effectiveAccount(registryId);
         List<Repository> repositories = new ArrayList<>();
         List<ScanningConfigurationFailure> failures = new ArrayList<>();
