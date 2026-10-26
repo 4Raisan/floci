@@ -784,25 +784,35 @@ public class ApiGatewayExecuteController {
             return null;
         }
         String connectionId = integration.getConnectionId();
+        if (connectionId != null) {
+            Matcher stageVariable = ApiGatewayService.VPC_LINK_STAGE_VARIABLE.matcher(connectionId);
+            if (stageVariable.matches()) {
+                connectionId = scope.stage().getVariables().get(stageVariable.group(1));
+            }
+        }
         if (connectionId == null || connectionId.isBlank()) {
             return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
                     "VPC_LINK integration is missing a connectionId");
         }
+        String status;
         try {
-            io.github.hectorvent.floci.services.apigateway.model.VpcLink link =
-                    apiGatewayService.getVpcLink(region, connectionId);
-            if (!"AVAILABLE".equalsIgnoreCase(link.getStatus())) {
+            status = apiGatewayService.getVpcLink(region, connectionId).getStatus();
+        } catch (AwsException e) {
+            try {
+                status = apiGatewayV2Service.getVpcLink(region, connectionId).getVpcLinkStatus();
+            } catch (AwsException ignored) {
+                LOG.warnv("VPC_LINK integration references unknown link {0} in {1}", connectionId, region);
                 return Response.status(502)
-                        .entity(jsonMessage("VPC link is not available: " + link.getStatus()))
+                        .entity(jsonMessage("Invalid VPC link identifier specified: " + connectionId))
                         .type(MediaType.APPLICATION_JSON).build();
             }
-            return null;
-        } catch (AwsException e) {
-            LOG.warnv("VPC_LINK integration references unknown link {0} in {1}", connectionId, region);
+        }
+        if (!"AVAILABLE".equalsIgnoreCase(status)) {
             return Response.status(502)
-                    .entity(jsonMessage("Invalid VPC link identifier specified: " + connectionId))
+                    .entity(jsonMessage("VPC link is not available: " + status))
                     .type(MediaType.APPLICATION_JSON).build();
         }
+        return null;
     }
 
     // ──────────────────────────── Binary payloads ────────────────────────────
