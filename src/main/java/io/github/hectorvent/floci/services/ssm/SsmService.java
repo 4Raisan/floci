@@ -52,6 +52,8 @@ public class SsmService implements ResourceProvider {
     private static final String PUBLIC_PARAMETER_PREFIX = "/aws/service/";
     private static final String ECS_AL2023_RECOMMENDED =
             "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended";
+    private static final String ECS_AL2023_ARM64_RECOMMENDED =
+            "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended";
     private static final DateTimeFormatter SOURCE_RESULT_DATE =
             DateTimeFormatter.ofPattern("MMM d, yyyy, h:mm:ss a", Locale.US).withZone(ZoneOffset.UTC);
     static final String SECRET_REFERENCE_PREFIX = "/aws/reference/secretsmanager/";
@@ -564,7 +566,8 @@ public class SsmService implements ResourceProvider {
         }
         return imageCatalog.findByPublicParameterName(name).map(image -> {
             String value = image.imageId;
-            if (ECS_AL2023_RECOMMENDED.equals(name)) {
+            if (name.startsWith(ECS_AL2023_RECOMMENDED)
+                    || name.startsWith(ECS_AL2023_ARM64_RECOMMENDED)) {
                 ObjectNode metadata = JsonNodeFactory.instance.objectNode();
                 metadata.put("schema_version", 1);
                 metadata.put("image_name", image.name);
@@ -573,7 +576,10 @@ public class SsmService implements ResourceProvider {
                 // The catalog image is synthetic; do not claim an installed ECS agent or runtime version.
                 metadata.put("ecs_agent_version", "unknown");
                 metadata.put("ecs_runtime_version", "unknown");
-                value = metadata.toString();
+                String recommendedName = name.startsWith(ECS_AL2023_ARM64_RECOMMENDED)
+                        ? ECS_AL2023_ARM64_RECOMMENDED : ECS_AL2023_RECOMMENDED;
+                value = name.equals(recommendedName) ? metadata.toString()
+                        : metadata.required(name.substring(recommendedName.length() + 1)).asText();
             }
             Parameter parameter = new Parameter(name, value, "String");
             parameter.setArn(AwsArnUtils.Arn.of("ssm", region, "", parameterResource(name)).toString());
