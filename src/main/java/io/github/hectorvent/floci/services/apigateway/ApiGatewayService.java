@@ -80,6 +80,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
@@ -133,9 +134,10 @@ public class ApiGatewayService implements ResourceProvider {
     private final Object domainNameLock = new Object();
     private final Object vpcLinkTagLock = new Object();
     /**
-     * Guards a usage plan patch and delete. A patch writes back the stages, throttle and quota it
-     * read, so two at once would restore one another's stale values, and a delete between its read
-     * and its write would be undone.
+     * Guards a usage plan patch, its delete, the CloudFormation limits replacement, the rollback
+     * restore and the {@code readUsagePlan} read. A patch writes back what it read, so two at once
+     * would restore one another's stale values, and a delete between its read and its write would
+     * be undone.
      */
     private final Object usagePlanLock = new Object();
     private final TlsCertificateManager certificateManager;
@@ -1546,6 +1548,13 @@ public class ApiGatewayService implements ResourceProvider {
                 .orElseThrow(() -> new AwsException("NotFoundException", "Invalid Usage Plan ID specified", 404));
     }
 
+    /** Reads the stored plan under the lock patches hold, so the reader sees one revision of it. */
+    public <T> T readUsagePlan(String region, String usagePlanId, Function<UsagePlan, T> reader) {
+        synchronized (usagePlanLock) {
+            return reader.apply(getUsagePlan(region, usagePlanId));
+        }
+    }
+
     public UsagePlan updateUsagePlan(String region, String usagePlanId, List<Map<String, String>> patchOperations) {
         synchronized (usagePlanLock) {
             UsagePlan plan = getUsagePlan(region, usagePlanId);
@@ -1624,6 +1633,37 @@ public class ApiGatewayService implements ResourceProvider {
         plan.setTags(ReservedTags.stripApiGatewayReservedTags(tags));
         usagePlanStore.put(usagePlanKey(region, usagePlanId), plan);
         return plan;
+    }
+
+    /**
+     * Replaces a usage plan's stages, throttle and quota wholesale. CloudFormation drives them to the
+     * template's desired state on update, as it does tags, so a stage the template dropped has to go.
+     */
+    public UsagePlan replaceUsagePlanLimits(String region, String usagePlanId, UsagePlan.Limits limits) {
+        synchronized (usagePlanLock) {
+            UsagePlan plan = getUsagePlan(region, usagePlanId);
+            plan.applyLimits(limits);
+            usagePlanStore.put(usagePlanKey(region, usagePlanId), plan);
+            return plan;
+        }
+    }
+
+    /**
+     * Sets a usage plan's name, description, stages, throttle, quota and tags to exactly the given
+     * values, a null description included, which no patch can set. It is for putting back the plan
+     * as it was before a failed CloudFormation update changed it.
+     */
+    public UsagePlan restoreUsagePlan(String region, String usagePlanId, String name, String description,
+                                      UsagePlan.Limits limits, Map<String, String> tags) {
+        synchronized (usagePlanLock) {
+            UsagePlan plan = getUsagePlan(region, usagePlanId);
+            plan.setName(name);
+            plan.setDescription(description);
+            plan.applyLimits(limits);
+            plan.setTags(new HashMap<>(tags));
+            usagePlanStore.put(usagePlanKey(region, usagePlanId), plan);
+            return plan;
+        }
     }
 
     public void tagUsagePlan(String region, String usagePlanId, Map<String, String> tags) {
