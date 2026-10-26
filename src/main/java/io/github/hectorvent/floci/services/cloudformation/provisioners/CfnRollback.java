@@ -128,9 +128,11 @@ public final class CfnRollback {
 
     /**
      * Holds the name, description and endpoint configuration a REST API had before an in-place
-     * update patched them, and whether the update also re-applied an OpenAPI document, so a failed
-     * stack update can put them back. Written by {@code ApiGatewayRestApiCfnProvisioner} before its
-     * update call and spent by its {@code rollbackUpdate}.
+     * update patched them, so a failed stack update can put them back, and a {@code body} flag set
+     * once the update's OpenAPI document was applied, which the snapshot cannot undo. Written by
+     * {@code ApiGatewayRestApiCfnProvisioner} before its update call and spent by its
+     * {@code rollbackUpdate}; when its own undo did not complete, the provisioner carries it onto
+     * the restored resource through {@code mergeFailedUpdateResourceTracking}.
      */
     public static final String REST_API_UPDATE_SNAPSHOT_ATTR = "__FlociRestApiUpdateSnapshot";
 
@@ -324,7 +326,9 @@ public final class CfnRollback {
      * deleted again by {@code undoCreate}, a reused one is put back by {@code undoInPlace}, which
      * restores the provisioner's snapshot and is a no-op when there is none. The engine only removes
      * a failed create it can see, and on a failed update it restores the previous resource metadata
-     * and discards the attempted one, snapshot included, so the undo has to happen here.
+     * and discards the attempted one, snapshot included, so the undo has to happen here. A
+     * provisioner whose snapshot a ContinueUpdateRollback still needs after an undo that failed
+     * carries it in {@link CfnResourceProvisioner#mergeFailedUpdateResourceTracking}.
      *
      * <p>A compensation that fails is reported, never hidden. A created entity carries
      * {@link #ROLLBACK_OWNED_ATTR} while the steps run, so the engine's create rollback deletes it
