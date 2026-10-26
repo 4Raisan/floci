@@ -1377,6 +1377,31 @@ class SsmIntegrationTest {
             .body("Parameter.Version", equalTo(1))
             .body("Parameter.ARN", equalTo("arn:aws:ssm:us-east-1::parameter" + eksOptimizedAmi));
 
+        String ecsRecommended = "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended";
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Name": "%s" }
+                """.formatted(ecsRecommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Value", containsString("\"image_id\":\"ami-0abcdef1234567891\""));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameters")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Names": ["%s", "%s/image_id"] }
+                """.formatted(ecsRecommended, ecsRecommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameters.Name", hasItems(ecsRecommended, ecsRecommended + "/image_id"));
+
         given()
             .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
             .contentType(SSM_CONTENT_TYPE)

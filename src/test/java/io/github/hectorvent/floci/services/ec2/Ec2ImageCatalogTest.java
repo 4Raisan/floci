@@ -87,7 +87,9 @@ class Ec2ImageCatalogTest {
                 "/aws/service/eks/optimized-ami/1.33/amazon-linux-2023/x86_64/standard/recommended/image_id",
                 "/aws/service/eks/optimized-ami/1.34/amazon-linux-2023/x86_64/standard/recommended/image_id",
                 "/aws/service/eks/optimized-ami/1.35/amazon-linux-2023/x86_64/standard/recommended/image_id",
-                "/aws/service/eks/optimized-ami/1.36/amazon-linux-2023/x86_64/standard/recommended/image_id"),
+                "/aws/service/eks/optimized-ami/1.36/amazon-linux-2023/x86_64/standard/recommended/image_id",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"),
                 x86.publicParameterNames());
 
         Ec2ImageCatalog.CatalogImage arm64 = imageCatalog.findByIdOrAlias("ami-amazonlinux2023-arm64").orElseThrow();

@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.ssm;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -34,6 +36,8 @@ class SsmServicePublicAmiParameterTest {
             "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64";
     private static final String AMZN2_DEFAULT =
             "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2";
+    private static final String ECS_AL2023_RECOMMENDED =
+            "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended";
 
     private SsmService ssmService;
 
@@ -81,6 +85,28 @@ class SsmServicePublicAmiParameterTest {
     }
 
     @Test
+    void resolvesEcsOptimizedAl2023ImageIdAndRecommendedMetadata() throws Exception {
+        Parameter imageId = ssmService.getParameter(ECS_AL2023_RECOMMENDED + "/image_id", REGION);
+        Parameter metadata = ssmService.getParameter(ECS_AL2023_RECOMMENDED, REGION);
+        JsonNode value = new ObjectMapper().readTree(metadata.getValue());
+
+        assertEquals("ami-0abcdef1234567891", imageId.getValue());
+        assertEquals("String", metadata.getType());
+        assertEquals(1, value.path("schema_version").asInt());
+        assertEquals(imageId.getValue(), value.path("image_id").asText());
+        assertEquals("Amazon Linux 2023", value.path("os").asText());
+        assertEquals("al2023-ami-2023.0.20230315.0-kernel-6.1-x86_64", value.path("image_name").asText());
+        assertEquals("unknown", value.path("ecs_agent_version").asText());
+        assertEquals("unknown", value.path("ecs_runtime_version").asText());
+        assertEquals("arn:aws:ssm:eu-west-1::parameter" + ECS_AL2023_RECOMMENDED, metadata.getArn());
+        assertEquals(List.of(ECS_AL2023_RECOMMENDED, ECS_AL2023_RECOMMENDED + "/image_id"),
+                ssmService.getParametersByPath("/aws/service/ecs/optimized-ami/amazon-linux-2023", true, REGION)
+                        .stream().map(Parameter::getName).toList());
+        assertEquals(2, ssmService.getParameters(
+                List.of(ECS_AL2023_RECOMMENDED, ECS_AL2023_RECOMMENDED + "/image_id"), false, REGION).size());
+    }
+
+    @Test
     void resolvesAPublicParameterByItsArnForAnEcsSecret() {
         String arn = ssmService.getParameter(AL2023_DEFAULT, REGION).getArn();
 
@@ -108,12 +134,12 @@ class SsmServicePublicAmiParameterTest {
         assertTrue(names.contains(AMZN2_DEFAULT), names.toString());
         assertEquals(9, names.size());
         assertTrue(ssmService.getParametersByPath("/aws/service", false, REGION).isEmpty());
-        assertEquals(32, ssmService.getParametersByPath("/aws/service", true, REGION).size());
+        assertEquals(34, ssmService.getParametersByPath("/aws/service", true, REGION).size());
     }
 
     @Test
     void appliesPathTypeFiltersToPublicParameters() {
-        assertEquals(32, ssmService.getParametersByPath("/aws/service", true,
+        assertEquals(34, ssmService.getParametersByPath("/aws/service", true,
                 List.of(new ParameterStringFilter("Type", null, List.of("String"))), REGION).size());
         assertTrue(ssmService.getParametersByPath("/aws/service", true,
                 List.of(new ParameterStringFilter("Type", null, List.of("StringList"))), REGION).isEmpty());
