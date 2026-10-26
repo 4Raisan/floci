@@ -226,20 +226,13 @@ public class EcrJsonHandler {
     }
 
     private Response handleBatchGetRepositoryScanningConfiguration(JsonNode request, String region) {
-        // Scanning configuration is not modeled. Resolve names via describeRepositories
-        // and synthesize a wire-accurate RepositoryScanningConfiguration per repo:
-        // scanFrequency derived from scanOnPush (AWS enum: SCAN_ON_PUSH|CONTINUOUS_SCAN|
-        // MANUAL), with empty appliedScanFilters. Note: real AWS reports unknown repos
-        // in the `failures` array; here describeRepositories throws
-        // RepositoryNotFoundException, failing the whole batch instead.
-        // AWS's request has no registryId, so the repositories are the caller's.
         List<String> names = parseStringList(request.path("repositoryNames"));
-
-        List<Repository> repos = service.describeRepositories(names, null, region);
+        EcrService.BatchScanningConfigurationResult result =
+                service.batchGetRepositoryScanningConfiguration(names, null, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode configs = objectMapper.createArrayNode();
-        for (Repository r : repos) {
+        for (Repository r : result.repositories()) {
             ObjectNode cfg = objectMapper.createObjectNode();
             cfg.put("repositoryArn", r.getRepositoryArn());
             cfg.put("repositoryName", r.getRepositoryName());
@@ -249,7 +242,15 @@ public class EcrJsonHandler {
             configs.add(cfg);
         }
         response.set("scanningConfigurations", configs);
-        response.set("failures", objectMapper.createArrayNode());
+        ArrayNode failures = objectMapper.createArrayNode();
+        for (EcrService.ScanningConfigurationFailure failure : result.failures()) {
+            ObjectNode entry = objectMapper.createObjectNode();
+            entry.put("repositoryName", failure.repositoryName());
+            entry.put("failureCode", failure.failureCode());
+            entry.put("failureReason", failure.failureReason());
+            failures.add(entry);
+        }
+        response.set("failures", failures);
         return Response.ok(response).build();
     }
 

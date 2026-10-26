@@ -400,6 +400,33 @@ public class EcrService implements ResourceProvider {
         return out;
     }
 
+    public record ScanningConfigurationFailure(String repositoryName, String failureCode, String failureReason) {}
+
+    public record BatchScanningConfigurationResult(List<Repository> repositories,
+                                                    List<ScanningConfigurationFailure> failures) {}
+
+    public BatchScanningConfigurationResult batchGetRepositoryScanningConfiguration(
+            List<String> repositoryNames, String registryId, String region) {
+        if (repositoryNames == null || repositoryNames.isEmpty()) {
+            return new BatchScanningConfigurationResult(describeRepositories(repositoryNames, registryId, region),
+                    List.of());
+        }
+
+        String account = effectiveAccount(registryId);
+        List<Repository> repositories = new ArrayList<>();
+        List<ScanningConfigurationFailure> failures = new ArrayList<>();
+        for (String name : repositoryNames) {
+            Optional<Repository> repository = repoStore.get(key(region, account, name));
+            if (repository.isPresent()) {
+                repositories.add(refreshRepositoryUri(repository.get(), region));
+            } else {
+                failures.add(new ScanningConfigurationFailure(name, "REPOSITORY_NOT_FOUND",
+                        notFound(name, account).getMessage()));
+            }
+        }
+        return new BatchScanningConfigurationResult(repositories, failures);
+    }
+
     // ============================================================
     // DeleteRepository
     // ============================================================
