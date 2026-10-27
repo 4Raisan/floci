@@ -1783,6 +1783,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             // 403, the status the Kinesis and CloudWatch common errors give AccessDeniedException.
             return cborError(ctx, "AccessDeniedException", accessDeniedMessage(action), 403);
         }
+        // The route decides the envelope, not the resolved action: a request on an S3 Control
+        // route is S3 Control's however its action reads, and only its ErrorResponse wrapper
+        // reaches the s3control SDK deserializers (issue #557).
+        if (IamActionRegistry.isS3ControlRequest(credentialScope, ctx)) {
+            return s3ControlXmlAccessDenied(accessDeniedMessage(action));
+        }
         return accessDeniedResponse(action, credentialScope, ctx.getMediaType(), resourceArn, protocol);
     }
 
@@ -1860,6 +1866,31 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private static Response s3XmlAccessDenied(String message, String resourcePath) {
         return s3Xml("AccessDenied", message, resourcePath, 403);
+    }
+
+    /**
+     * S3 Control's own access-denied answer, which unlike S3's error body wraps the error in an
+     * {@code <ErrorResponse>} the s3control SDK deserializers read (issue #557): the bare
+     * {@code <Error>} S3 answers with collapses to {@code UnknownError} there, hiding the message
+     * that names the action a caller is missing, which Terraform's AWS provider matches to fall
+     * back from {@code ListTagsForResource} to {@code GetBucketTagging}. The same envelope as
+     * {@code S3ControlController}'s, and no {@code Resource} element: the ARN a tagging route
+     * names is the resource, not a bucket and key.
+     */
+    private static Response s3ControlXmlAccessDenied(String message) {
+        String requestId = UUID.randomUUID().toString();
+        String xml = new XmlBuilder()
+                .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+                .start("ErrorResponse", AwsNamespaces.S3_CONTROL)
+                .start("Error")
+                .elem("Code", "AccessDenied")
+                .elem("Message", message)
+                .elem("RequestId", requestId)
+                .end("Error")
+                .elem("RequestId", requestId)
+                .end("ErrorResponse")
+                .build();
+        return Response.status(403).type(MediaType.APPLICATION_XML).entity(xml).build();
     }
 
     private static Response s3Xml(String code, String message, String resourcePath, int status) {
