@@ -1663,6 +1663,7 @@ public class DynamoDbService {
         // that you have reached the end of the result set").
         final int MAX_RESPONSE_BYTES = 1024 * 1024;
         int accSize = 0;
+        long billedBytes = 0;
         int included = -1; // index one past the last included item; -1 = no boundary hit
         for (int i = 0; i < evaluatedItems.size(); i++) {
             int sz = readItemSize(evaluatedItems.get(i), accessPath, table);
@@ -1671,6 +1672,7 @@ public class DynamoDbService {
                 break;
             }
             accSize += sz;
+            billedBytes += billedReadSize(evaluatedItems.get(i), accessPath, table, sz);
             if (limit != null && limit > 0 && i + 1 >= limit) {
                 included = i + 1; // the Limit cap stops the read AFTER this item
                 break;
@@ -1693,7 +1695,7 @@ public class DynamoDbService {
 
         LOG.tracev("Query on {0}: returned={1} scanned={2}",
                 canonicalTableName, evaluatedItems.size(), scannedCount);
-        return new QueryResult(evaluatedItems, scannedCount, accSize, lastEvaluatedKey, scannedItems);
+        return new QueryResult(evaluatedItems, scannedCount, billedBytes, lastEvaluatedKey, scannedItems);
     }
 
     public ScanResult scan(String tableName, String filterExpression,
@@ -1748,6 +1750,7 @@ public class DynamoDbService {
         final int MAX_RESPONSE_BYTES = 1024 * 1024;
         int totalScanned = 0;
         int accSize = 0;
+        long billedBytes = 0;
         List<JsonNode> results = new ArrayList<>();
         List<JsonNode> scannedItems = new ArrayList<>();
         JsonNode lastEvaluatedKey = null;
@@ -1780,6 +1783,7 @@ public class DynamoDbService {
                 break;
             }
             accSize += sz;
+            billedBytes += billedReadSize(item, accessPath, table, sz);
             totalScanned++;
             scannedItems.add(item);
             lastScanned = item;
@@ -1802,7 +1806,7 @@ public class DynamoDbService {
 
         LOG.tracev("Scan on {0}: returned={1} scanned={2}",
                 canonicalTableName, results.size(), totalScanned);
-        return new ScanResult(results, totalScanned, accSize, lastEvaluatedKey, scannedItems);
+        return new ScanResult(results, totalScanned, billedBytes, lastEvaluatedKey, scannedItems);
     }
 
     // A read served by a KEYS_ONLY or INCLUDE index is sized on the projection the
@@ -1814,6 +1818,13 @@ public class DynamoDbService {
         }
         return DynamoDbItemSize.calculateItemSize(ProjectionEvaluator.trimToAttributes(
                 (ObjectNode) item, accessPath.projectedAttributeNames(table)));
+    }
+
+    // The 1 MB page counts the size above. The bill of a base table read counts a vector
+    // attribute at its billed size, while an index read is billed on the copy the index holds.
+    private static long billedReadSize(JsonNode item, DynamoDbAccessPath accessPath, TableDefinition table,
+                                       int readSize) {
+        return accessPath.isIndex() ? readSize : DynamoDbItemSize.billedItemSize(table, item, readSize);
     }
 
     public boolean matchesScanFilterPublic(JsonNode item, JsonNode scanFilter) {
@@ -2151,14 +2162,14 @@ public class DynamoDbService {
             }
             JsonNode oldItem = oldImages.get(i);
             JsonNode newItem = newImages.get(i);
+            TableDefinition table = requireActiveTable(participant.storageKey());
             DynamoDbWriteCapacity.Cost cost;
             if (replay) {
-                cost = DynamoDbTransactCapacity.read(oldItem, newItem);
+                cost = DynamoDbTransactCapacity.read(table, oldItem, newItem);
             } else if (transactItems.get(i).has("ConditionCheck")) {
-                cost = DynamoDbTransactCapacity.conditionCheck(oldItem);
+                cost = DynamoDbTransactCapacity.conditionCheck(table, oldItem);
             } else {
-                cost = DynamoDbTransactCapacity.write(
-                        requireActiveTable(participant.storageKey()), oldItem, newItem);
+                cost = DynamoDbTransactCapacity.write(table, oldItem, newItem);
             }
             byTable.merge(participant.tableName(), cost, DynamoDbWriteCapacity.Cost::plus);
         }
@@ -2429,7 +2440,8 @@ public class DynamoDbService {
                 try {
                     JsonNode item = getItem(tableName, key, region);
                     results.add(projectTransactGet(item, get));
-                    capacity.merge(canonicalTableName(region, tableName), DynamoDbTransactCapacity.read(item, null),
+                    capacity.merge(canonicalTableName(region, tableName),
+                            DynamoDbTransactCapacity.read(requireTableForItemCall(tableName, region), item, null),
                             DynamoDbWriteCapacity.Cost::plus);
                     cancelReasons.add(new TransactionCanceledException.CancellationReason("", null));
                 } catch (AwsException e) {
