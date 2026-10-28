@@ -34,6 +34,8 @@
 # tools/aws/regen_emr_serverless_shapes.py.
 # src/test/resources/aws/rest-routes.json, the REST routes IamRestRouteCoverageTest checks, is
 # generated from botocore's models by tools/aws/regen_rest_routes.py.
+# src/main/resources/aws/iam-paginators.json, what each paged IAM list pages by, is generated
+# from botocore's IAM model and paginators by tools/aws/regen_iam_paginators.py.
 
 PYTHON ?= python3
 
@@ -245,6 +247,7 @@ aws-data-sync: ## Regenerate src/main/resources/aws/*.json and the IAM managed-p
 	$(PYTHON) tools/aws/regen_emr_serverless_shapes.py
 	$(PYTHON) tools/aws/regen_query_services.py
 	$(PYTHON) tools/aws/regen_rest_routes.py
+	$(PYTHON) tools/aws/regen_iam_paginators.py
 	$(PYTHON) tools/aws/regen_managed_policies.py
 
 aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
@@ -331,6 +334,12 @@ aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
 	@$(PYTHON) tools/aws/regen_rest_routes.py --check || { \
 		echo ""; \
 		echo "error: src/test/resources/aws/rest-routes.json is out of date."; \
+		echo "       Run 'make aws-data-sync' and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_iam_paginators.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/iam-paginators.json is out of date."; \
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}

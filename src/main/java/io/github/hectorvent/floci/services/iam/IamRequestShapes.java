@@ -17,7 +17,10 @@ import jakarta.ws.rs.core.MultivaluedMap;
  * came first, with {@code AttachRolePolicy} and {@code DetachRolePolicy} as the exception and the
  * parity case, {@code IamService.validateRoleName} already answering {@code roleName} in the same
  * form. {@code GetAccountAuthorizationDetails} is the first read through the list walk, its
- * {@code Filter}, {@code MaxItems} and {@code Marker} having been read by nothing at all.
+ * {@code Filter}, {@code MaxItems} and {@code Marker} having been read by nothing at all. Every
+ * other paged operation follows, so {@code MaxItems} and {@code Marker} are held to the model here
+ * rather than by the paging itself; six of them carry only those two members, the rest of their
+ * request being answered by hand or nested past what the walk reads.
  */
 final class IamRequestShapes {
 
