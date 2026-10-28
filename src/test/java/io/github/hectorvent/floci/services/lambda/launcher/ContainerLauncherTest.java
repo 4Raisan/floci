@@ -333,6 +333,30 @@ class ContainerLauncherTest {
                         .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
     }
 
+    @ParameterizedTest
+    @CsvSource({"JSON, DEBUG, DEBUG", "JSON, , INFO", "Text, , "})
+    void launchPassesTheLoggingConfigToTheRuntime(String logFormat, String level, String runtimeLevel) {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("logging-config-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("python3.13");
+        fn.setHandler("fn.handler");
+        fn.setLogFormat(logFormat);
+        fn.setApplicationLogLevel(level);
+
+        launcher.launch(fn);
+
+        List<String> expected = new ArrayList<>(List.of("AWS_LAMBDA_LOG_FORMAT=" + logFormat));
+        if (runtimeLevel != null) {
+            expected.add("AWS_LAMBDA_LOG_LEVEL=" + runtimeLevel);
+        }
+        assertEquals(expected,
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_LOG_FORMAT=")
+                                || value.startsWith("AWS_LAMBDA_LOG_LEVEL="))
+                        .toList());
+    }
+
     @Test
     void launchFunction_hotReloadMountsTheHostDirectoryReadOnlyAtVarTask() {
         LambdaFunction fn = new LambdaFunction();

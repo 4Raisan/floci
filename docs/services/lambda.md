@@ -978,6 +978,11 @@ exist, and `AWS_LAMBDA_LOG_GROUP_NAME` names that group. Once a group is named, 
 functions can share, each stream's name carries the function's name, as on AWS:
 `2026/10/16/my-fn[$LATEST]<id>` rather than the default group's `2026/10/16/[$LATEST]<id>`.
 
+The execution environment gets `AWS_LAMBDA_LOG_FORMAT` from `LogFormat` and, under `LogFormat=JSON`,
+`AWS_LAMBDA_LOG_LEVEL` from `ApplicationLogLevel` (`INFO` when unset, the level the API reports).
+The runtime interface clients read both: a Python function writes each record as a JSON object,
+`extra` keys included, and drops records under the level.
+
 `DurableConfig` requires `ExecutionTimeout` on create. A durable function created without
 a `Timeout` gets `min(ExecutionTimeout, 900)`. It always logs in JSON format, and
 `LogFormat: Text` is rejected. On update the members are merged, and a function created
