@@ -66,7 +66,7 @@ public class CloudFrontController {
         try {
             DistributionConfig config = parseDistributionConfig(body);
             Map<String, String> tags = new LinkedHashMap<>();
-            if (withTags != null) {
+            if (withTags != null || "DistributionConfigWithTags".equals(XmlParser.rootElementName(body))) {
                 tags = parseTags(body);
             }
             Distribution dist = new Distribution();

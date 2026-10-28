@@ -218,7 +218,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
             dist.setEtag(UUID.randomUUID().toString());
             if (tags != null && !tags.isEmpty()) {
                 dist.setTags(tags);
-                tagStore.put("distribution/" + id, tags);
+                tagStore.put(dist.getArn(), tags);
             }
             distStore.put(id, dist);
             return dist;
@@ -443,6 +443,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
         }
         distStore.delete(id);
         invalidationStore.delete(id);
+        tagStore.delete(existing.getArn());
         tagStore.delete("distribution/" + id);
     }
 
@@ -452,8 +453,12 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
      * which owns the resource lifecycle at the stack level.
      */
     public synchronized void removeDistribution(String id) {
+        Distribution existing = distStore.get(id).orElse(null);
         distStore.delete(id);
         invalidationStore.delete(id);
+        if (existing != null) {
+            tagStore.delete(existing.getArn());
+        }
         tagStore.delete("distribution/" + id);
     }
 

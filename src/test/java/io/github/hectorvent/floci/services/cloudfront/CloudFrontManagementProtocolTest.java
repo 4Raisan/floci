@@ -49,6 +49,49 @@ class CloudFrontManagementProtocolTest {
                     "http://cloudfront.amazonaws.com/doc/2020-05-31/")));
     }
 
+    @Test
+    void distributionCreatedWithTagsReturnsThemByArn() {
+        String body = """
+                <DistributionConfigWithTags xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">
+                  <DistributionConfig>
+                    <CallerReference>%s</CallerReference>
+                    <Enabled>false</Enabled>
+                    <Origins><Quantity>1</Quantity><Items><Origin>
+                      <Id>origin</Id><DomainName>example.com</DomainName>
+                      <CustomOriginConfig>
+                        <HTTPPort>80</HTTPPort><HTTPSPort>443</HTTPSPort>
+                        <OriginProtocolPolicy>http-only</OriginProtocolPolicy>
+                      </CustomOriginConfig>
+                    </Origin></Items></Origins>
+                    <DefaultCacheBehavior>
+                      <TargetOriginId>origin</TargetOriginId>
+                      <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>
+                    </DefaultCacheBehavior>
+                  </DistributionConfig>
+                  <Tags><Items><Tag><Key>env</Key><Value>dev</Value></Tag></Items></Tags>
+                </DistributionConfigWithTags>
+                """.formatted(UUID.randomUUID());
+
+        Response created = given().contentType("application/xml").body(body)
+                .when().post(API + "distribution?WithTags");
+        created.then().statusCode(201);
+        String xml = created.asString();
+        String arn = XmlParser.extractFirst(xml, "ARN", null);
+        String id = XmlParser.extractFirst(xml, "Id", null);
+
+        try {
+            given().queryParam("Resource", arn)
+                    .when().get(API + "tagging")
+                    .then().statusCode(200)
+                    .body(hasXPath("//*[local-name()='Tag']/*[local-name()='Key']/text()", equalTo("env")))
+                    .body(hasXPath("//*[local-name()='Tag']/*[local-name()='Value']/text()", equalTo("dev")));
+        } finally {
+            given().header("If-Match", created.header("ETag"))
+                    .when().delete(API + "distribution/" + id)
+                    .then().statusCode(204);
+        }
+    }
+
     @ParameterizedTest(name = "{0} omits unmodeled Marker and IsTruncated members")
     @ValueSource(strings = {
             "cache-policy",
