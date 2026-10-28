@@ -34,6 +34,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -449,13 +450,21 @@ final class CognitoAuthFlowHandler {
                 if (!state.secret().equals(user.getSoftwareTokenMfaSecret())) {
                     throw new AwsException("NotAuthorizedException", "Software token is not verified", 400);
                 }
-            } else if (!state.secret().equals(user.getSoftwareTokenMfaSecret())
-                    || !CognitoTotp.validCode(state.secret(),
-                    responses.get("SOFTWARE_TOKEN_MFA_CODE"), clock.instant())) {
-                if (state.failedAttempts().incrementAndGet() >= CognitoTotp.MAX_FAILED_ATTEMPTS) {
-                    totpSessions.remove(session, state);
+            } else {
+                OptionalLong step = state.secret().equals(user.getSoftwareTokenMfaSecret())
+                        ? CognitoTotp.matchingStep(state.secret(), responses.get("SOFTWARE_TOKEN_MFA_CODE"),
+                                clock.instant())
+                        : OptionalLong.empty();
+                if (step.isEmpty()) {
+                    countFailedTotpAttempt(session, state);
+                    throw new AwsException("CodeMismatchException",
+                            "Invalid verification code provided, please try again.", 400);
                 }
-                throw new AwsException("CodeMismatchException", "Invalid verification code provided, please try again.", 400);
+                if (!service.consumeSoftwareTokenStep(pool.getId(), user.getUsername(), step.getAsLong())) {
+                    countFailedTotpAttempt(session, state);
+                    throw new AwsException("ExpiredCodeException",
+                            "Your software token has already been used once.", 400);
+                }
             }
             if (!totpSessions.remove(session, state)) {
                 throw new AwsException("NotAuthorizedException", "Session not found", 400);
@@ -467,6 +476,12 @@ final class CognitoAuthFlowHandler {
         Map<String, String> metadata = clientMetadata != null && !clientMetadata.isEmpty()
                 ? clientMetadata : state.clientMetadata();
         return authenticationResult(pool, client, user, state.triggerSource(), metadata);
+    }
+
+    private void countFailedTotpAttempt(String session, TotpSession state) {
+        if (state.failedAttempts().incrementAndGet() >= CognitoTotp.MAX_FAILED_ATTEMPTS) {
+            totpSessions.remove(session, state);
+        }
     }
 
     private Map<String, Object> processChallenge(UserPool pool, UserPoolClient client, String challengeName,

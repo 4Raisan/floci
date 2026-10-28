@@ -364,6 +364,10 @@ requires a fresh code in `SOFTWARE_TOKEN_MFA_CODE`. Its `ChallengeParameters` ca
 `USER_ID_FOR_SRP`, the user's actual username rather than an alias (the `sub` in a pool
 with `UsernameAttributes`), to send back as `USERNAME` and to compute `SECRET_HASH` from,
 plus `FRIENDLY_DEVICE_NAME` when `VerifySoftwareToken` was given a `FriendlyDeviceName`.
+As on AWS, a code is accepted for one `SOFTWARE_TOKEN_MFA` challenge only: answering
+another with a code from the same 30-second step, or an earlier one, fails with
+`ExpiredCodeException` (`Your software token has already been used once.`) until the
+authenticator shows its next code. The code given to `VerifySoftwareToken` is not counted.
 Both token-management actions also accept an access token for an already authenticated
 user. Sessions expire with the app client's `AuthSessionValidity` and cannot be replayed
 after completion.
