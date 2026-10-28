@@ -1699,6 +1699,8 @@ public class Ec2QueryHandler {
         String cidrBlock = p.getFirst("CidrBlock");
         boolean amazonProvidedIpv6 = "true".equalsIgnoreCase(p.getFirst("AmazonProvidedIpv6CidrBlock"));
         List<Tag> vpcTags = parseTagsForResource(p, "vpc");
+        // Answered before Ec2Service checks the CIDR block and the tenancy, an order AWS does not document.
+        checkDryRun(p);
         Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6, p.getFirst("InstanceTenancy"));
         applyResourceTags(vpcTags, region, vpc.getVpcId());
         XmlBuilder xml = new XmlBuilder()
@@ -3324,6 +3326,10 @@ public class Ec2QueryHandler {
         String azId = p.getFirst("AvailabilityZoneId");
         String ipv6CidrBlock = p.getFirst("Ipv6CidrBlock");
         List<Tag> tags = parseTagsForResource(p, "subnet", Set.of("subnet"));
+        // A dry run needs the VPC to exist and is answered before the CIDR, zone and overlap checks.
+        requireParameter(p, "VpcId");
+        service.requireVpc(region, vpcId);
+        checkDryRun(p);
         Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock);
         try {
             if (!tags.isEmpty()) {
@@ -3402,6 +3408,9 @@ public class Ec2QueryHandler {
         String groupName = requireParameter(p, "GroupName");
         String description = requireParameter(p, "GroupDescription");
         String vpcId = p.getFirst("VpcId");
+        // A dry run needs the (default) VPC to exist and is answered before the taken-name check.
+        service.requireSecurityGroupVpc(region, vpcId);
+        checkDryRun(p);
         SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId);
         applyResourceTags(resourceTags, region, sg.getGroupId());
         XmlBuilder xml = new XmlBuilder()
