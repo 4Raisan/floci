@@ -4225,7 +4225,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         inst.setRootDeviceName(rootDeviceName);
                         for (LaunchVolume planned : launchVolumes) {
                             Volume volume = newVolume(region, az, planned.volumeType(), planned.size(),
-                                    planned.encrypted(), planned.iops(), planned.throughput(), planned.snapshotId());
+                                    planned.encrypted(), planned.kmsKeyId(), planned.iops(), planned.throughput(),
+                                    planned.snapshotId());
                             volume.setState("in-use");
                             VolumeAttachment attachment = new VolumeAttachment();
                             attachment.setVolumeId(volume.getVolumeId());
@@ -8677,7 +8678,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** One EBS volume a launch creates, settled before anything of the launch is stored. */
     private record LaunchVolume(String deviceName, String snapshotId, int size, String volumeType,
-                                int iops, Integer throughput, boolean encrypted, boolean deleteOnTermination) {}
+                                int iops, Integer throughput, boolean encrypted, String kmsKeyId,
+                                boolean deleteOnTermination) {}
 
     /**
      * The EBS volumes a launch creates, one per device: the AMI's block device mappings with the
@@ -8766,7 +8768,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Integer throughput = "gp3".equals(volumeType) ? ebs.getThroughput() : null;
             planned.add(new LaunchVolume(mapping.getDeviceName(), snapshotId, size, volumeType, iops, throughput,
                     Boolean.TRUE.equals(ebs.getEncrypted()) || snapshot != null && snapshot.isEncrypted(),
-                    !Boolean.FALSE.equals(ebs.getDeleteOnTermination())));
+                    ebs.getKmsKeyId(), !Boolean.FALSE.equals(ebs.getDeleteOnTermination())));
         }
         return planned;
     }
@@ -13534,11 +13536,36 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return ebsEncryptionService != null && ebsEncryptionService.getEbsEncryptionByDefault(region);
     }
 
+    /**
+     * The KMS key a volume encrypted without one gets: the region's default EBS key, read when the
+     * volume is created, so a later ModifyEbsDefaultKmsKeyId leaves the volume's key alone, as on AWS.
+     */
+    private String ebsDefaultKmsKeyId(String region) {
+        return ebsEncryptionService != null ? ebsEncryptionService.getEbsDefaultKmsKeyId(region)
+                : Ec2EbsEncryptionService.AWS_MANAGED_KEY_ALIAS;
+    }
+
+    /** Creates a volume without naming a KMS key, so an encrypted one gets the region's default. */
     public Volume createVolume(String region, String availabilityZone, String volumeType,
                                int size, boolean encrypted, int iops, Integer throughput,
                                String snapshotId, List<Tag> volumeTags) {
+        return createVolume(region, availabilityZone, volumeType, size, encrypted, null, iops, throughput,
+                snapshotId, volumeTags);
+    }
+
+    /**
+     * Creates a volume with the KMS key CreateVolume names. An encrypted volume keeps that key as
+     * given, a key id, key ARN, alias name or alias ARN, without checking it against KMS, as the
+     * region's default EBS key is not checked; AWS itself checks it only after answering. An
+     * encrypted volume that names no key gets the region's default, and a volume that is not
+     * encrypted has no key.
+     */
+    public Volume createVolume(String region, String availabilityZone, String volumeType,
+                               int size, boolean encrypted, String kmsKeyId, int iops, Integer throughput,
+                               String snapshotId, List<Tag> volumeTags) {
         ensureDefaultResources(region);
-        Volume vol = newVolume(region, availabilityZone, volumeType, size, encrypted, iops, throughput, snapshotId);
+        Volume vol = newVolume(region, availabilityZone, volumeType, size, encrypted, kmsKeyId, iops, throughput,
+                snapshotId);
         String volumeId = vol.getVolumeId();
         if (volumeTags != null) {
             vol.setTags(new ArrayList<>(volumeTags));
@@ -13554,10 +13581,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * A new, unattached volume record, not yet stored, with the defaults CreateVolume and a
-     * launch's block device mappings share.
+     * launch's block device mappings share. An encrypted volume keeps {@code kmsKeyId}, or gets
+     * the region's default key when it names none; a volume that is not encrypted has no key.
      */
     private Volume newVolume(String region, String availabilityZone, String volumeType, int size,
-                             boolean encrypted, int iops, Integer throughput, String snapshotId) {
+                             boolean encrypted, String kmsKeyId, int iops, Integer throughput,
+                             String snapshotId) {
         String effectiveType = volumeType != null ? volumeType : "gp2";
         Volume vol = new Volume();
         vol.setVolumeId("vol-" + randomHex(17));
@@ -13567,6 +13596,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // With encryption by default on, AWS encrypts every new volume and the Encrypted parameter
         // cannot opt out of it.
         vol.setEncrypted(encrypted || ebsEncryptionByDefault(region));
+        if (vol.isEncrypted()) {
+            vol.setKmsKeyId(kmsKeyId != null && !kmsKeyId.isBlank() ? kmsKeyId : ebsDefaultKmsKeyId(region));
+        }
         vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
         // Throughput is a gp3-only attribute; AWS reports 125 MiB/s by default for gp3.
         if ("gp3".equals(effectiveType)) {
