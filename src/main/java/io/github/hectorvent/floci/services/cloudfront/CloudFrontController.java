@@ -894,7 +894,7 @@ public class CloudFrontController {
             }
             CloudFrontFunction fn = parseFunction(body);
             fn = service.updateFunction(name, ifMatch, fn);
-            return Response.ok(xmlFunctionResponse(fn), XML).header("ETag", fn.getEtag()).build();
+            return Response.ok(xmlFunctionResponse(fn), XML).header("ETtag", fn.getEtag()).build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
         }
