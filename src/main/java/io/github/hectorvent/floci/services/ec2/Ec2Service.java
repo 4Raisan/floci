@@ -8155,9 +8155,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private boolean sameProtocolAndPorts(IpPermission a, IpPermission b) {
-        return Objects.equals(a.getIpProtocol(), b.getIpProtocol())
-                && Objects.equals(a.getFromPort(), b.getFromPort())
-                && Objects.equals(a.getToPort(), b.getToPort());
+        String protocol = SecurityGroupPolicy.normalizeProtocol(a.getIpProtocol());
+        if (!Objects.equals(protocol, SecurityGroupPolicy.normalizeProtocol(b.getIpProtocol()))) {
+            return false;
+        }
+        // "All traffic" has no ports, and AWS ignores any a request names: Terraform's
+        // aws_security_group revokes the default egress rule as -1 with FromPort=0, ToPort=0.
+        return "-1".equals(protocol)
+                || (Objects.equals(a.getFromPort(), b.getFromPort()) && Objects.equals(a.getToPort(), b.getToPort()));
     }
 
     private boolean hasSources(IpPermission perm) {

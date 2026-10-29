@@ -6388,6 +6388,39 @@ class Ec2ServiceTest {
         assertEquals(1, rules.stream().filter(r -> "2001:db8:1::/64".equals(r.getCidrIpv6())).count());
     }
 
+    /**
+     * Terraform's aws_security_group revokes AWS's default allow-all egress rule as {@code -1} with
+     * {@code FromPort=0, ToPort=0}. The revoke compared ports literally, never matched the stored rule
+     * (which has none), and every new group kept allowing all egress.
+     */
+    @Test
+    void revokingAllTrafficIgnoresThePortsTheRequestNames() {
+        Ec2Service service = mockModeService();
+        String vpcId = service.createVpc("us-east-1", "10.74.0.0/16", false).getVpcId();
+        String groupId = service.createSecurityGroup("us-east-1", "tf", "x", vpcId).getGroupId();
+
+        service.revokeSecurityGroupEgress("us-east-1", groupId, List.of(cidrPermission("-1", 0, 0)));
+
+        assertTrue(service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissionsEgress().isEmpty(), "the default allow-all egress is gone");
+    }
+
+    @Test
+    void portsStillMatterForOtherProtocols() {
+        Ec2Service service = mockModeService();
+        String vpcId = service.createVpc("us-east-1", "10.76.0.0/16", false).getVpcId();
+        String groupId = service.createSecurityGroup("us-east-1", "tf", "x", vpcId).getGroupId();
+        service.authorizeSecurityGroupIngress("us-east-1", groupId, List.of(cidrPermission("tcp", 22, 22)));
+
+        service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(cidrPermission("tcp", 0, 0)));
+        assertEquals(1, service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissions().size(), "port 0 is not port 22");
+
+        service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(cidrPermission("6", 22, 22)));
+        assertTrue(service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissions().isEmpty(), "protocol 6 is tcp");
+    }
+
     /** Ingress only: createSecurityGroup seeds a default allow-all egress rule. */
     private static List<String> ingressRuleIds(Ec2Service service, String groupId) {
         return service.describeSecurityGroupRules("us-east-1", List.of(groupId), List.of())
@@ -6421,6 +6454,15 @@ class Ec2ServiceTest {
         perm.setIpProtocol("tcp");
         perm.setFromPort(443);
         perm.setToPort(443);
+        return perm;
+    }
+
+    private static IpPermission cidrPermission(String protocol, int fromPort, int toPort) {
+        IpPermission perm = new IpPermission();
+        perm.setIpProtocol(protocol);
+        perm.setFromPort(fromPort);
+        perm.setToPort(toPort);
+        perm.getIpRanges().add(new IpRange("0.0.0.0/0", null));
         return perm;
     }
 
