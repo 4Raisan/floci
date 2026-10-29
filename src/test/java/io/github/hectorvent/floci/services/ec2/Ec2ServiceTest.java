@@ -142,6 +142,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -348,6 +349,84 @@ class Ec2ServiceTest {
         assertEquals(1, mockingDetails(service).getInvocations().stream()
                 .filter(invocation -> invocation.getMethod().getName().equals("instanceVolumeAttachments"))
                 .count());
+    }
+
+    @Test
+    void describeInstancesScansTheAddressesOnceWhateverTheInstanceCount() {
+        AccountAwareStorageBackend<Address> addressStore = spy(AccountAwareStorageBackend.<Address>inMemory("000000000000"));
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-addresses.json", addressStore)));
+        List<Instance> launched = service.runInstances("us-east-1", "ami-test", "t3.micro", 3, 3, null, List.of(),
+                null, null, List.of(), null, null).getInstances();
+        Address elastic = service.allocateAddress("us-east-1");
+        service.associateAddress("us-east-1", elastic.getAllocationId(), launched.get(1).getInstanceId());
+        Ec2QueryHandler handler = new Ec2QueryHandler(service, mock(EmulatorConfig.class),
+                mock(FlowLogService.class), mock(Ec2EbsEncryptionService.class),
+                mock(Ec2SnapshotBlockPublicAccessService.class), mock(Ec2IpamService.class),
+                new RegionResolver("us-east-1", "000000000000"));
+        // The first read settles the pending launches, which reads the addresses once per launch.
+        handler.handle("DescribeInstances", new MultivaluedHashMap<>(), "us-east-1");
+        clearInvocations(addressStore);
+
+        Response response = handler.handle("DescribeInstances", new MultivaluedHashMap<>(), "us-east-1");
+
+        assertEquals(200, response.getStatus());
+        String xml = response.getEntity().toString();
+        assertTrue(xml.contains("<association><publicIp>" + elastic.getPublicIp() + "</publicIp>"), xml);
+        verify(addressStore, times(1)).scan(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"kept", "disassociated", "reassigned"})
+    void anIndexReadBeforeAnElasticIpMovedShowsItOnlyWhereItStillIs(String change) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        List<Instance> launched = service.runInstances("us-east-1", "ami-test", "t3.micro", 2, 2, null, List.of(),
+                null, null, List.of(), null, null).getInstances();
+        String formerId = launched.get(0).getInstanceId();
+        String newOwnerId = launched.get(1).getInstanceId();
+        String allocationId = service.allocateAddress("us-east-1").getAllocationId();
+        String associationId = service.associateAddress("us-east-1", allocationId, formerId).getAssociationId();
+        Ec2Service.ElasticAddresses read = service.elasticAddresses("us-east-1");
+
+        if ("reassigned".equals(change)) {
+            service.associateAddress("us-east-1", allocationId, newOwnerId);
+        } else if ("disassociated".equals(change)) {
+            service.disassociateAddress("us-east-1", associationId);
+        }
+
+        Address live = service.describeAddresses("us-east-1", List.of(allocationId), Map.of()).getFirst();
+        Instance former = describedInstance(service, formerId);
+        NetworkInterfaceAssociation shown = service.instanceInterfaceAssociation(former,
+                former.getNetworkInterfaces().getFirst(), read);
+        if ("kept".equals(change)) {
+            assertNotNull(shown, "the instance still holding the Elastic IP shows no association");
+            assertEquals(allocationId, shown.getAllocationId());
+            assertEquals(associationId, shown.getAssociationId());
+            assertEquals(live.getPublicIp(), shown.getPublicIp());
+            return;
+        }
+        assertTrue(shown == null || !allocationId.equals(shown.getAllocationId()),
+                "the former instance still shows " + allocationId);
+        if ("reassigned".equals(change)) {
+            // Known limit: the index was read before the move, so the new owner is not found in it
+            // and shows its public address (the Elastic IP's) as an automatic one, owned by "amazon".
+            Instance newOwner = describedInstance(service, newOwnerId);
+            NetworkInterfaceAssociation moved = service.instanceInterfaceAssociation(newOwner,
+                    newOwner.getNetworkInterfaces().getFirst(), read);
+            assertNotNull(moved);
+            assertNull(moved.getAllocationId());
+            assertEquals("amazon", moved.getIpOwnerId());
+            assertEquals(live.getPublicIp(), moved.getPublicIp());
+            assertEquals(newOwner.getPublicIpAddress(), moved.getPublicIp());
+        }
+    }
+
+    private static Instance describedInstance(Ec2Service service, String instanceId) {
+        return service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                .getFirst().getInstances().getFirst();
     }
 
     @Test

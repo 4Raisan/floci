@@ -525,16 +525,17 @@ public class Ec2ContainerManager {
 
                 refreshMetadataAddresses(instance, containerId);
 
-                if (!markRunning(instance)) {
-                    failLaunch(instance, leasedPrivateIp);
-                    return;
-                }
-
                 // Set public-facing addresses only for instances due one, by the rule mock instances
                 // follow too, or holding an Elastic IP their interface carries, which RunInstances
                 // recorded. Private-subnet instances have no public IP/DNS, matching real EC2.
                 if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, false)) {
                     exposeReachablePublicAddress(instance);
+                }
+
+                // Published before the state flips, so a poller that sees running never sees it without the address.
+                if (!markRunning(instance)) {
+                    failLaunch(instance, leasedPrivateIp);
+                    return;
                 }
 
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
@@ -740,6 +741,9 @@ public class Ec2ContainerManager {
         String containerIp;
         boolean alreadyCleaned;
         synchronized (instance) {
+            // A launch cancelled after its address was published must not keep it.
+            instance.setPublicIpAddress(null);
+            instance.setPublicDnsName(null);
             alreadyCleaned = isLaunchCancelledState(instance)
                     && instance.getDockerContainerId() == null
                     && instance.getSshHostPort() <= 0
