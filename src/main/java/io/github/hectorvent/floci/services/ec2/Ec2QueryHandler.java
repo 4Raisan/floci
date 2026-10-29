@@ -5255,14 +5255,14 @@ public class Ec2QueryHandler {
             }
             xml.end("groupSet");
             // The provider derives associate_public_ip_address from the presence of this element.
+            // AWS repeats it on the primary private address, the only one this set renders.
             NetworkInterfaceAssociation association = service.instanceInterfaceAssociation(inst, eni, elasticAddresses);
-            if (association != null) {
-                xml.start("association")
-                        .elem("publicIp", association.getPublicIp())
-                        .elem("publicDnsName", inst.getPublicDnsName())
-                        .elem("ipOwnerId", association.getIpOwnerId())
-                        .end("association");
-            }
+            String associationXml = association == null ? "" : new XmlBuilder().start("association")
+                    .elem("publicIp", association.getPublicIp())
+                    .elem("publicDnsName", inst.getPublicDnsName())
+                    .elem("ipOwnerId", association.getIpOwnerId())
+                    .end("association").build();
+            xml.raw(associationXml);
             xml.start("attachment")
                     .elem("attachmentId", eni.getAttachmentId())
                     .elem("deviceIndex", String.valueOf(eni.getDeviceIndex()))
@@ -5277,6 +5277,7 @@ public class Ec2QueryHandler {
                     .elem("privateIpAddress", eni.getPrivateIpAddress())
                     .elem("privateDnsName", eni.getPrivateDnsName())
                     .elem("primary", "true")
+                    .raw(associationXml)
                     .end("item")
                     .end("privateIpAddressesSet")
                     .end("item");
