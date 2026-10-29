@@ -408,11 +408,20 @@ public class DynamoDbService {
         return rekeyedItems;
     }
 
+    private Map<String, JsonNode> itemsForStorage(Map<String, JsonNode> items) {
+        // Memory storage can retain the live concurrent map; durable stores still need a snapshot.
+        if (itemStore instanceof InMemoryStorage<?, ?>
+                || itemStore instanceof AccountAwareStorageBackend<?> aware && aware.isInMemory()) {
+            return items;
+        }
+        return new HashMap<>(items);
+    }
+
     private void persistItems(String storageKey) {
         if (itemStore == null) return;
         ConcurrentSkipListMap<String, JsonNode> items = currentItems(storageKey, false);
         if (items != null) {
-            itemStore.put(storageKey, new HashMap<>(items));
+            itemStore.put(storageKey, itemsForStorage(items));
         } else {
             itemStore.delete(storageKey);
         }
@@ -3212,9 +3221,9 @@ public class DynamoDbService {
     private void persistItemsForAccount(String accountId, String storageKey, Map<String, JsonNode> items) {
         if (itemStore == null) return;
         if (accountId != null && itemStore instanceof AccountAwareStorageBackend<Map<String, JsonNode>> aware) {
-            aware.putForAccount(accountId, storageKey, new HashMap<>(items));
+            aware.putForAccount(accountId, storageKey, itemsForStorage(items));
         } else {
-            itemStore.put(storageKey, new HashMap<>(items));
+            itemStore.put(storageKey, itemsForStorage(items));
         }
     }
 
