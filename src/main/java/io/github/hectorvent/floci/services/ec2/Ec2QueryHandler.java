@@ -940,6 +940,20 @@ public class Ec2QueryHandler {
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification);
 
+        // The request's EbsOptimized wins over a launch template's. Applied after the launch, on this
+        // API path only: CloudFormation, Auto Scaling and Fleet launches still read false. Passing it
+        // into Ec2Service.runInstances would cover all of them.
+        Boolean ebsOptimized = boolParam(p, "EbsOptimized");
+        if (ebsOptimized == null && launchTemplateData != null) {
+            ebsOptimized = launchTemplateData.getEbsOptimized();
+        }
+        if (ebsOptimized != null) {
+            for (Instance inst : res.getInstances()) {
+                service.modifyInstanceAttribute(region, inst.getInstanceId(), "ebsOptimized", ebsOptimized.toString());
+                inst.setEbsOptimized(ebsOptimized);
+            }
+        }
+
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
             for (Instance inst : res.getInstances()) {
