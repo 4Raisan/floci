@@ -259,7 +259,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 execSessions, discoveryRegistrar, cloudWatchMetricsService, Clock.systemUTC());
     }
 
-    /** With the clock that dates Container Insights samples, which a test pins. */
+    /** With the clock for Container Insights samples and task protection deadlines. */
     EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
                EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
                StorageFactory storageFactory, EcsEventPublisher eventPublisher,
@@ -1984,6 +1984,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    private void stopServiceTaskIfUnprotected(EcsTask task, String reason, String region) {
+        synchronized (task) {
+            if (!isTaskProtected(task, clock.instant())) {
+                stopTaskLocked(task, reason, STOP_CODE_SERVICE_SCHEDULER_INITIATED, region);
+            }
+        }
+    }
+
     private EcsTask stopTaskLocked(EcsTask task, String reason, String stopCode, String region) {
         if (TaskStatus.STOPPED.name().equals(task.getLastStatus())) {
             return task;
@@ -2499,15 +2507,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         List<ProtectedTask> result = new ArrayList<>();
         for (String ref : taskRefs) {
             EcsTask task = resolveTaskOrThrow(ref, region);
-            task.setProtectionEnabled(protectionEnabled);
-            Instant expiration = null;
-            if (protectionEnabled && expiresInMinutes != null) {
-                expiration = Instant.now().plusSeconds(expiresInMinutes * 60L);
+            synchronized (task) {
+                task.setProtectionEnabled(protectionEnabled);
+                Instant expiration = protectionEnabled
+                        ? clock.instant().plusSeconds((expiresInMinutes == null ? 120L : expiresInMinutes) * 60L)
+                        : null;
                 task.setProtectedUntil(expiration);
-            } else {
-                task.setProtectedUntil(null);
+                result.add(new ProtectedTask(task.getTaskArn(), protectionEnabled, expiration));
             }
-            result.add(new ProtectedTask(task.getTaskArn(), protectionEnabled, expiration));
         }
         return result;
     }
@@ -2516,9 +2523,36 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         List<ProtectedTask> result = new ArrayList<>();
         for (String ref : taskRefs) {
             EcsTask task = resolveTaskOrThrow(ref, region);
-            result.add(new ProtectedTask(task.getTaskArn(), task.isProtectionEnabled(), task.getProtectedUntil()));
+            synchronized (task) {
+                result.add(new ProtectedTask(task.getTaskArn(), isTaskProtected(task, clock.instant()),
+                        task.getProtectedUntil()));
+            }
         }
         return result;
+    }
+
+    private static boolean isTaskProtected(EcsTask task, Instant now) {
+        if (!task.isProtectionEnabled()) {
+            return false;
+        }
+        Instant until = task.getProtectedUntil();
+        if (until == null || now.isBefore(until)) {
+            return true;
+        }
+        task.setProtectionEnabled(false);
+        task.setProtectedUntil(null);
+        task.bumpVersion();
+        return false;
+    }
+
+    private boolean isProtectedTask(EcsTask task) {
+        synchronized (task) {
+            return isTaskProtected(task, clock.instant());
+        }
+    }
+
+    private boolean eligibleForServiceStop(EcsTask task) {
+        return !isProtectedTask(task);
     }
 
     // ── Services ──────────────────────────────────────────────────────────────
@@ -4153,7 +4187,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         // This deployment's own tasks: counting the ones still draining from the previous
         // deployment would report a task-definition change COMPLETED as soon as it was made.
         long running = runningOnCurrentDeployment(svc);
-        boolean converged = running >= svc.getDesiredCount();
+        boolean converged = running >= svc.getDesiredCount() && !hasProtectedStaleTask(svc);
         boolean rollbackPending = latestServiceDeployment(svc.getServiceArn(), candidate ->
                 DEPLOYMENT_STATUS_ROLLBACK_IN_PROGRESS.equals(candidate.getStatus())) != null;
         ServiceDeployment record = lockedCopyOf(deploymentRecordOf(svc));
@@ -4227,7 +4261,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      */
     public List<ServiceEvent> eventsFor(EcsServiceModel svc) {
         if (svc == null || !"ACTIVE".equals(svc.getStatus())
-                || runningOnCurrentDeployment(svc) < svc.getDesiredCount()) {
+                || runningOnCurrentDeployment(svc) < svc.getDesiredCount()
+                || hasProtectedStaleTask(svc)) {
             return List.of();
         }
         String deploymentId = deploymentId(svc);
@@ -4281,6 +4316,20 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(t -> TaskStatus.RUNNING.name().equals(t.getLastStatus()))
                 .filter(t -> !isStaleForDeployment(t, currentDeploymentId, taskDefinitionArn))
                 .count();
+    }
+
+    private boolean hasProtectedStaleTask(EcsServiceModel svc) {
+        EcsCluster cluster = resolveClusterByArn(svc.getClusterArn());
+        if (cluster == null) {
+            return false;
+        }
+        String currentDeploymentId = deploymentId(svc);
+        String taskDefinitionArn = resolvedTaskDefinitionArn(svc, serviceRegion(svc));
+        return tasks.values().stream()
+                .filter(t -> ownedBy(t, svc, cluster))
+                .filter(t -> TaskStatus.RUNNING.name().equals(t.getLastStatus()))
+                .filter(t -> isStaleForDeployment(t, currentDeploymentId, taskDefinitionArn))
+                .anyMatch(this::isProtectedTask);
     }
 
     /**
@@ -4412,7 +4461,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     && deployment.getTargetServiceRevisionArn().endsWith("/" + taskSetId(svc))
                     && DEPLOYMENT_STATUS_IN_PROGRESS.equals(deployment.getStatus())
                     && STATUS_ACTIVE.equals(svc.getStatus())
-                    && runningOnCurrentDeployment(svc) >= svc.getDesiredCount()) {
+                    && runningOnCurrentDeployment(svc) >= svc.getDesiredCount()
+                    && !hasProtectedStaleTask(svc)) {
                 Instant now = Instant.now();
                 deployment.setStatus(DEPLOYMENT_STATUS_SUCCESSFUL);
                 if (deployment.getAlarmNames() != null) {
@@ -5133,9 +5183,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 // maximumPercent is 100 for DAEMON: the replacement starts once this is STOPPED.
                 if (!TaskStatus.STOPPING.name().equals(t.getLastStatus())) {
                     try {
-                        stopTask(clusterName, t.getTaskArn(),
-                                "Service deployment replaced task definition " + t.getTaskDefinitionArn(),
-                                STOP_CODE_SERVICE_SCHEDULER_INITIATED, region);
+                        stopServiceTaskIfUnprotected(t, "Service deployment replaced task definition "
+                                + t.getTaskDefinitionArn(), region);
                     } catch (Exception e) {
                         LOG.warnv("Service reconciler failed to stop daemon task {0}: {1}",
                                 t.getTaskArn(), e.getMessage());
@@ -5143,6 +5192,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 }
                 if (TaskStatus.STOPPED.name().equals(t.getLastStatus())) {
                     covered.remove(instanceArn);
+                } else if (TaskStatus.RUNNING.name().equals(t.getLastStatus())) {
+                    running++;
                 }
                 continue;
             }
@@ -5393,7 +5444,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
         if (eventPublisher != null) {
             String deploymentId = currentDeploymentId;
-            boolean converged = current >= svc.getDesiredCount();
+            boolean converged = current >= svc.getDesiredCount() && !hasProtectedStaleTask(svc);
             ServiceDeployment pendingFailure = latestServiceDeployment(svc.getServiceArn(), candidate ->
                     DEPLOYMENT_STATUS_ROLLBACK_IN_PROGRESS.equals(candidate.getStatus()));
             if (converged && pendingFailure == null) {
@@ -5439,19 +5490,21 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
         } else if (running > svc.getDesiredCount()) {
-            int toStop = (int) running - svc.getDesiredCount();
             // Drain stale tasks first: once their replacements are RUNNING this is the second
-            // half of the rolling deployment, not a scale-in.
-            Stream.concat(staleTasks.stream(),
-                            runningTasks.stream().filter(t -> !staleTasks.contains(t)))
-                    .limit(toStop)
+            // half of the rolling deployment. Protected stale tasks cannot displace the
+            // desired number of current-revision tasks.
+            int currentToStop = Math.max(0, (int) current - svc.getDesiredCount());
+            Stream.concat(staleTasks.stream().filter(this::eligibleForServiceStop),
+                            runningTasks.stream()
+                                    .filter(t -> !staleTasks.contains(t))
+                                    .filter(this::eligibleForServiceStop)
+                                    .limit(currentToStop))
                     .forEach(t -> {
                         boolean stale = staleTasks.contains(t);
                         try {
-                            stopTask(clusterName, t.getTaskArn(),
-                                    stale ? "Service deployment replaced task definition " + t.getTaskDefinitionArn()
-                                          : "Service scale-in",
-                                    STOP_CODE_SERVICE_SCHEDULER_INITIATED, region);
+                            stopServiceTaskIfUnprotected(t,
+                                    stale ? "Service deployment replaced task definition "
+                                            + t.getTaskDefinitionArn() : "Service scale-in", region);
                         } catch (Exception e) {
                             LOG.warnv("Service reconciler failed to stop task {0}: {1}",
                                     t.getTaskArn(), e.getMessage());
