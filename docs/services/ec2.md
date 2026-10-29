@@ -1149,7 +1149,7 @@ Validation matches AWS behavior:
 
 | Action | Description |
 |--------|-------------|
-| CreateFlowLogs | Creates flow logs for the given resources; returns one flow log id per resource. |
+| CreateFlowLogs | Creates flow logs for the given resources; returns one flow log id per resource. A `vpc-flow-log` `TagSpecification` tags each one, and `DescribeFlowLogs` returns the tags. |
 | DescribeFlowLogs | Lists stored flow logs, optionally filtered by id. |
 | DeleteFlowLogs | Deletes the named flow logs. |
 
