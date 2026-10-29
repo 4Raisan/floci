@@ -560,7 +560,13 @@ public class Ec2ContainerManager {
                 // key-pair association) - starting it only when a key was present meant
                 // run-instances without --key-name produced a "connection refused" instead of AWS's
                 // actual behavior: a running daemon with simply nothing to authenticate against.
-                startSshd(containerId, instanceId);
+                // A systemd guest is the exception: its init starts sshd from the image's own unit,
+                // as it does on EC2. A second sshd launched here raced that unit for port 22, and
+                // whichever lost left either the unit failed or a daemon outside systemd that a
+                // later `systemctl restart ssh` could not replace.
+                if (!image.systemd()) {
+                    startSshd(containerId, instanceId);
+                }
 
                 // Execute UserData
                 String userData = instance.getUserData();
