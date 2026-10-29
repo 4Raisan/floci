@@ -702,7 +702,7 @@ public class LambdaService implements ResourceProvider {
             AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
             if (!region.equals(arn.region())
                     || !regionResolver.getAccountId().equals(arn.accountId())
-                    || !AwsRegions.partitionFor(region).equals(arn.partition())) {
+                    || !regionResolver.partitionForRegion(region).equals(arn.partition())) {
                 throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
             }
             return reference.name();
