@@ -26,6 +26,7 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -163,7 +164,7 @@ public class Route53Service implements Resettable {
 
     public List<HostedZone> listHostedZones(String marker, int maxItems) {
         List<HostedZone> all = new ArrayList<>(zoneStore.scan(k -> true));
-        all.sort((a, b) -> a.getName().compareTo(b.getName()));
+        all.sort(Comparator.comparing(HostedZone::getName).thenComparing(HostedZone::getId));
         for (HostedZone zone : all) {
             zone.setResourceRecordSetCount(recordCount(zone.getId()));
         }
@@ -171,7 +172,7 @@ public class Route53Service implements Resettable {
             int idx = 0;
             for (int i = 0; i < all.size(); i++) {
                 if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
+                    idx = i;
                     break;
                 }
             }

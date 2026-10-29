@@ -143,9 +143,10 @@ public class Route53Controller {
     public Response listHostedZones(@QueryParam("marker") String marker,
                                      @QueryParam("maxitems") @DefaultValue("100") int maxItems) {
         try {
-            List<HostedZone> zones = service.listHostedZones(marker, maxItems);
-            long total = service.getHostedZoneCount();
-            boolean truncated = zones.size() == maxItems && zones.size() < total;
+            int lookaheadLimit = maxItems > 0 && maxItems < Integer.MAX_VALUE ? maxItems + 1 : maxItems;
+            List<HostedZone> remaining = service.listHostedZones(marker, lookaheadLimit);
+            boolean truncated = maxItems > 0 && remaining.size() > maxItems;
+            List<HostedZone> zones = truncated ? remaining.subList(0, maxItems) : remaining;
 
             XmlBuilder xml = new XmlBuilder()
                     .start("ListHostedZonesResponse", NS)
@@ -156,8 +157,8 @@ public class Route53Controller {
             xml.end("HostedZones")
                .elem("Marker", marker != null ? marker : "")
                .elem("IsTruncated", String.valueOf(truncated));
-            if (truncated && !zones.isEmpty()) {
-                xml.elem("NextMarker", zones.get(zones.size() - 1).getId());
+            if (truncated) {
+                xml.elem("NextMarker", remaining.get(maxItems).getId());
             }
             xml.elem("MaxItems", String.valueOf(maxItems))
                .end("ListHostedZonesResponse");
