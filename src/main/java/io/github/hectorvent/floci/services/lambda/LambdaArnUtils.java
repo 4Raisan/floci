@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 
 import java.util.Arrays;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -24,6 +25,11 @@ public final class LambdaArnUtils {
     private static final Pattern NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_]+");
     private static final int MAX_NAME_LENGTH = 64;
     private static final int MAX_TOTAL_LENGTH = 140;
+    /** The NamespacedFunctionName shape used by Lambda's attachment and mapping APIs. */
+    public static final Pattern NAMESPACED_FUNCTION_NAME_PATTERN = Pattern.compile(
+            "^(arn:(aws[a-zA-Z-]*)?:lambda:)?(?<region>(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
+                    + "(?<account>\\d{12}:)?(function:)?(?<name>[a-zA-Z0-9-_\\.]+)"
+                    + "(?::(?<qualifier>\\$LATEST(\\.PUBLISHED)?|[a-zA-Z0-9-_]+))?$");
     /** The model's {@code FunctionName} pattern, quoted in the ValidationException a bad name gets. */
     private static final String NAME_REGEX = "(arn:(aws[a-zA-Z-]*)?:lambda:)?"
             + "((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
@@ -90,6 +96,50 @@ public final class LambdaArnUtils {
      * @param account   account named by a full or partial ARN, or null for a bare name
      */
     public record ResolvedFunctionRef(String name, String qualifier, String region, String account) {}
+
+    /**
+     * Parses Lambda's broader {@code NamespacedFunctionName} shape. Unlike {@link #resolve}, this
+     * accepts dotted names, optional region/account prefixes without {@code function:}, and the
+     * {@code function:NAME} namespace used by the code-signing attachment APIs.
+     */
+    public static ResolvedFunctionRef resolveNamespacedFunctionName(String input) {
+        if (input == null || input.isEmpty() || input.length() > 256) {
+            throw namespacedValidationFailure(input);
+        }
+        Matcher matcher = NAMESPACED_FUNCTION_NAME_PATTERN.matcher(input);
+        if (!matcher.matches()) {
+            throw namespacedValidationFailure(input);
+        }
+        if (matcher.group(1) != null) {
+            if (!AwsArnUtils.isArn(input)) {
+                throw invalid("Invalid ARN: " + input);
+            }
+            AwsArnUtils.Arn arn;
+            try {
+                arn = AwsArnUtils.parse(input);
+            } catch (IllegalArgumentException e) {
+                throw invalid("Invalid ARN: " + input);
+            }
+            if (!"lambda".equals(arn.service())) {
+                throw invalid("Invalid ARN: " + input);
+            }
+            return new ResolvedFunctionRef(matcher.group("name"), matcher.group("qualifier"),
+                    arn.region(), arn.accountId());
+        }
+        return new ResolvedFunctionRef(matcher.group("name"), matcher.group("qualifier"),
+                stripTrailingColon(matcher.group("region")), stripTrailingColon(matcher.group("account")));
+    }
+
+    private static String stripTrailingColon(String value) {
+        return value == null ? null : value.substring(0, value.length() - 1);
+    }
+
+    private static AwsException namespacedValidationFailure(String input) {
+        return SmithyValidationErrors.validationException(
+                "Value '" + input + "' at 'functionName' failed to satisfy constraint: "
+                        + "Member must satisfy regular expression pattern: "
+                        + NAMESPACED_FUNCTION_NAME_PATTERN.pattern());
+    }
 
     /**
      * Parses a {@code FunctionName} path parameter. Throws {@link AwsException}, HTTP 400,

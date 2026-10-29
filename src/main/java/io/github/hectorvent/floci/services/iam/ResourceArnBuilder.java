@@ -895,6 +895,9 @@ public class ResourceArnBuilder {
         if (name == null) {
             return createdFunctionArn(path, ctx, region, accountId);
         }
+        if (path.endsWith("/code-signing-config")) {
+            return codeSigningFunctionArn(name, region, accountId);
+        }
         boolean qualifiedTarget = path.endsWith("/functions/" + name + "/invocations")
                 || path.endsWith("/functions/" + name + "/response-streaming-invocations")
                 || path.endsWith("/functions/" + name + "/provisioned-concurrency");
@@ -916,6 +919,17 @@ public class ResourceArnBuilder {
                     ref.region() != null ? ref.region() : region,
                     ref.account() != null ? ref.account() : accountId,
                     resource).toString();
+        } catch (AwsException e) {
+            // A reference Lambda refuses, which its handler answers with a 400 before acting on anything.
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        }
+    }
+
+    /** Code-signing attachment routes use Lambda's broader NamespacedFunctionName shape. */
+    private static String codeSigningFunctionArn(String name, String region, String accountId) {
+        try {
+            LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveNamespacedFunctionName(name);
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + ref.name()).toString();
         } catch (AwsException e) {
             // A reference Lambda refuses, which its handler answers with a 400 before acting on anything.
             return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
