@@ -3649,7 +3649,18 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      */
     public ListPage listContainerInstances(String clusterRef, String status, Integer maxResults,
                                             String nextToken, String region) {
+        return listContainerInstances(clusterRef, status, maxResults, nextToken, null, region);
+    }
+
+    public ListPage listContainerInstances(String clusterRef, String status, Integer maxResults,
+                                            String nextToken, String filter, String region) {
         EcsCluster cluster = resolveClusterOrDefault(clusterRef, region);
+        Map<String, List<EcsTask>> queryTasks = filter == null ? Map.of() : tasks.values().stream()
+                .filter(task -> cluster.getClusterArn().equals(task.getClusterArn()))
+                .filter(task -> task.getContainerInstanceArn() != null)
+                .collect(Collectors.groupingBy(EcsTask::getContainerInstanceArn));
+        Predicate<ContainerInstance> query = ContainerInstanceQuery.compile(filter,
+                instance -> queryTasks.getOrDefault(instance.getContainerInstanceArn(), List.of()));
         if (status != null && !CONTAINER_INSTANCE_STATUSES.contains(status)) {
             throw new AwsException("InvalidParameterException",
                     "Invalid container instance status: " + status, 400);
@@ -3661,7 +3672,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(ci -> status != null
                         ? status.equals(ci.getStatus())
                         : !STATUS_INACTIVE.equals(ci.getStatus()))
+                .filter(query)
                 .map(ContainerInstance::getContainerInstanceArn)
+                .sorted()
                 .toList();
         return paginate(arns, maxResults, nextToken);
     }
