@@ -496,10 +496,6 @@ public class S3Service implements Resettable, ResourceProvider {
         if (!OBJECT_OWNERSHIP_VALUES.contains(ownership)) {
             throw new AwsException("InvalidArgument", "Invalid x-amz-object-ownership value: " + ownership, 400);
         }
-        if (!isBlank(cannedAcl) && (!isBlank(grantRead) || !isBlank(grantWrite)
-                || !isBlank(grantFullControl) || !isBlank(grantReadAcp) || !isBlank(grantWriteAcp))) {
-            throw new AwsException("InvalidRequest", "Specifying both Canned ACLs and Header Grants is not allowed", 400);
-        }
         String requestedAcl = resolveObjectAclXml(cannedAcl, grantRead, grantWrite,
                 grantFullControl, grantReadAcp, grantWriteAcp);
         if ("BucketOwnerEnforced".equals(ownership)
@@ -6578,10 +6574,10 @@ public class S3Service implements Resettable, ResourceProvider {
     /**
      * Resolves the ACL to store for an object/bucket from a canned ACL and/or the explicit
      * ACL grant headers (x-amz-grant-read, x-amz-grant-write, x-amz-grant-full-control,
-     * x-amz-grant-read-acp, x-amz-grant-write-acp). If both are somehow present, the canned ACL
-     * takes precedence - real S3 instead rejects that combination with 400 "Conflicting header
-     * values", but Floci doesn't model that validation yet. Returns null if neither is set, so
-     * callers can fall back to a pre-existing ACL (e.g. an explicit AccessControlPolicy XML body).
+     * x-amz-grant-read-acp, x-amz-grant-write-acp). A canned ACL together with any grant header is
+     * refused with 400 InvalidRequest, as S3 does; blank values count as absent. Returns null if
+     * neither is set, so callers can fall back to a pre-existing ACL (e.g. an explicit
+     * AccessControlPolicy XML body).
      */
     String resolveObjectAclXml(String cannedAcl, String grantRead, String grantWrite,
                                 String grantFullControl, String grantReadAcp, String grantWriteAcp) {
@@ -6593,11 +6589,15 @@ public class S3Service implements Resettable, ResourceProvider {
                                        String grantRead, String grantWrite,
                                        String grantFullControl, String grantReadAcp,
                                        String grantWriteAcp) {
-        if (cannedAcl != null && !cannedAcl.isBlank()) {
+        boolean hasGrants = !isBlank(grantRead) || !isBlank(grantWrite) || !isBlank(grantFullControl)
+                || !isBlank(grantReadAcp) || !isBlank(grantWriteAcp);
+        if (!isBlank(cannedAcl) && hasGrants) {
+            throw new AwsException("InvalidRequest", "Specifying both Canned ACLs and Header Grants is not allowed", 400);
+        }
+        if (!isBlank(cannedAcl)) {
             return cannedObjectAclXml(ownerAccount, cannedAcl);
         }
-        if (isBlank(grantRead) && isBlank(grantWrite) && isBlank(grantFullControl)
-                && isBlank(grantReadAcp) && isBlank(grantWriteAcp)) {
+        if (!hasGrants) {
             return null;
         }
         List<String> grants = new ArrayList<>();
