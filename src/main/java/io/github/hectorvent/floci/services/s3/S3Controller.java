@@ -764,6 +764,9 @@ public class S3Controller {
             List<S3Object> objects = result.objects();
             List<String> commonPrefixes = result.commonPrefixes();
             boolean v2 = "2".equals(listType);
+            String bucketOwnerAccount = (v1 || Boolean.parseBoolean(uriInfo.getQueryParameters().getFirst("fetch-owner")))
+                    ? s3Service.getBucketOwnerAccountId(bucket) : null;
+            boolean ownershipEnforced = bucketOwnerAccount != null && s3Service.bucketOwnershipIsEnforced(bucket);
 
             XmlBuilder xml = new XmlBuilder()
                     .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
@@ -782,8 +785,15 @@ public class S3Controller {
                    .elem("LastModified", ISO_FORMAT.format(obj.getLastModified()))
                    .elem("ETag", obj.getETag())
                    .elem("Size", obj.getSize())
-                   .elem("StorageClass", obj.getStorageClass())
-                   .end("Contents");
+                   .elem("StorageClass", obj.getStorageClass());
+                if (bucketOwnerAccount != null) {
+                    xml.start("Owner")
+                       .elem("ID", AwsCanonicalUserId.forAccount(S3Service.effectiveObjectOwnerAccount(
+                               obj, bucketOwnerAccount, ownershipEnforced)))
+                       .elem("DisplayName", S3Service.DEFAULT_OWNER_DISPLAY_NAME)
+                       .end("Owner");
+                }
+                xml.end("Contents");
             }
             for (String cp : commonPrefixes) {
                 xml.start("CommonPrefixes")

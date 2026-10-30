@@ -627,6 +627,12 @@ public class S3Service implements Resettable, ResourceProvider {
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
     }
 
+    boolean bucketOwnershipIsEnforced(String bucketName) {
+        return resolveBucketEntry(bucketName)
+                .map(entry -> ownershipIsEnforced(entry.value()))
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+    }
+
     public void putBucketLogging(String bucketName, String loggingConfigurationXml) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
@@ -910,6 +916,9 @@ public class S3Service implements Resettable, ResourceProvider {
         byte[] data = body instanceof BytesBody bytes ? bytes.data() : null;
         S3Object object = new S3Object(bucketName, key, body.size(), contentType,
                 eTag != null ? eTag : computeETag(data));
+        String objectOwnerAccount = objectOwnerAccount(bucket, bucketOwnerAccount,
+                aclRequestAccount, effectiveOptions.getAcl());
+        object.setOwnerAccountId(objectOwnerAccount);
         object.setData(data);
         if (metadata != null) {
             object.getMetadata().putAll(metadata);
@@ -935,7 +944,7 @@ public class S3Service implements Resettable, ResourceProvider {
         rejectUploadAclWhenOwnershipEnforced(bucket, bucketOwnerAccount, effectiveOptions,
                 aclRequestAccount);
         rejectObjectLockWithoutLockEnabled(bucket, effectiveOptions);
-        String objectAcl = resolveObjectAclXml(bucketOwnerAccount,
+        String objectAcl = resolveStoredObjectAclXml(objectOwnerAccount, bucketOwnerAccount,
                 effectiveOptions.getAcl(), effectiveOptions.getGrantRead(),
                 effectiveOptions.getGrantWrite(), effectiveOptions.getGrantFullControl(),
                 effectiveOptions.getGrantReadAcp(), effectiveOptions.getGrantWriteAcp());
@@ -6060,9 +6069,11 @@ public class S3Service implements Resettable, ResourceProvider {
         S3Object obj = ownedObject.value();
         Bucket bucket = resolveBucket(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
-        return !ownershipIsEnforced(bucket) && obj.getAcl() != null
+        boolean enforced = ownershipIsEnforced(bucket);
+        return !enforced && obj.getAcl() != null
                 ? obj.getAcl()
-                : defaultAclXml(ownedObject.account(), DEFAULT_OWNER_DISPLAY_NAME);
+                : defaultAclXml(effectiveObjectOwnerAccount(obj, ownedObject.account(), enforced),
+                        DEFAULT_OWNER_DISPLAY_NAME);
     }
 
     public void putObjectAcl(String bucketName, String key, String versionId, String bodyAcl, String cannedAcl,
@@ -6075,7 +6086,8 @@ public class S3Service implements Resettable, ResourceProvider {
                     getStoredObjectEntry(bucketName, key, versionId);
             S3Object obj = ownedObject.value();
             rejectAclWhenOwnershipEnforced(bucket);
-            String resolvedAcl = resolveObjectAclXml(ownedObject.account(), cannedAcl, grantRead,
+            String resolvedAcl = resolveStoredObjectAclXml(effectiveObjectOwnerAccount(obj, ownedObject.account(), false),
+                    ownedObject.account(), cannedAcl, grantRead,
                     grantWrite, grantFullControl, grantReadAcp, grantWriteAcp);
             String newAcl = resolvedAcl != null ? resolvedAcl : (bodyAcl.isBlank() ? null : bodyAcl);
             rejectPublicAclWhenBlocked(bucketName, newAcl);
@@ -6134,6 +6146,23 @@ public class S3Service implements Resettable, ResourceProvider {
     private static boolean ownershipIsEnforced(Bucket bucket) {
         return XmlParser.containsValue(bucket.getOwnershipControlsConfiguration(),
                 "ObjectOwnership", "BucketOwnerEnforced");
+    }
+
+    private static String objectOwnerAccount(Bucket bucket, String bucketOwnerAccount,
+                                             String writerAccount, String cannedAcl) {
+        String controls = bucket.getOwnershipControlsConfiguration();
+        if (ownershipIsEnforced(bucket)
+                || (XmlParser.containsValue(controls, "ObjectOwnership", "BucketOwnerPreferred")
+                        && "bucket-owner-full-control".equals(cannedAcl))) {
+            return bucketOwnerAccount;
+        }
+        return writerAccount;
+    }
+
+    static String effectiveObjectOwnerAccount(S3Object object, String bucketOwnerAccount,
+                                              boolean ownershipEnforced) {
+        return ownershipEnforced || object.getOwnerAccountId() == null
+                ? bucketOwnerAccount : object.getOwnerAccountId();
     }
 
     /**
@@ -6579,6 +6608,27 @@ public class S3Service implements Resettable, ResourceProvider {
         appendGrantHeader(grants, grantReadAcp, "READ_ACP");
         appendGrantHeader(grants, grantWriteAcp, "WRITE_ACP");
         return objectAclXml(ownerAccount, grants.toArray(new String[0]));
+    }
+
+    private String resolveStoredObjectAclXml(String objectOwnerAccount, String bucketOwnerAccount,
+                                             String cannedAcl, String grantRead, String grantWrite,
+                                             String grantFullControl, String grantReadAcp,
+                                             String grantWriteAcp) {
+        String acl = resolveObjectAclXml(objectOwnerAccount, cannedAcl, grantRead, grantWrite,
+                grantFullControl, grantReadAcp, grantWriteAcp);
+        if (objectOwnerAccount.equals(bucketOwnerAccount)) {
+            return acl;
+        }
+        if ("bucket-owner-full-control".equals(cannedAcl)) {
+            return objectAclXml(objectOwnerAccount, ownerFullControlGrant(objectOwnerAccount),
+                    ownerFullControlGrant(bucketOwnerAccount));
+        }
+        if ("bucket-owner-read".equals(cannedAcl)) {
+            return objectAclXml(objectOwnerAccount, ownerFullControlGrant(objectOwnerAccount),
+                    canonicalUserGrant(AwsCanonicalUserId.forAccount(bucketOwnerAccount),
+                            DEFAULT_OWNER_DISPLAY_NAME, "READ"));
+        }
+        return acl;
     }
 
     private static boolean isBlank(String value) {
@@ -7183,6 +7233,7 @@ public class S3Service implements Resettable, ResourceProvider {
         copy.setRetainUntilDate(source.getRetainUntilDate());
         copy.setLegalHoldStatus(source.getLegalHoldStatus());
         copy.setAcl(source.getAcl());
+        copy.setOwnerAccountId(source.getOwnerAccountId());
         copy.setDataGeneration(source.getDataGeneration());
         copy.setEventSequencer(source.getEventSequencer());
         return copy;
