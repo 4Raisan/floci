@@ -7524,15 +7524,17 @@ public class RdsService implements Resettable, ResourceProvider {
     public DbParameterGroup modifyDbParameterGroup(String name,
                                                     Map<String, String> parameters) {
         return modifyDbParameterGroup(
-                name, parameters, regionResolver.getDefaultRegion());
+                name, parameters, null, regionResolver.getDefaultRegion());
     }
 
     public DbParameterGroup modifyDbParameterGroup(
-            String name, Map<String, String> parameters, String region) {
+            String name, Map<String, String> parameters, Map<String, String> applyMethods, String region) {
         String effectiveRegion = effectiveRegion(region);
         DbParameterGroup group = getDbParameterGroup(name, effectiveRegion);
         if (parameters != null) {
             group.getParameters().putAll(parameters);
+            parameters.keySet().forEach(k -> group.getApplyMethods().put(
+                    k, applyMethods == null ? "immediate" : applyMethods.getOrDefault(k, "immediate")));
         }
         putParameterGroupForRegion(name, effectiveRegion, group);
         return group;
@@ -7554,6 +7556,7 @@ public class RdsService implements Resettable, ResourceProvider {
         DbParameterGroup target = createDbParameterGroup(
                 targetName, source.getDbParameterGroupFamily(), targetDescription, effectiveRegion);
         target.getParameters().putAll(source.getParameters());
+        target.getApplyMethods().putAll(source.getApplyMethods());
         putParameterGroupForRegion(targetName, effectiveRegion, target);
         return target;
     }
@@ -7567,6 +7570,7 @@ public class RdsService implements Resettable, ResourceProvider {
         String effectiveRegion = effectiveRegion(region);
         DbParameterGroup group = getDbParameterGroup(name, effectiveRegion);
         resetParameters(group.getParameters(), resetAllParameters, parameterNames);
+        resetParameters(group.getApplyMethods(), resetAllParameters, parameterNames);
         putParameterGroupForRegion(name, effectiveRegion, group);
         return group;
     }
@@ -7798,11 +7802,11 @@ public class RdsService implements Resettable, ResourceProvider {
     public DbClusterParameterGroup modifyDbClusterParameterGroup(String name,
                                                                   Map<String, String> parameters) {
         return modifyDbClusterParameterGroup(
-                name, parameters, regionResolver.getDefaultRegion());
+                name, parameters, null, regionResolver.getDefaultRegion());
     }
 
     public DbClusterParameterGroup modifyDbClusterParameterGroup(
-            String name, Map<String, String> parameters, String region) {
+            String name, Map<String, String> parameters, Map<String, String> applyMethods, String region) {
         String effectiveRegion = effectiveRegion(region);
         if (managedClusterParameterGroup(name) != null) {
             throw new AwsException("InvalidDBParameterGroupState",
@@ -7811,6 +7815,8 @@ public class RdsService implements Resettable, ResourceProvider {
         DbClusterParameterGroup group = getDbClusterParameterGroup(name, effectiveRegion);
         if (parameters != null) {
             group.getParameters().putAll(parameters);
+            parameters.keySet().forEach(k -> group.getApplyMethods().put(
+                    k, applyMethods == null ? "immediate" : applyMethods.getOrDefault(k, "immediate")));
         }
         putClusterParameterGroupForRegion(name, effectiveRegion, group);
         return group;
@@ -7831,6 +7837,7 @@ public class RdsService implements Resettable, ResourceProvider {
         DbClusterParameterGroup target = createDbClusterParameterGroup(
                 targetName, source.getDbParameterGroupFamily(), targetDescription, effectiveRegion);
         target.getParameters().putAll(source.getParameters());
+        target.getApplyMethods().putAll(source.getApplyMethods());
         putClusterParameterGroupForRegion(targetName, effectiveRegion, target);
         return target;
     }
@@ -7845,6 +7852,7 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         DbClusterParameterGroup group = getDbClusterParameterGroup(name, effectiveRegion);
         resetParameters(group.getParameters(), resetAllParameters, parameterNames);
+        resetParameters(group.getApplyMethods(), resetAllParameters, parameterNames);
         putClusterParameterGroupForRegion(name, effectiveRegion, group);
         return group;
     }

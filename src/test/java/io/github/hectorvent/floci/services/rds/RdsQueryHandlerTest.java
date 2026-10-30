@@ -907,14 +907,14 @@ class RdsQueryHandlerTest {
         when(service.getDbParameterGroup("pg1", "us-west-2"))
                 .thenReturn(parameterGroup);
         when(service.modifyDbParameterGroup(
-                "pg1", Map.of("max_connections", "200"), "us-west-2"))
+                "pg1", Map.of("max_connections", "200"), Map.of(), "us-west-2"))
                 .thenReturn(parameterGroup);
         when(service.listDbClusterParameterGroups(null, "us-west-2"))
                 .thenReturn(List.of(clusterParameterGroup));
         when(service.getDbClusterParameterGroup("cpg1", "us-west-2"))
                 .thenReturn(clusterParameterGroup);
         when(service.modifyDbClusterParameterGroup(
-                "cpg1", Map.of("log_statement", "all"), "us-west-2"))
+                "cpg1", Map.of("log_statement", "all"), Map.of(), "us-west-2"))
                 .thenReturn(clusterParameterGroup);
 
         MultivaluedMap<String, String> subnetParams = params();
@@ -947,12 +947,12 @@ class RdsQueryHandlerTest {
         verify(service).deleteDbSubnetGroup("custom-group", "us-west-2");
         verify(service).listDbParameterGroups(null, "us-west-2");
         verify(service).modifyDbParameterGroup(
-                "pg1", Map.of("max_connections", "200"), "us-west-2");
+                "pg1", Map.of("max_connections", "200"), Map.of(), "us-west-2");
         verify(service).getDbParameterGroup("pg1", "us-west-2");
         verify(service).deleteDbParameterGroup("pg1", "us-west-2");
         verify(service).listDbClusterParameterGroups(null, "us-west-2");
         verify(service).modifyDbClusterParameterGroup(
-                "cpg1", Map.of("log_statement", "all"), "us-west-2");
+                "cpg1", Map.of("log_statement", "all"), Map.of(), "us-west-2");
         verify(service).getDbClusterParameterGroup("cpg1", "us-west-2");
         verify(service).deleteDbClusterParameterGroup("cpg1", "us-west-2");
     }
@@ -1385,7 +1385,7 @@ class RdsQueryHandlerTest {
     void modifyDbParameterGroup_ignoresParametersWithoutValue() {
         DbParameterGroup group = new DbParameterGroup("pg1", "postgres15", "test group");
         when(service.modifyDbParameterGroup(
-                eq("pg1"), eq(Map.of("max_connections", "200")), isNull()))
+                eq("pg1"), eq(Map.of("max_connections", "200")), eq(Map.of()), isNull()))
                 .thenReturn(group);
 
         MultivaluedMap<String, String> p = params();
@@ -1396,7 +1396,7 @@ class RdsQueryHandlerTest {
         handler.handle("ModifyDBParameterGroup", p);
 
         verify(service).modifyDbParameterGroup(
-                "pg1", Map.of("max_connections", "200"), null);
+                "pg1", Map.of("max_connections", "200"), Map.of(), null);
     }
 
     @Test
@@ -1469,7 +1469,7 @@ class RdsQueryHandlerTest {
     void modifyDbClusterParameterGroup_ignoresParametersWithoutValue() {
         DbClusterParameterGroup group = new DbClusterParameterGroup("cpg1", "aurora-postgresql16", "test group");
         when(service.modifyDbClusterParameterGroup(
-                eq("cpg1"), eq(Map.of("log_statement", "all")), isNull()))
+                eq("cpg1"), eq(Map.of("log_statement", "all")), eq(Map.of()), isNull()))
                 .thenReturn(group);
 
         MultivaluedMap<String, String> p = params();
@@ -1480,7 +1480,7 @@ class RdsQueryHandlerTest {
         handler.handle("ModifyDBClusterParameterGroup", p);
 
         verify(service).modifyDbClusterParameterGroup(
-                "cpg1", Map.of("log_statement", "all"), null);
+                "cpg1", Map.of("log_statement", "all"), Map.of(), null);
     }
 
     @Test
