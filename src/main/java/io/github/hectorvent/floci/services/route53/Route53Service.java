@@ -163,25 +163,16 @@ public class Route53Service implements Resettable {
     }
 
     public List<HostedZone> listHostedZones(String marker, int maxItems) {
+        return pageHostedZones(marker, maxItems).items();
+    }
+
+    Route53Pagination.Page<HostedZone> pageHostedZones(String marker, int maxItems) {
         List<HostedZone> all = new ArrayList<>(zoneStore.scan(k -> true));
         all.sort(Comparator.comparing(HostedZone::getName).thenComparing(HostedZone::getId));
         for (HostedZone zone : all) {
             zone.setResourceRecordSetCount(recordCount(zone.getId()));
         }
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        return Route53Pagination.page(all, marker, maxItems, HostedZone::getId);
     }
 
     public List<HostedZone> listHostedZonesByName(String dnsName, int maxItems) {
@@ -504,21 +495,13 @@ public class Route53Service implements Resettable {
     }
 
     public List<HealthCheck> listHealthChecks(String marker, int maxItems) {
+        return pageHealthChecks(marker, maxItems).items();
+    }
+
+    Route53Pagination.Page<HealthCheck> pageHealthChecks(String marker, int maxItems) {
         List<HealthCheck> all = new ArrayList<>(healthCheckStore.scan(k -> true));
-        if (marker != null && !marker.isEmpty()) {
-            int idx = 0;
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getId().equals(marker)) {
-                    idx = i + 1;
-                    break;
-                }
-            }
-            all = all.subList(idx, all.size());
-        }
-        if (maxItems > 0 && all.size() > maxItems) {
-            return all.subList(0, maxItems);
-        }
-        return all;
+        all.sort(Comparator.comparing(HealthCheck::getId));
+        return Route53Pagination.page(all, marker, maxItems, HealthCheck::getId);
     }
 
     public HealthCheck updateHealthCheck(String id, HealthCheckConfig cfg) {
