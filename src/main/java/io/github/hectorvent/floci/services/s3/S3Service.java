@@ -6886,12 +6886,15 @@ public class S3Service implements Resettable, ResourceProvider {
         }
 
         String region = bucket.getRegion();
-        String eventJson = buildS3EventJson(bucketName, key, eventName, obj, region, bucket.isVersioningEnabled(),
-                sequencer);
+        String eventTime = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
+        String requestId = UUID.randomUUID().toString();
+        ObjectNode event = buildS3Event(bucketName, key, eventName, obj, region,
+                bucket.isVersioningEnabled(), sequencer, eventTime, requestId);
 
         for (QueueNotification qn : config.getQueueConfigurations()) {
             if (qn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && qn.matchesKey(key)) {
                 try {
+                    String eventJson = notificationEventJson(event, qn.id());
                     sqsService.sendMessage(sqsUrlFromArn(qn.queueArn()), eventJson, 0,
                             extractRegionFromArn(qn.queueArn()));
                     LOG.debugv("Fired S3 event {0} to SQS {1}", eventName, qn.queueArn());
@@ -6904,6 +6907,7 @@ public class S3Service implements Resettable, ResourceProvider {
         for (TopicNotification tn : config.getTopicConfigurations()) {
             if (tn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && tn.matchesKey(key)) {
                 try {
+                    String eventJson = notificationEventJson(event, tn.id());
                     snsService.publish(tn.topicArn(), null, eventJson, "Amazon S3 Notification",
                             extractRegionFromArn(tn.topicArn()));
                     LOG.debugv("Fired S3 event {0} to SNS {1}", eventName, tn.topicArn());
@@ -6923,6 +6927,7 @@ public class S3Service implements Resettable, ResourceProvider {
                             throw new AwsException("InvalidParameterValueException",
                                     "Invalid Lambda function ARN: " + ln.functionArn(), 400);
                         }
+                        String eventJson = notificationEventJson(event, ln.id());
                         invokeLambda(lambdaRegion, ln.functionArn(), eventJson.getBytes(StandardCharsets.UTF_8));
                         LOG.debugv("Fired S3 event {0} to Lambda {1}", eventName, ln.functionArn());
                     } catch (Exception e) {
@@ -7054,16 +7059,17 @@ public class S3Service implements Resettable, ResourceProvider {
         }
     }
 
-    private String buildS3EventJson(String bucketName, String key, String eventName,
-                                    S3Object obj, String region, boolean isVersionEnabled, String sequencer) {
+    private ObjectNode buildS3Event(String bucketName, String key, String eventName,
+                                    S3Object obj, String region, boolean isVersionEnabled, String sequencer,
+                                    String eventTime, String requestId) {
         try {
-            String eventTime = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
             long size = obj != null ? obj.getSize() : 0;
             String eTag = obj != null && obj.getETag() != null ? obj.getETag().replace("\"", "") : "";
-            String requestId = UUID.randomUUID().toString();
-
             ObjectNode bucketNode = objectMapper.createObjectNode();
             bucketNode.put("name", bucketName);
+            String bucketOwner = resolveBucketEntry(bucketName)
+                    .map(AccountAwareStorageBackend.OwnedEntry::account).orElseGet(this::ownerId);
+            bucketNode.putObject("ownerIdentity").put("principalId", bucketOwner);
             bucketNode.put("arn", AwsArnUtils.Arn.global(bucketPartition(bucketName), "s3", "", bucketName).toString());
 
             ObjectNode objectNode = objectMapper.createObjectNode();
@@ -7092,15 +7098,29 @@ public class S3Service implements Resettable, ResourceProvider {
             record.putObject("userIdentity").put("principalId", lifecycle ? ServicePrincipals.of("s3") : "AWS:EMULATOR");
             record.putObject("requestParameters")
                     .put("sourceIPAddress", lifecycle ? ServicePrincipals.of("s3") : "127.0.0.1");
-            record.putObject("responseElements").put("x-amz-request-id", requestId);
+            record.putObject("responseElements")
+                    .put("x-amz-request-id", requestId)
+                    .put("x-amz-id-2", requestId);
             record.set("s3", s3Node);
 
             ObjectNode root = objectMapper.createObjectNode();
             root.putArray("Records").add(record);
-            return objectMapper.writeValueAsString(root);
+            return root;
         } catch (Exception e) {
-            return "{\"Records\":[]}";
+            LOG.warnv("Failed to build S3 event for {0}: {1}", bucketName, e.getMessage());
+            ObjectNode empty = objectMapper.createObjectNode();
+            empty.putArray("Records");
+            return empty;
         }
+    }
+
+    private String notificationEventJson(ObjectNode event, String configurationId) throws JsonProcessingException {
+        ObjectNode copy = event.deepCopy();
+        if (copy.path("Records").path(0).path("s3") instanceof ObjectNode s3) {
+            s3.put("configurationId",
+                    configurationId == null || configurationId.isBlank() ? "emulator" : configurationId);
+        }
+        return objectMapper.writeValueAsString(copy);
     }
 
     /**
