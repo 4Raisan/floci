@@ -98,7 +98,23 @@ public class CloudTrailService {
                              String snsTopicArn, boolean includeGlobalServiceEvents,
                              boolean isMultiRegionTrail, boolean enableLogFileValidation,
                              boolean isOrganizationTrail, Map<String, String> tags) {
+        return createTrail(region, name, s3BucketName, s3KeyPrefix, snsTopicArn, includeGlobalServiceEvents,
+                isMultiRegionTrail, enableLogFileValidation, isOrganizationTrail, tags, null, null, null);
+    }
+
+    /**
+     * @param kmsKeyId                  the key the trail's log files are encrypted with, recorded and
+     *                                  reported back; Floci writes the files unencrypted
+     * @param cloudWatchLogsLogGroupArn the log group events are also delivered to, recorded only
+     * @param cloudWatchLogsRoleArn     the role CloudTrail assumes for that delivery
+     */
+    public Trail createTrail(String region, String name, String s3BucketName, String s3KeyPrefix,
+                             String snsTopicArn, boolean includeGlobalServiceEvents,
+                             boolean isMultiRegionTrail, boolean enableLogFileValidation,
+                             boolean isOrganizationTrail, Map<String, String> tags, String kmsKeyId,
+                             String cloudWatchLogsLogGroupArn, String cloudWatchLogsRoleArn) {
         validateTrailName(name);
+        validateCloudWatchLogs(cloudWatchLogsLogGroupArn, cloudWatchLogsRoleArn);
         if (s3BucketName == null || s3BucketName.isEmpty()) {
             throw new AwsException("S3BucketDoesNotExistException", "S3 bucket name is required.", 400);
         }
@@ -118,10 +134,29 @@ public class CloudTrailService {
         Trail trail = new Trail(
                 name, arn, s3BucketName, s3KeyPrefix, snsTopicArn,
                 includeGlobalServiceEvents, isMultiRegionTrail, region,
-                enableLogFileValidation, false, false, isOrganizationTrail);
+                enableLogFileValidation, false, false, isOrganizationTrail,
+                blankToNull(kmsKeyId), blankToNull(cloudWatchLogsLogGroupArn), blankToNull(cloudWatchLogsRoleArn));
         store.put(key, new CloudTrailEntry(trail, List.of(), List.of(), false, null, null,
                 initialTags, null, null));
         return trail;
+    }
+
+    /** CloudTrail needs both halves of CloudWatch Logs delivery, or neither. */
+    private static void validateCloudWatchLogs(String logGroupArn, String roleArn) {
+        boolean group = logGroupArn != null && !logGroupArn.isBlank();
+        boolean role = roleArn != null && !roleArn.isBlank();
+        if (group && !role) {
+            throw new AwsException("InvalidCloudWatchLogsRoleArnException",
+                    "You must specify a role ARN when you specify a CloudWatch Logs log group.", 400);
+        }
+        if (role && !group) {
+            throw new AwsException("InvalidCloudWatchLogsLogGroupArnException",
+                    "You must specify a log group ARN when you specify a CloudWatch Logs role.", 400);
+        }
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     public void deleteTrail(String region, String trailNameOrArn) {
@@ -136,6 +171,20 @@ public class CloudTrailService {
                              String s3BucketName, String s3KeyPrefix, String snsTopicArn,
                              Boolean includeGlobalServiceEvents, Boolean isMultiRegionTrail,
                              Boolean enableLogFileValidation, Boolean isOrganizationTrail) {
+        return updateTrail(region, trailNameOrArn, s3BucketName, s3KeyPrefix, snsTopicArn,
+                includeGlobalServiceEvents, isMultiRegionTrail, enableLogFileValidation, isOrganizationTrail,
+                null, null, null);
+    }
+
+    /**
+     * A null KMS or CloudWatch Logs argument leaves the setting as it is; an empty one removes it,
+     * as UpdateTrail does on AWS.
+     */
+    public Trail updateTrail(String region, String trailNameOrArn,
+                             String s3BucketName, String s3KeyPrefix, String snsTopicArn,
+                             Boolean includeGlobalServiceEvents, Boolean isMultiRegionTrail,
+                             Boolean enableLogFileValidation, Boolean isOrganizationTrail,
+                             String kmsKeyId, String cloudWatchLogsLogGroupArn, String cloudWatchLogsRoleArn) {
         Trail resolved = findTrailOrThrow(region, trailNameOrArn);
         String key = regionKey(resolved.homeRegion(), resolved.name());
         return withTrailLock(key, () -> {
@@ -154,7 +203,12 @@ public class CloudTrailService {
                     enableLogFileValidation != null ? enableLogFileValidation : existing.logFileValidationEnabled(),
                     existing.hasCustomEventSelectors(),
                     existing.hasInsightSelectors(),
-                    isOrganizationTrail != null ? isOrganizationTrail : existing.isOrganizationTrail());
+                    isOrganizationTrail != null ? isOrganizationTrail : existing.isOrganizationTrail(),
+                    kmsKeyId != null ? blankToNull(kmsKeyId) : existing.kmsKeyId(),
+                    cloudWatchLogsLogGroupArn != null
+                            ? blankToNull(cloudWatchLogsLogGroupArn) : existing.cloudWatchLogsLogGroupArn(),
+                    cloudWatchLogsRoleArn != null ? blankToNull(cloudWatchLogsRoleArn) : existing.cloudWatchLogsRoleArn());
+            validateCloudWatchLogs(updated.cloudWatchLogsLogGroupArn(), updated.cloudWatchLogsRoleArn());
             store.put(key, entry.withTrail(updated));
             return updated;
         });

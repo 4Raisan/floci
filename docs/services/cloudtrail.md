@@ -40,6 +40,10 @@ and `AWS::S3::Object` data resource ARNs in any of these forms:
 - `arn:aws:s3:::bucket/prefix` — keys with the given prefix
 - `arn:aws:s3:::bucket/prefix/key` — exact key match
 
+## Encryption and CloudWatch Logs settings
+
+`CreateTrail` and `UpdateTrail` record `KmsKeyId`, `CloudWatchLogsLogGroupArn` and `CloudWatchLogsRoleArn`, and `DescribeTrails` returns them, so a Terraform `aws_cloudtrail` with encryption or log delivery reads back what it declared. `UpdateTrail` with an empty value clears one, as on AWS. A log group without a role is refused with `InvalidCloudWatchLogsRoleArnException`, and a role without a log group with `InvalidCloudWatchLogsLogGroupArnException`. The settings are recorded only: log files are not encrypted, events are not delivered to the log group, and `KmsKeyId` is stored as sent (an alias is not resolved to the key ARN, and an unknown key is not refused).
+
 ## S3 Hook Coverage
 
 Floci emits a CloudTrail data event whenever any of these S3 ops runs
