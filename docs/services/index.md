@@ -56,7 +56,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Amazon Macie](macie2.md) | `/admin`, `/macie`, `/admin/configuration` | REST JSON | 8 |
 | [Amazon Inspector](inspector2.md) | `/delegatedadminaccounts/*`, `/status/batch/get`, `/enable`, `/organizationconfiguration/*` | REST JSON | 7 |
 | [Amazon Verified Permissions](verifiedpermissions.md) | `POST /` + `X-Amz-Target: VerifiedPermissions.*` | JSON 1.0 | 34 |
-| [Security Hub](securityhub.md) | `/organization/*`, `/accounts`, `/findingAggregator/*`, `/configurationPolicy*`, `/tags/*` | REST JSON | 22 |
+| [Security Hub](securityhub.md) | `/organization/*`, `/accounts`, `/findingAggregator/*`, `/configurationPolicy*`, `/standards*`, `/tags/*` | REST JSON | 26 |
 | [Amazon Detective](detective.md) | `/orgs/*`, `/graphs/list`, `/graph/*` | REST JSON | 8 |
 | [Amazon Connect](connect.md) | `/instance`, `/instance/{instanceId}/*`, `/tags/*` | REST JSON | 15 |
 | [Amazon AppIntegrations](appintegrations.md) | `/eventIntegrations/*`, `/dataIntegrations/*`, `/tags/*` | REST JSON | 14 |
