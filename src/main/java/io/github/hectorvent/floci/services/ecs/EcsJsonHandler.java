@@ -933,8 +933,9 @@ public class EcsJsonHandler {
         String status = parseChoice(req, "status", CONTAINER_INSTANCE_STATUSES);
         Integer maxResults = req.hasNonNull("maxResults") ? req.path("maxResults").asInt() : null;
         String nextToken = req.hasNonNull("nextToken") ? req.path("nextToken").asText() : null;
+        String filter = req.hasNonNull("filter") ? req.path("filter").asText() : null;
         EcsService.ListPage page =
-                service.listContainerInstances(cluster, status, maxResults, nextToken, region);
+                service.listContainerInstances(cluster, status, maxResults, nextToken, filter, region);
         ObjectNode resp = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
         page.arns().forEach(arr::add);

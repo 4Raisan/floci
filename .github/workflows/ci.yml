@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - fix/ecs-instance-filter-7012
     paths:
       - 'src/**'
       - 'pom.xml'
@@ -231,3 +232,32 @@ jobs:
         uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2
         with:
           paths: 'shards/shard-*/target/surefire-reports/TEST-*.xml,shards/shard-*/surefire-reports/TEST-*.xml'
+
+  checkstyle:
+    name: Checkstyle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      # Restore only. CI shard 1 owns saving this cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Run Checkstyle
+        run: ./mvnw -B checkstyle:check
+
+      - name: Test import-order rules
+        run: python3 tools/checkstyle/test_import_order.py
+
+      - name: Test that each suppression matches exactly one file
+        run: python3 tools/checkstyle/test_suppressions.py

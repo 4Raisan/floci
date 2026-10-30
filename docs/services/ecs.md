@@ -727,7 +727,9 @@ dropping it, so a later `DescribeContainerInstances` still answers for it, as on
 
 `ListContainerInstances` defaults to every instance other than the `INACTIVE` ones, validates
 `status` against the five documented values, and pages with `maxResults` (1 to 100) and
-`nextToken`. The cluster query language `filter` is accepted and ignored.
+`nextToken`. The cluster query language `filter` selects instances before pagination. It supports
+attributes, agent connection and version, EC2 instance ID, registration time, running task count,
+and task group, with comparison, membership, pattern, existence, and Boolean operators.
 
 `UpdateContainerInstancesState` sets only `ACTIVE` or `DRAINING`, takes at most 10 instances per
 call, and refuses to drain an instance that is not `ACTIVE` first. It and

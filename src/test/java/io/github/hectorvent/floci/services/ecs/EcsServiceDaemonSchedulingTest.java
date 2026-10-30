@@ -41,6 +41,38 @@ class EcsServiceDaemonSchedulingTest {
     private static final String REGION = "us-east-1";
 
     @Test
+    void containerQueryFindsLiveTaskGroupsAndExcludesStoppedTasks() {
+        EcsService service = newMockModeService();
+        service.createCluster("query-cluster", REGION);
+        ContainerInstance instance = service.registerContainerInstance("query-cluster", null, List.of(), REGION);
+        registerTaskDef(service);
+        service.createService("query-cluster", "query-svc", "daemon-fam", 1, LaunchType.EC2,
+                List.of(), null, null, "DAEMON", null, null, REGION);
+        service.reconcileServices();
+        service.reconcileServices();
+
+        assertEquals(List.of(instance.getContainerInstanceArn()), service.listContainerInstances(
+                "query-cluster", null, null, null, "task:group == service:query-svc", REGION).arns());
+        assertEquals(List.of(instance.getContainerInstanceArn()), service.listContainerInstances(
+                "query-cluster", null, null, null, "runningTasksCount == 1", REGION).arns());
+        assertTrue(service.listContainerInstances("query-cluster", null, null, null,
+                "task:group == service:other", REGION).arns().isEmpty());
+
+        EcsTask transitioning = runningTasks(service).getFirst();
+        transitioning.setLastStatus("PENDING");
+        assertEquals(List.of(instance.getContainerInstanceArn()), service.listContainerInstances(
+                "query-cluster", null, null, null, "runningTasksCount == 1", REGION).arns());
+        transitioning.setLastStatus("RUNNING");
+        transitioning.setDesiredStatus("STOPPED");
+        assertTrue(service.listContainerInstances("query-cluster", null, null, null,
+                "runningTasksCount == 1", REGION).arns().isEmpty());
+
+        service.stopTask("query-cluster", transitioning.getTaskArn(), "query regression", REGION);
+        assertTrue(service.listContainerInstances("query-cluster", null, null, null,
+                "task:group == service:query-svc", REGION).arns().isEmpty());
+    }
+
+    @Test
     void daemonServiceRunsExactlyOneTaskPerActiveContainerInstance() {
         EcsService service = newMockModeService();
         service.createCluster("daemon-cluster", REGION);
