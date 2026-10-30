@@ -821,6 +821,19 @@ public class Ec2QueryHandler {
         int networkInterfaceDeviceIndex = parseIntParam(p, "NetworkInterface.1.DeviceIndex", 0);
         String clientToken = p.getFirst("ClientToken");
         List<String> sgIds = getList(p, "SecurityGroupId");
+        // With a primary interface spec the groups travel on it: Terraform's aws_instance sends that
+        // shape whenever private_ip or associate_public_ip_address is set. A spec with another device
+        // index is a secondary interface, whose groups are not the instance's.
+        List<String> interfaceSgIds = networkInterfaceDeviceIndex == 0
+                ? getList(p, "NetworkInterface.1.SecurityGroupId") : List.of();
+        if (!interfaceSgIds.isEmpty()) {
+            if (!sgIds.isEmpty()) {
+                throw new AwsException("InvalidParameterCombination",
+                        "Network interfaces and an instance-level security groups may not be specified on "
+                                + "the same request", 400);
+            }
+            sgIds = interfaceSgIds;
+        }
 
         // UserData is base64-encoded in the wire format
         String userDataEncoded = p.getFirst("UserData");
