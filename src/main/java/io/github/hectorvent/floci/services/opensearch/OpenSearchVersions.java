@@ -85,6 +85,11 @@ public final class OpenSearchVersions {
         // line, so non-2.19 2.x sources do NOT list any 3.x targets directly.
         // https://docs.aws.amazon.com/opensearch-service/latest/developerguide/version-migration.html
         COMPAT_MATRIX.put("Elasticsearch_7.10", List.of("OpenSearch_1.3", "OpenSearch_2.19"));
+        // The GetCompatibleVersions API example enumerates these 1.x hops.
+        // https://docs.aws.amazon.com/opensearch-service/latest/APIReference/API_GetCompatibleVersions.html
+        COMPAT_MATRIX.put("OpenSearch_1.0", List.of("OpenSearch_1.1", "OpenSearch_1.2", "OpenSearch_1.3"));
+        COMPAT_MATRIX.put("OpenSearch_1.1", List.of("OpenSearch_1.2", "OpenSearch_1.3"));
+        COMPAT_MATRIX.put("OpenSearch_1.2", List.of("OpenSearch_1.3"));
         COMPAT_MATRIX.put("OpenSearch_1.3", List.of("OpenSearch_2.19", "OpenSearch_2.17", "OpenSearch_2.15", "OpenSearch_2.13"));
         COMPAT_MATRIX.put("OpenSearch_2.19", List.of("OpenSearch_3.0", "OpenSearch_3.1", "OpenSearch_3.6"));
         COMPAT_MATRIX.put("OpenSearch_2.17", List.of("OpenSearch_2.19"));
@@ -92,8 +97,19 @@ public final class OpenSearchVersions {
         COMPAT_MATRIX.put("OpenSearch_2.13", List.of("OpenSearch_2.19"));
         COMPAT_MATRIX.put("OpenSearch_2.11", List.of("OpenSearch_2.13", "OpenSearch_2.19"));
         COMPAT_MATRIX.put("OpenSearch_2.9", List.of("OpenSearch_2.11", "OpenSearch_2.13"));
-        COMPAT_MATRIX.put("OpenSearch_3.0", List.of("OpenSearch_3.1", "OpenSearch_3.6"));
-        COMPAT_MATRIX.put("OpenSearch_3.1", List.of("OpenSearch_3.2", "OpenSearch_3.6"));
+        // AWS documents 3.x to 3.x upgrades at the major-version level. Offer
+        // later supported 3.x releases, without same-version or downgrade paths.
+        COMPAT_MATRIX.put("OpenSearch_3.0", List.of("OpenSearch_3.1", "OpenSearch_3.2", "OpenSearch_3.3",
+                "OpenSearch_3.4", "OpenSearch_3.5", "OpenSearch_3.6", "OpenSearch_3.7"));
+        COMPAT_MATRIX.put("OpenSearch_3.1", List.of("OpenSearch_3.2", "OpenSearch_3.3", "OpenSearch_3.4",
+                "OpenSearch_3.5", "OpenSearch_3.6", "OpenSearch_3.7"));
+        COMPAT_MATRIX.put("OpenSearch_3.2", List.of("OpenSearch_3.3", "OpenSearch_3.4", "OpenSearch_3.5",
+                "OpenSearch_3.6", "OpenSearch_3.7"));
+        COMPAT_MATRIX.put("OpenSearch_3.3", List.of("OpenSearch_3.4", "OpenSearch_3.5", "OpenSearch_3.6",
+                "OpenSearch_3.7"));
+        COMPAT_MATRIX.put("OpenSearch_3.4", List.of("OpenSearch_3.5", "OpenSearch_3.6", "OpenSearch_3.7"));
+        COMPAT_MATRIX.put("OpenSearch_3.5", List.of("OpenSearch_3.6", "OpenSearch_3.7"));
+        COMPAT_MATRIX.put("OpenSearch_3.6", List.of("OpenSearch_3.7"));
     }
 
     private OpenSearchVersions() {
