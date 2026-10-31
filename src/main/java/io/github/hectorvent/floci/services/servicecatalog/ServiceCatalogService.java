@@ -1078,7 +1078,11 @@ public class ServiceCatalogService implements PassedRoleLookup {
         }
         return associationStore.scan(key -> true).stream()
                 .filter(record -> "RECORD".equals(text(record, "Type")) && id.equals(text(record, "RecordId")))
-                .findFirst().map(ObjectNode::deepCopy)
+                .findFirst().map(record -> {
+                    ObjectNode detail = record.deepCopy();
+                    detail.remove("Type");
+                    return detail;
+                })
                 .orElseThrow(() -> notFound("record", id));
     }
 

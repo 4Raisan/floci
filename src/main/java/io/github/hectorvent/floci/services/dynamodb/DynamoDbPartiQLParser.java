@@ -527,9 +527,128 @@ public class DynamoDbPartiQLParser {
             case DELETE -> parseDelete();
             default -> {
                 requireTermStart();
-                throw validationEx(NOT_WELL_FORMED + "Expected data manipulation");
+                throw validationEx(expressionStatementRefusal());
             }
         };
+    }
+
+    // DynamoDB reads any other statement as one expression and refuses it by the kind of that expression.
+    private String expressionStatementRefusal() {
+        String kind = parseTermKind();
+        if (kind == null || continuesExpression(peek())) {
+            return NOT_WELL_FORMED + "Expected data manipulation";
+        }
+        if (peek().type() == TType.SEMICOLON) {
+            advance();
+        }
+        if (peek().type() != TType.EOF) {
+            return UNEXPECTED_TOKEN;
+        }
+        return OPERATOR.equals(kind) ? NOT_WELL_FORMED + "Expected data manipulation" : "Unsupported operation: " + kind;
+    }
+
+    // A sign on anything but a number, or IS NOT. DynamoDB refuses it with a message of its own.
+    private static final String OPERATOR = "Operator";
+
+    // A sign folds into the number it applies to. It binds tighter than IS and looser than a path step.
+    private String parseTermKind() {
+        Deque<Boolean> signedGroups = new ArrayDeque<>();
+        boolean signed = skipSigns();
+        while (peek().type() == TType.LPAREN) {
+            advance();
+            requireTermStart();
+            signedGroups.push(signed);
+            signed = skipSigns();
+        }
+        Token primary = peek();
+        String kind = parsePrimaryKind();
+        if (kind == null) {
+            return null;
+        }
+        boolean number = primary.type() == TType.NUMBER;
+        signed |= number && primary.value().startsWith("-");
+        while (true) {
+            if (addPathSteps(new ArrayList<>())) {
+                kind = "Path";
+                number = false;
+            }
+            if (signed) {
+                kind = number ? "Lit" : OPERATOR;
+            }
+            while (peek().type() == TType.IS) {
+                advance();
+                boolean negated = peek().type() == TType.NOT;
+                if (negated) {
+                    advance();
+                }
+                parseTypeName(negated);
+                kind = negated ? OPERATOR : "IsType";
+                number = false;
+            }
+            if (signedGroups.isEmpty() || peek().type() != TType.RPAREN) {
+                break;
+            }
+            advance();
+            signed = signedGroups.pop();
+        }
+        if (signedGroups.isEmpty()) {
+            return kind;
+        }
+        if (continuesExpression(peek())) {
+            return null;
+        }
+        throw validationEx(NOT_WELL_FORMED + "Expected RIGHT_PAREN");
+    }
+
+    private boolean skipSigns() {
+        boolean signed = false;
+        while (peek().type() == TType.PLUS || peek().type() == TType.MINUS) {
+            advance();
+            signed = true;
+        }
+        return signed;
+    }
+
+    private String parsePrimaryKind() {
+        Token t = peek();
+        return switch (t.type()) {
+            case QUESTION -> {
+                advance();
+                yield "Parameter";
+            }
+            case MISSING -> {
+                advance();
+                yield "Missing";
+            }
+            case STRING, NUMBER, BOOL, NULL -> {
+                advance();
+                yield "Lit";
+            }
+            case LBRACKET, LBRACE, LBAG -> {
+                parseValue();
+                yield switch (t.type()) {
+                    case LBRACKET -> "List";
+                    case LBRACE -> "Struct";
+                    default -> "Bag";
+                };
+            }
+            case IDENT -> {
+                if (isBareWord(t) && KEYWORDS.contains(t.value().toLowerCase(Locale.ROOT))
+                        || tokens.get(pos + 1).type() == TType.LPAREN) {
+                    yield null;
+                }
+                yield parsePath().segments().size() == 1 ? "Id" : "Path";
+            }
+            default -> null;
+        };
+    }
+
+    private static final Set<TType> EXPRESSION_CONTINUATIONS = EnumSet.of(TType.EQ, TType.NE, TType.LT, TType.LE,
+            TType.GT, TType.GE, TType.AND, TType.OR, TType.NOT, TType.IN, TType.BETWEEN, TType.PLUS, TType.MINUS);
+
+    private boolean continuesExpression(Token t) {
+        return EXPRESSION_CONTINUATIONS.contains(t.type()) || isStar(t)
+                || Stream.of("LIKE", "UNION", "INTERSECT", "EXCEPT").anyMatch(word -> isWord(t, word));
     }
 
     // SELECT col [, col …] | * FROM "Table"["." "Index"] [WHERE cond [AND cond …]]
@@ -1327,6 +1446,12 @@ public class DynamoDbPartiQLParser {
         requireTermStart();
         List<Seg> segments = new ArrayList<>();
         segments.add(new Seg.Name(expectIdent()));
+        addPathSteps(segments);
+        return new Path(List.copyOf(segments));
+    }
+
+    private boolean addPathSteps(List<Seg> segments) {
+        int start = segments.size();
         while (true) {
             switch (peek().type()) {
                 case DOT -> {
@@ -1339,7 +1464,7 @@ public class DynamoDbPartiQLParser {
                     consume(TType.RBRACKET);
                 }
                 default -> {
-                    return new Path(List.copyOf(segments));
+                    return start < segments.size();
                 }
             }
         }
