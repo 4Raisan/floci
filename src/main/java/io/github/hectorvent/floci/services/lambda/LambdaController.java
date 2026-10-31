@@ -734,17 +734,22 @@ public class LambdaController {
         node.put("CodeSha256", fn.getCodeSha256() != null ? fn.getCodeSha256() : "");
         node.put("PackageType", fn.getPackageType());
         if (fn.getImageUri() != null) node.put("ImageUri", fn.getImageUri());
-        if ("Image".equals(fn.getPackageType())) {
+        boolean hasCommand = fn.getImageConfigCommand() != null && !fn.getImageConfigCommand().isEmpty();
+        boolean hasEntryPoint = fn.getImageConfigEntryPoint() != null && !fn.getImageConfigEntryPoint().isEmpty();
+        boolean hasWorkingDirectory = fn.getImageConfigWorkingDirectory() != null
+                && !fn.getImageConfigWorkingDirectory().isBlank();
+        // AWS omits ImageConfigResponse when no override is set; an empty one reads as drift in Terraform.
+        if ("Image".equals(fn.getPackageType()) && (hasCommand || hasEntryPoint || hasWorkingDirectory)) {
             ObjectNode imageConfig = node.putObject("ImageConfigResponse").putObject("ImageConfig");
-            if (fn.getImageConfigCommand() != null && !fn.getImageConfigCommand().isEmpty()) {
+            if (hasCommand) {
                 ArrayNode cmdNode = imageConfig.putArray("Command");
                 fn.getImageConfigCommand().forEach(cmdNode::add);
             }
-            if (fn.getImageConfigEntryPoint() != null && !fn.getImageConfigEntryPoint().isEmpty()) {
+            if (hasEntryPoint) {
                 ArrayNode epNode = imageConfig.putArray("EntryPoint");
                 fn.getImageConfigEntryPoint().forEach(epNode::add);
             }
-            if (fn.getImageConfigWorkingDirectory() != null && !fn.getImageConfigWorkingDirectory().isBlank()) {
+            if (hasWorkingDirectory) {
                 imageConfig.put("WorkingDirectory", fn.getImageConfigWorkingDirectory());
             }
         }
