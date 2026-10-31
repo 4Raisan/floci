@@ -132,6 +132,22 @@ class SamLayerVersionTransformTest {
     }
 
     @Test
+    void subOverlayVariablesWinOverSameNamedParameters() throws Exception {
+        ObjectNode input = (ObjectNode) template("""
+                {"ContentUri":{"Bucket":{"Fn::Sub":["${Bucket}-${Env}",{"Bucket":"layers"}]},
+                 "Key":{"Fn::Sub":["${Env}/${Key}.zip",{"Key":"layer"}]}}}
+                """);
+        input.putObject("Parameters").putObject("Bucket").put("Type", "String").put("Default", "other-bucket");
+        ((ObjectNode) input.path("Parameters")).putObject("Env").put("Type", "String").put("Default", "staging");
+        JsonNode content = processor.expandSamTemplate(input).path("Resources").elements().next()
+                .path("Properties").path("Content");
+        assertEquals("${Bucket}-staging", content.at("/S3Bucket/Fn::Sub/0").asText());
+        assertEquals("layers", content.at("/S3Bucket/Fn::Sub/1/Bucket").asText());
+        assertEquals("staging/${Key}.zip", content.at("/S3Key/Fn::Sub/0").asText());
+        assertEquals("layer", content.at("/S3Key/Fn::Sub/1/Key").asText());
+    }
+
+    @Test
     void literalDependsOnValuesAreNotResourceDependencies() throws Exception {
         ObjectNode input = (ObjectNode) template("{\"ContentUri\":\"s3://layers/code.zip\"}");
         ObjectNode function = ((ObjectNode) input.path("Resources")).putObject("Function");

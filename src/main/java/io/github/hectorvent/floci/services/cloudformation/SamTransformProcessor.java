@@ -1388,11 +1388,15 @@ class SamTransformProcessor {
             JsonNode sub = node.get("Fn::Sub");
             ObjectNode resolved = objectMapper.createObjectNode();
             if (sub.isTextual()) {
-                resolved.put("Fn::Sub", substituteParameters(sub.asText(), template, parameterValues));
+                resolved.put("Fn::Sub", substituteParameters(sub.asText(), template, parameterValues, Set.of()));
             } else if (sub.isArray() && !sub.isEmpty() && sub.get(0).isTextual()) {
+                Set<String> localVariables = new LinkedHashSet<>();
+                if (sub.size() > 1 && sub.get(1).isObject()) {
+                    sub.get(1).fieldNames().forEachRemaining(localVariables::add);
+                }
                 ArrayNode arguments = (ArrayNode) resolveParameterRefs(sub, template, parameterValues);
                 arguments.set(0, TextNode.valueOf(substituteParameters(sub.get(0).asText(), template,
-                        parameterValues)));
+                        parameterValues, localVariables)));
                 resolved.set("Fn::Sub", arguments);
             } else {
                 resolved.set("Fn::Sub", resolveParameterRefs(sub, template, parameterValues));
@@ -1413,12 +1417,17 @@ class SamTransformProcessor {
         return node;
     }
 
-    /** {@code text} with each {@code ${Name}} naming a template parameter replaced by its value. */
-    private static String substituteParameters(String text, JsonNode template, Map<String, String> parameterValues) {
+    /**
+     * {@code text} with each {@code ${Name}} naming a template parameter replaced by its value. Names that
+     * the same {@code Fn::Sub} localizes in its variable map are left for the template engine to resolve.
+     */
+    private static String substituteParameters(String text, JsonNode template, Map<String, String> parameterValues,
+                                               Set<String> localVariables) {
         Matcher matcher = SUB_REFERENCE.matcher(text);
         StringBuilder substituted = new StringBuilder();
         while (matcher.find()) {
-            String value = parameterValue(matcher.group(1), template, parameterValues);
+            String name = matcher.group(1);
+            String value = localVariables.contains(name) ? null : parameterValue(name, template, parameterValues);
             matcher.appendReplacement(substituted, Matcher.quoteReplacement(value == null ? matcher.group() : value));
         }
         matcher.appendTail(substituted);
