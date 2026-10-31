@@ -2715,7 +2715,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             putTags(region, attachmentId, new ArrayList<>(attachmentTags));
         }
         transitGatewayVpcAttachments.put(key(region, attachmentId), attachment);
+        String propagationTableId = gateway.getOptions().getPropagationDefaultRouteTableId();
+        if ("enable".equals(gateway.getOptions().getDefaultRouteTablePropagation()) && propagationTableId != null) {
+            storePropagation(region, propagationTableId, attachmentId, vpcId);
+        }
         return attachment;
+    }
+
+    private TransitGatewayRouteTablePropagation storePropagation(
+            String region, String routeTableId, String attachmentId, String vpcId) {
+        TransitGatewayRouteTablePropagation propagation = new TransitGatewayRouteTablePropagation();
+        propagation.setTransitGatewayRouteTableId(routeTableId);
+        propagation.setTransitGatewayAttachmentId(attachmentId);
+        propagation.setResourceId(vpcId);
+        propagation.setResourceType("vpc");
+        // Verified live: propagation reports the settled state at once, where association
+        // reports associating first.
+        propagation.setState("enabled");
+        propagation.setRegion(region);
+        transitGatewayPropagations.put(propagationKey(region, routeTableId, attachmentId), propagation);
+        return propagation;
     }
 
     /**
@@ -3301,17 +3320,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("TransitGatewayRouteTablePropagation.Duplicate", "Propagation "
                         + attachmentId + " already exists in Transit Gateway Route Table " + routeTableId + ".", 400);
             }
-            TransitGatewayRouteTablePropagation propagation = new TransitGatewayRouteTablePropagation();
-            propagation.setTransitGatewayRouteTableId(routeTableId);
-            propagation.setTransitGatewayAttachmentId(attachmentId);
-            propagation.setResourceId(attachment.getVpcId());
-            propagation.setResourceType("vpc");
-            // Verified live: propagation reports the settled state at once, where association
-            // reports associating first.
-            propagation.setState("enabled");
-            propagation.setRegion(region);
-            transitGatewayPropagations.put(propagationKey(region, routeTableId, attachmentId), propagation);
-            return propagation;
+            return storePropagation(region, routeTableId, attachmentId, attachment.getVpcId());
         }
     }
 

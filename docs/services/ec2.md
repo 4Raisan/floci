@@ -720,6 +720,8 @@ returns `Resource.AlreadyAssociated` rather than moving it — disassociate firs
 recorded on the attachment itself, which is why `GetTransitGatewayRouteTableAssociations` reports
 the attachment's VPC as the associated resource.
 
+A VPC attachment is propagated into the gateway's default propagation route table on creation when the gateway has `DefaultRouteTablePropagation` enabled, and leaves it when the attachment is deleted.
+
 Propagation is separate: one attachment may propagate into several route tables. Enabling twice
 returns `TransitGatewayRouteTablePropagation.Duplicate`. Unlike association, which reports
 `associating` and `disassociating`, propagation reports the settled `enabled` or `disabled` at
