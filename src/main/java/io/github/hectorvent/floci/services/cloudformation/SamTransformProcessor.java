@@ -262,15 +262,7 @@ class SamTransformProcessor {
             hashResource.remove(List.of("Metadata", "DeletionPolicy", "UpdateReplacePolicy"));
             ObjectNode hashInput = objectMapper.createObjectNode();
             hashInput.set(id, hashResource);
-            String generatedId;
-            try {
-                String serialized = objectMapper.writer().with(JsonNodeFeature.WRITE_PROPERTIES_SORTED)
-                        .with(JsonWriteFeature.ESCAPE_NON_ASCII).without(JsonWriteFeature.WRITE_HEX_UPPER_CASE)
-                        .writeValueAsString(hashInput).replace("\u007f", "\\u007f");
-                generatedId = id + Digests.sha1Hex(serialized).substring(0, 10);
-            } catch (JsonProcessingException e) {
-                throw new IllegalStateException("Cannot serialize the layer hash input of " + id, e);
-            }
+            String generatedId = id + samHashSuffix(hashInput, id);
             if (resources.has(generatedId)) {
                 throw invalidResource(id, "Generated layer logical id conflicts with resource '" + generatedId + "'.");
             }
@@ -1342,19 +1334,7 @@ class SamTransformProcessor {
                 hashed.set("SnapStart", snapStart.deepCopy());
             }
         }
-        String hashInput;
-        try {
-            hashInput = objectMapper.writer()
-                    .with(JsonNodeFeature.WRITE_PROPERTIES_SORTED)
-                    .with(JsonWriteFeature.ESCAPE_NON_ASCII)
-                    .without(JsonWriteFeature.WRITE_HEX_UPPER_CASE)
-                    .writeValueAsString(hashed)
-                    // ESCAPE_NON_ASCII leaves DEL as it is; SAM's hash input escapes DEL as well.
-                    .replace("\u007f", "\\u007f");
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("Cannot serialize the version hash input of " + functionLogicalId, e);
-        }
-        return functionLogicalId + "Version" + Digests.sha1Hex(hashInput).substring(0, 10);
+        return functionLogicalId + "Version" + samHashSuffix(hashed, functionLogicalId);
     }
 
     /**
@@ -1697,6 +1677,27 @@ class SamTransformProcessor {
                 .add(objectMapper.createObjectNode().set("Condition", conditionRef(propertyCondition))));
         conditions(context.template()).set(name, and);
         return name;
+    }
+
+    /**
+     * The first ten hex digits of the SHA-1 of SAM's canonical form of {@code hashInput}: properties
+     * sorted, non-ASCII escaped, and DEL escaped as well, because ESCAPE_NON_ASCII leaves DEL as it is
+     * while SAM's hash input escapes it. A generated logical id is its subject plus this suffix, so a
+     * layer version and a function version hash their input exactly alike.
+     */
+    private String samHashSuffix(JsonNode hashInput, String subject) {
+        String serialized;
+        try {
+            serialized = objectMapper.writer()
+                    .with(JsonNodeFeature.WRITE_PROPERTIES_SORTED)
+                    .with(JsonWriteFeature.ESCAPE_NON_ASCII)
+                    .without(JsonWriteFeature.WRITE_HEX_UPPER_CASE)
+                    .writeValueAsString(hashInput)
+                    .replace("\u007f", "\\u007f");
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Cannot serialize the hash input of " + subject, e);
+        }
+        return Digests.sha1Hex(serialized).substring(0, 10);
     }
 
     /**
