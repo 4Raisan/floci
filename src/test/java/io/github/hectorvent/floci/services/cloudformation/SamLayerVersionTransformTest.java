@@ -123,9 +123,13 @@ class SamLayerVersionTransformTest {
         function.put("Type", "AWS::Serverless::Function");
         function.putObject("Properties").put("Runtime", "nodejs22.x").put("Handler", "index.handler")
                 .put("InlineCode", "exports.handler=async()=>({})");
+        ((ObjectNode) function.path("Properties")).putArray("Layers")
+                .add("arn:aws:lambda:us-east-1:123456789012:layer:local:1");
         JsonNode result = processor.expandSamTemplate(input);
         String id = result.at("/Outputs/LayerArn/Value/Ref").asText();
         assertEquals(id, result.at("/Resources/Function/Properties/Layers/0/Ref").asText());
+        assertEquals("arn:aws:lambda:us-east-1:123456789012:layer:local:1",
+                result.at("/Resources/Function/Properties/Layers/1").asText());
     }
 
     @Test

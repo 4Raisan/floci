@@ -1099,8 +1099,8 @@ class SamTransformProcessor {
      *
      * <p>Nested objects (e.g. {@code Environment.Variables}, {@code Tags}) are merged key-wise, so a
      * resource only overrides the individual keys it sets and global entries are preserved — matching
-     * SAM's map-merge behavior. Scalar and array-valued properties (e.g. {@code Policies},
-     * {@code Layers}) are overridden wholesale; SAM's additive list-append for those is not implemented.
+     * SAM's map-merge behavior. Lists append global entries first, except
+     * {@code Function.Architectures}, which the resource replaces; scalars are overridden.
      */
     private JsonNode mergeGlobals(JsonNode globals, String section, JsonNode properties) {
         JsonNode sectionGlobals = globals.path(section);
@@ -1110,12 +1110,17 @@ class SamTransformProcessor {
         if (!properties.isObject()) {
             return sectionGlobals.deepCopy();
         }
-        return deepMerge((ObjectNode) sectionGlobals.deepCopy(), (ObjectNode) properties);
+        ObjectNode merged = (ObjectNode) sectionGlobals.deepCopy();
+        if ("Function".equals(section) && properties.has("Architectures")) {
+            merged.remove("Architectures");
+        }
+        return deepMerge(merged, (ObjectNode) properties);
     }
 
     /**
      * Recursively merges {@code override} into {@code base}: when both sides hold an object for the
-     * same key, the objects are merged key-wise; otherwise the override value replaces the base value.
+     * same key, plain objects are merged key-wise; lists are appended with base entries first;
+     * intrinsic function objects and scalar values are replaced by the override value.
      * {@code base} is mutated and returned.
      */
     private ObjectNode deepMerge(ObjectNode base, ObjectNode override) {
@@ -1123,13 +1128,24 @@ class SamTransformProcessor {
             String key = entry.getKey();
             JsonNode overrideValue = entry.getValue();
             JsonNode baseValue = base.get(key);
-            if (baseValue != null && baseValue.isObject() && overrideValue.isObject()) {
+            if (baseValue != null && baseValue.isObject() && overrideValue.isObject()
+                    && !isIntrinsicObject(baseValue) && !isIntrinsicObject(overrideValue)) {
                 base.set(key, deepMerge((ObjectNode) baseValue, (ObjectNode) overrideValue));
+            } else if (baseValue instanceof ArrayNode baseArray && overrideValue.isArray()) {
+                baseArray.addAll((ArrayNode) overrideValue.deepCopy());
             } else {
                 base.set(key, overrideValue.deepCopy());
             }
         });
         return base;
+    }
+
+    private static boolean isIntrinsicObject(JsonNode value) {
+        if (!value.isObject() || value.size() != 1) {
+            return false;
+        }
+        String key = value.fieldNames().next();
+        return key.equals("Ref") || key.startsWith("Fn::");
     }
 
     private String expandServerlessFunction(String logicalId, JsonNode properties, JsonNode source,
