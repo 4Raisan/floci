@@ -2226,6 +2226,14 @@ class SamTransformIntegrationTest {
                 Transform: AWS::Serverless-2016-10-31
                 Parameters:
                   Bucket: {Type: String}
+                  Runtimes: {Type: CommaDelimitedList, Default: 'nodejs22.x,python3.14'}
+                  Architectures: {Type: CommaDelimitedList, Default: arm64}
+                Globals:
+                  Function:
+                    Runtime: nodejs22.x
+                    Architectures: [arm64]
+                    Handler: index.handler
+                    Layers: [!Ref Layer]
                 Resources:
                   Layer:
                     Type: AWS::Serverless::LayerVersion
@@ -2234,10 +2242,18 @@ class SamTransformIntegrationTest {
                       ContentUri:
                         Bucket: !Ref Bucket
                         Key: layer.zip
-                      CompatibleRuntimes: [nodejs22.x]
-                      CompatibleArchitectures: [arm64]
+                      CompatibleRuntimes: !Ref Runtimes
+                      CompatibleArchitectures: !Ref Architectures
                       LicenseInfo: MIT
                       RetentionPolicy: Delete
+                  Function:
+                    Type: AWS::Serverless::Function
+                    Properties:
+                      FunctionName: sam-layer-consumer
+                      InlineCode: 'exports.handler=async()=>({})'
+                      Environment:
+                        Variables:
+                          DependsOn: Layer
                 Outputs:
                   LayerArn:
                     Value: !Ref Layer
@@ -2247,6 +2263,7 @@ class SamTransformIntegrationTest {
         try {
             given().contentType("application/x-www-form-urlencoded")
                     .formParam("Action", "CreateStack").formParam("StackName", stack)
+                    .formParam("Capabilities.member.1", "CAPABILITY_IAM")
                     .formParam("TemplateBody", template)
                     .formParam("Parameters.member.1.ParameterKey", "Bucket")
                     .formParam("Parameters.member.1.ParameterValue", bucket)
@@ -2260,14 +2277,18 @@ class SamTransformIntegrationTest {
             assertThat(stackOutputValue(description, "LayerSub"), equalTo(arn));
             given().when().get("/2018-10-31/layers/sam-shared-layer/versions/1")
                     .then().statusCode(200).body("LayerVersionArn", equalTo(arn))
-                    .body("CompatibleRuntimes", hasItem("nodejs22.x"))
+                    .body("CompatibleRuntimes", hasItems("nodejs22.x", "python3.14"))
                     .body("CompatibleArchitectures", hasItem("arm64"))
                     .body("LicenseInfo", equalTo("MIT"))
                     .body("Content.CodeSize", equalTo(buildHandlerZip().length));
+            given().when().get("/2015-03-31/functions/sam-layer-consumer")
+                    .then().statusCode(200).body("Configuration.Layers[0].Arn", equalTo(arn))
+                    .body("Configuration.Environment.Variables.DependsOn", equalTo("Layer"));
             given().contentType("application/zip").body(buildHandlerZip())
                     .when().put("/" + bucket + "/updated.zip").then().statusCode(200);
             given().contentType("application/x-www-form-urlencoded")
                     .formParam("Action", "UpdateStack").formParam("StackName", stack)
+                    .formParam("Capabilities.member.1", "CAPABILITY_IAM")
                     .formParam("TemplateBody", template.replace("Key: layer.zip", "Key: updated.zip"))
                     .formParam("Parameters.member.1.ParameterKey", "Bucket")
                     .formParam("Parameters.member.1.ParameterValue", bucket)
@@ -2277,6 +2298,10 @@ class SamTransformIntegrationTest {
                     .formParam("Action", "DescribeStacks").formParam("StackName", stack)
                     .when().post("/").then().statusCode(200).extract().asString();
             assertThat(stackOutputValue(updated, "LayerArn"), containsString(":layer:sam-shared-layer:2"));
+            given().when().get("/2015-03-31/functions/sam-layer-consumer")
+                    .then().statusCode(200)
+                    .body("Configuration.Layers[0].Arn", equalTo(stackOutputValue(updated, "LayerArn")))
+                    .body("Configuration.Environment.Variables.DependsOn", equalTo("Layer"));
             given().when().get("/2018-10-31/layers/sam-shared-layer/versions/1")
                     .then().statusCode(404);
             given().contentType("application/x-www-form-urlencoded")

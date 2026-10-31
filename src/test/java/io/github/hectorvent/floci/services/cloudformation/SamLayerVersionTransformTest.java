@@ -104,6 +104,47 @@ class SamLayerVersionTransformTest {
     }
 
     @Test
+    void inheritedGlobalLayersFollowTheGeneratedLayer() throws Exception {
+        ObjectNode input = (ObjectNode) template("{\"ContentUri\":\"s3://layers/code.zip\"}");
+        input.putObject("Globals").putObject("Function").putArray("Layers").addObject().put("Ref", "Layer");
+        ObjectNode function = ((ObjectNode) input.path("Resources")).putObject("Function");
+        function.put("Type", "AWS::Serverless::Function");
+        function.putObject("Properties").put("Runtime", "nodejs22.x").put("Handler", "index.handler")
+                .put("InlineCode", "exports.handler=async()=>({})");
+        JsonNode result = processor.expandSamTemplate(input);
+        String id = result.at("/Outputs/LayerArn/Value/Ref").asText();
+        assertEquals(id, result.at("/Resources/Function/Properties/Layers/0/Ref").asText());
+    }
+
+    @Test
+    void listParameterReferencesRemainTypedForTheProvisioner() throws Exception {
+        ObjectNode input = (ObjectNode) template("""
+                {"ContentUri":"s3://layers/code.zip","CompatibleRuntimes":{"Ref":"Runtimes"},
+                 "CompatibleArchitectures":{"Ref":"Architectures"}}
+                """);
+        input.putObject("Parameters").putObject("Runtimes").put("Type", "CommaDelimitedList")
+                .put("Default", "nodejs22.x,python3.14");
+        ((ObjectNode) input.path("Parameters")).putObject("Architectures").put("Type", "CommaDelimitedList")
+                .put("Default", "arm64");
+        JsonNode layer = processor.expandSamTemplate(input).path("Resources").elements().next();
+        assertEquals("Runtimes", layer.at("/Properties/CompatibleRuntimes/Ref").asText());
+        assertEquals("Architectures", layer.at("/Properties/CompatibleArchitectures/Ref").asText());
+    }
+
+    @Test
+    void literalDependsOnValuesAreNotResourceDependencies() throws Exception {
+        ObjectNode input = (ObjectNode) template("{\"ContentUri\":\"s3://layers/code.zip\"}");
+        ObjectNode function = ((ObjectNode) input.path("Resources")).putObject("Function");
+        function.put("Type", "AWS::Serverless::Function");
+        ObjectNode properties = function.putObject("Properties");
+        properties.put("Runtime", "nodejs22.x").put("Handler", "index.handler")
+                .put("InlineCode", "exports.handler=async()=>({})");
+        properties.putObject("Environment").putObject("Variables").put("DependsOn", "Layer");
+        JsonNode result = processor.expandSamTemplate(input);
+        assertEquals("Layer", result.at("/Resources/Function/Properties/Environment/Variables/DependsOn").asText());
+    }
+
+    @Test
     void unpackagedOrIncompleteContentIsRejectedBeforeProvisioning() throws Exception {
         for (String props : new String[]{"{}", "{\"ContentUri\":\"./layer\"}",
                 "{\"ContentUri\":{\"Bucket\":\"layers\"}}",

@@ -121,7 +121,7 @@ class SamTransformProcessor {
             }
         });
 
-        expandServerlessLayers(expanded, expandedResources, parameterValues);
+        expandServerlessLayers(expanded, expandedResources, globals, parameterValues);
         samLogicalIds.removeIf(id -> !expandedResources.has(id));
 
         // Collect implicit-API routes from function Api events before the functions are expanded.
@@ -209,7 +209,7 @@ class SamTransformProcessor {
         }
     }
 
-    private void expandServerlessLayers(ObjectNode template, ObjectNode resources,
+    private void expandServerlessLayers(ObjectNode template, ObjectNode resources, JsonNode globals,
                                         Map<String, String> parameterValues) {
         Map<String, String> layerIds = new LinkedHashMap<>();
         List<String> ids = new ArrayList<>();
@@ -219,8 +219,9 @@ class SamTransformProcessor {
             if (!"AWS::Serverless::LayerVersion".equals(source.path("Type").asText())) {
                 continue;
             }
-            JsonNode properties = resolveParameterRefs(source.path("Properties"), template, parameterValues);
-            JsonNode uri = properties.path("ContentUri");
+            JsonNode properties = source.path("Properties");
+            JsonNode resolvedProperties = resolveParameterRefs(properties, template, parameterValues);
+            JsonNode uri = resolvedProperties.path("ContentUri");
             ObjectNode content = objectMapper.createObjectNode();
             if (uri.isTextual()) {
                 Matcher match = S3_DEFINITION_URI.matcher(uri.asText());
@@ -239,7 +240,7 @@ class SamTransformProcessor {
             } else {
                 throw invalidResource(id, "'ContentUri' requires Bucket and Key properties to be specified.");
             }
-            String retention = properties.path("RetentionPolicy").asText(null);
+            String retention = resolvedProperties.path("RetentionPolicy").asText(null);
             if (retention != null && !List.of("Retain", "Delete").contains(retention)) {
                 throw invalidResource(id, "'RetentionPolicy' must be 'Retain' or 'Delete'.");
             }
@@ -257,7 +258,7 @@ class SamTransformProcessor {
                 copyIfPresent(properties, key, target);
             }
             ObjectNode hashResource = source.deepCopy();
-            hashResource.set("Properties", properties);
+            hashResource.set("Properties", resolvedProperties);
             hashResource.remove(List.of("Metadata", "DeletionPolicy", "UpdateReplacePolicy"));
             ObjectNode hashInput = objectMapper.createObjectNode();
             hashInput.set(id, hashResource);
@@ -279,6 +280,12 @@ class SamTransformProcessor {
         }
         if (!layerIds.isEmpty()) {
             rewriteLayerReferences(template, layerIds);
+            rewriteLayerReferences(globals, layerIds);
+            resources.elements().forEachRemaining(resource -> {
+                if (resource instanceof ObjectNode object) {
+                    rewriteLayerDependencies(object, layerIds);
+                }
+            });
         }
     }
 
@@ -293,17 +300,6 @@ class SamTransformProcessor {
             } else if (getAtt.isTextual()) {
                 object.put("Fn::GetAtt", rewriteLayerName(getAtt.asText(), ids));
             }
-            JsonNode dependsOn = object.path("DependsOn");
-            if (dependsOn.isTextual() && ids.containsKey(dependsOn.asText())) {
-                object.put("DependsOn", ids.get(dependsOn.asText()));
-            } else if (dependsOn instanceof ArrayNode array) {
-                for (int i = 0; i < array.size(); i++) {
-                    String replacement = ids.get(array.get(i).asText());
-                    if (replacement != null) {
-                        array.set(i, TextNode.valueOf(replacement));
-                    }
-                }
-            }
             JsonNode sub = object.path("Fn::Sub");
             if (sub.isTextual()) {
                 object.put("Fn::Sub", rewriteLayerSub(sub.asText(), ids, objectMapper.createObjectNode()));
@@ -313,6 +309,20 @@ class SamTransformProcessor {
             object.elements().forEachRemaining(child -> rewriteLayerReferences(child, ids));
         } else if (node.isArray()) {
             node.forEach(child -> rewriteLayerReferences(child, ids));
+        }
+    }
+
+    private static void rewriteLayerDependencies(ObjectNode object, Map<String, String> ids) {
+        JsonNode dependsOn = object.path("DependsOn");
+        if (dependsOn.isTextual() && ids.containsKey(dependsOn.asText())) {
+            object.put("DependsOn", ids.get(dependsOn.asText()));
+        } else if (dependsOn instanceof ArrayNode array) {
+            for (int i = 0; i < array.size(); i++) {
+                String replacement = ids.get(array.get(i).asText());
+                if (replacement != null) {
+                    array.set(i, TextNode.valueOf(replacement));
+                }
+            }
         }
     }
 
