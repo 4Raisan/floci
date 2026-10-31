@@ -1152,7 +1152,7 @@ public class ServiceCatalogService implements PassedRoleLookup {
         ObjectNode record = objectMapper.createObjectNode();
         record.put("RecordId", "rec-" + UUID.randomUUID().toString().replace("-", "").substring(0, 16));
         record.put("Status", "SUCCEEDED");
-        record.put("CreatedTime", System.currentTimeMillis() / 1000.0);
+        record.put("CreatedTime", Instant.now(clock).toEpochMilli() / 1000.0);
         return record;
     }
 
