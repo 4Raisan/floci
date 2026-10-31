@@ -182,6 +182,27 @@ class SamLayerVersionTransformTest {
     }
 
     @Test
+    void subLocalVariableNamedRefIsNotTreatedAsAResourceReference() throws Exception {
+        ObjectNode input = (ObjectNode) mapper.readTree("""
+                {"Transform":"AWS::Serverless-2016-10-31","Resources":{
+                  "Consumer":{"Type":"AWS::Lambda::Function",
+                    "Properties":{"Layers":[{"Ref":"Layer"}],
+                      "Environment":{"Variables":{"Url":{"Fn::Sub":["${Name}-${Layer}-${Ref}",{"Name":"n","Ref":"Layer"}]}}}}},
+                  "Layer":{"Type":"AWS::Serverless::LayerVersion",
+                    "Properties":{"ContentUri":"s3://layers/code.zip"}}}}
+                """);
+        JsonNode result = processor.expandSamTemplate(input);
+        String id = result.at("/Resources/Consumer/Properties/Layers/0/Ref").asText();
+        assertTrue(id.startsWith("Layer") && id.length() > "Layer".length());
+        JsonNode url = result.at("/Resources/Consumer/Properties/Environment/Variables/Url");
+        // The real ${Layer} use follows the renamed layer, while ${Name} and ${Ref} stay local and
+        // the map value under the variable named Ref remains the literal Layer, never the hashed id.
+        assertEquals("${Name}-${" + id + "}-${Ref}", url.at("/Fn::Sub/0").asText());
+        assertEquals("n", url.at("/Fn::Sub/1/Name").asText());
+        assertEquals("Layer", url.at("/Fn::Sub/1/Ref").asText());
+    }
+
+    @Test
     void literalDependsOnValuesAreNotResourceDependencies() throws Exception {
         ObjectNode input = (ObjectNode) template("{\"ContentUri\":\"s3://layers/code.zip\"}");
         ObjectNode function = ((ObjectNode) input.path("Resources")).putObject("Function");

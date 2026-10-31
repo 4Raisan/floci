@@ -300,8 +300,21 @@ class SamTransformProcessor {
                 object.put("Fn::Sub", rewriteLayerSub(sub.asText(), ids, objectMapper.createObjectNode()));
             } else if (sub instanceof ArrayNode array && array.size() == 2 && array.get(0).isTextual()) {
                 array.set(0, TextNode.valueOf(rewriteLayerSub(array.get(0).asText(), ids, array.get(1))));
+                // Only the map's values are intrinsic contexts; its keys are local variable names
+                // that may themselves be spelled Ref, so walk the values, never the map container.
+                if (array.get(1) instanceof ObjectNode variables) {
+                    variables.elements().forEachRemaining(value -> rewriteLayerReferences(value, ids));
+                }
             }
-            object.elements().forEachRemaining(child -> rewriteLayerReferences(child, ids));
+            // The Fn::Sub node is fully handled above, so skip it here; recursing into its variables
+            // map would treat a variable literally named Ref as a Ref-intrinsic and rewrite it.
+            List<String> keys = new ArrayList<>();
+            object.fieldNames().forEachRemaining(keys::add);
+            for (String key : keys) {
+                if (!"Fn::Sub".equals(key)) {
+                    rewriteLayerReferences(object.get(key), ids);
+                }
+            }
         } else if (node.isArray()) {
             node.forEach(child -> rewriteLayerReferences(child, ids));
         }
