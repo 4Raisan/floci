@@ -433,6 +433,20 @@ status, named with its stack or by its ARN alone; a `StackName` that names no st
 - Hot-reload code (`S3Bucket: hot-reload`) is compared by host path: the same path is a no-op, a different path updates the bind mount in place.
 - `Tags` are applied when the function is created, including a replacement function. On `UpdateStack` the template's tags are applied and only the keys the previous template set and the new one drops are removed, so a tag added outside the template is kept, as in AWS.
 
+## SAM layers
+
+`AWS::Serverless::LayerVersion` expands into `AWS::Lambda::LayerVersion`. Packaged
+`ContentUri` values accept an S3 URI (including `?versionId=`) or a `Bucket`/`Key`/
+optional `Version` object. Local directories must first be packaged with the SAM CLI.
+The transform preserves layer metadata, runtime and architecture compatibility, and
+license information. `Ref` returns the published layer version ARN.
+
+As in SAM, the generated logical id changes with the layer definition, while the
+default layer name remains the original logical id. References and dependencies
+follow the generated resource. Layers default to `DeletionPolicy: Retain`;
+`RetentionPolicy: Delete` deletes the published version when the stack is deleted.
+An explicit resource `DeletionPolicy` is preserved unless `RetentionPolicy` overrides it.
+
 ## SAM published aliases
 
 `AutoPublishAlias` creates a version and points the generated alias at that version's

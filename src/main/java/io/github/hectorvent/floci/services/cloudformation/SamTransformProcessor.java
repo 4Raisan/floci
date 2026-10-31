@@ -121,6 +121,9 @@ class SamTransformProcessor {
             }
         });
 
+        expandServerlessLayers(expanded, expandedResources, parameterValues);
+        samLogicalIds.removeIf(id -> !expandedResources.has(id));
+
         // Collect implicit-API routes from function Api events before the functions are expanded.
         List<ApiRoute> apiRoutes = collectApiRoutes(samLogicalIds, resources);
 
@@ -204,6 +207,131 @@ class SamTransformProcessor {
                 rewriteGeneratedReferences(child, generatedReferences);
             }
         }
+    }
+
+    private void expandServerlessLayers(ObjectNode template, ObjectNode resources,
+                                        Map<String, String> parameterValues) {
+        Map<String, String> layerIds = new LinkedHashMap<>();
+        List<String> ids = new ArrayList<>();
+        resources.fieldNames().forEachRemaining(ids::add);
+        for (String id : ids) {
+            JsonNode source = resources.path(id);
+            if (!"AWS::Serverless::LayerVersion".equals(source.path("Type").asText())) {
+                continue;
+            }
+            JsonNode properties = resolveParameterRefs(source.path("Properties"), template, parameterValues);
+            JsonNode uri = properties.path("ContentUri");
+            ObjectNode content = objectMapper.createObjectNode();
+            if (uri.isTextual()) {
+                Matcher match = S3_DEFINITION_URI.matcher(uri.asText());
+                if (!match.matches()) {
+                    throw invalidResource(id, "'ContentUri' must specify a packaged S3 location.");
+                }
+                content.put("S3Bucket", match.group("bucket"));
+                content.put("S3Key", match.group("key"));
+                if (match.group("version") != null) {
+                    content.put("S3ObjectVersion", match.group("version"));
+                }
+            } else if (uri.isObject() && uri.hasNonNull("Bucket") && uri.hasNonNull("Key")) {
+                copyRenamed(uri, "Bucket", content, "S3Bucket");
+                copyRenamed(uri, "Key", content, "S3Key");
+                copyRenamed(uri, "Version", content, "S3ObjectVersion");
+            } else {
+                throw invalidResource(id, "'ContentUri' requires Bucket and Key properties to be specified.");
+            }
+            String retention = properties.path("RetentionPolicy").asText(null);
+            if (retention != null && !List.of("Retain", "Delete").contains(retention)) {
+                throw invalidResource(id, "'RetentionPolicy' must be 'Retain' or 'Delete'.");
+            }
+            ObjectNode layer = objectMapper.createObjectNode();
+            layer.put("Type", "AWS::Lambda::LayerVersion");
+            copyResourceLevelAttributes(source, layer);
+            if (retention != null || !layer.has("DeletionPolicy")) {
+                layer.put("DeletionPolicy", retention == null ? "Retain" : retention);
+            }
+            ObjectNode target = layer.putObject("Properties");
+            target.set("Content", content);
+            target.set("LayerName", properties.hasNonNull("LayerName")
+                    ? properties.get("LayerName").deepCopy() : TextNode.valueOf(id));
+            for (String key : List.of("Description", "LicenseInfo", "CompatibleRuntimes", "CompatibleArchitectures")) {
+                copyIfPresent(properties, key, target);
+            }
+            ObjectNode hashResource = source.deepCopy();
+            hashResource.set("Properties", properties);
+            hashResource.remove(List.of("Metadata", "DeletionPolicy", "UpdateReplacePolicy"));
+            ObjectNode hashInput = objectMapper.createObjectNode();
+            hashInput.set(id, hashResource);
+            String generatedId;
+            try {
+                String serialized = objectMapper.writer().with(JsonNodeFeature.WRITE_PROPERTIES_SORTED)
+                        .with(JsonWriteFeature.ESCAPE_NON_ASCII).without(JsonWriteFeature.WRITE_HEX_UPPER_CASE)
+                        .writeValueAsString(hashInput).replace("\u007f", "\\u007f");
+                generatedId = id + Digests.sha1Hex(serialized).substring(0, 10);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Cannot serialize the layer hash input of " + id, e);
+            }
+            if (resources.has(generatedId)) {
+                throw invalidResource(id, "Generated layer logical id conflicts with resource '" + generatedId + "'.");
+            }
+            resources.remove(id);
+            resources.set(generatedId, layer);
+            layerIds.put(id, generatedId);
+        }
+        if (!layerIds.isEmpty()) {
+            rewriteLayerReferences(template, layerIds);
+        }
+    }
+
+    private void rewriteLayerReferences(JsonNode node, Map<String, String> ids) {
+        if (node instanceof ObjectNode object) {
+            if (object.path("Ref").isTextual() && ids.containsKey(object.path("Ref").asText())) {
+                object.put("Ref", ids.get(object.path("Ref").asText()));
+            }
+            JsonNode getAtt = object.path("Fn::GetAtt");
+            if (getAtt instanceof ArrayNode array && !array.isEmpty() && ids.containsKey(array.get(0).asText())) {
+                array.set(0, TextNode.valueOf(ids.get(array.get(0).asText())));
+            } else if (getAtt.isTextual()) {
+                object.put("Fn::GetAtt", rewriteLayerName(getAtt.asText(), ids));
+            }
+            JsonNode dependsOn = object.path("DependsOn");
+            if (dependsOn.isTextual() && ids.containsKey(dependsOn.asText())) {
+                object.put("DependsOn", ids.get(dependsOn.asText()));
+            } else if (dependsOn instanceof ArrayNode array) {
+                for (int i = 0; i < array.size(); i++) {
+                    String replacement = ids.get(array.get(i).asText());
+                    if (replacement != null) {
+                        array.set(i, TextNode.valueOf(replacement));
+                    }
+                }
+            }
+            JsonNode sub = object.path("Fn::Sub");
+            if (sub.isTextual()) {
+                object.put("Fn::Sub", rewriteLayerSub(sub.asText(), ids, objectMapper.createObjectNode()));
+            } else if (sub instanceof ArrayNode array && array.size() == 2 && array.get(0).isTextual()) {
+                array.set(0, TextNode.valueOf(rewriteLayerSub(array.get(0).asText(), ids, array.get(1))));
+            }
+            object.elements().forEachRemaining(child -> rewriteLayerReferences(child, ids));
+        } else if (node.isArray()) {
+            node.forEach(child -> rewriteLayerReferences(child, ids));
+        }
+    }
+
+    private static String rewriteLayerName(String name, Map<String, String> ids) {
+        int dot = name.indexOf('.');
+        String id = dot < 0 ? name : name.substring(0, dot);
+        return ids.getOrDefault(id, id) + (dot < 0 ? "" : name.substring(dot));
+    }
+
+    private static String rewriteLayerSub(String text, Map<String, String> ids, JsonNode variables) {
+        Matcher matcher = SUB_REFERENCE.matcher(text);
+        StringBuilder result = new StringBuilder();
+        while (matcher.find()) {
+            String name = matcher.group(1);
+            String replacement = variables.has(name) ? name : rewriteLayerName(name, ids);
+            matcher.appendReplacement(result, Matcher.quoteReplacement("${" + replacement + "}"));
+        }
+        matcher.appendTail(result);
+        return result.toString();
     }
 
     private JsonNode globals(JsonNode template) {
