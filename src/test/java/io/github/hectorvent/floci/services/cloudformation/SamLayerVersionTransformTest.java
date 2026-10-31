@@ -53,6 +53,18 @@ class SamLayerVersionTransformTest {
     }
 
     @Test
+    void wholeContentUriParameterReferenceIsResolvedBeforeSplitting() throws Exception {
+        ObjectNode input = (ObjectNode) template("{\"ContentUri\":{\"Ref\":\"PackageUri\"}}");
+        input.putObject("Parameters").putObject("PackageUri").put("Type", "String")
+                .put("Default", "s3://layers/code.zip?versionId=v9");
+        JsonNode content = processor.expandSamTemplate(input).path("Resources").elements().next()
+                .path("Properties").path("Content");
+        assertEquals("layers", content.path("S3Bucket").asText());
+        assertEquals("code.zip", content.path("S3Key").asText());
+        assertEquals("v9", content.path("S3ObjectVersion").asText());
+    }
+
+    @Test
     void changedContentProducesANewLogicalId() throws Exception {
         JsonNode first = processor.expandSamTemplate(template("{\"ContentUri\":\"s3://layers/one.zip\"}"));
         JsonNode second = processor.expandSamTemplate(template("{\"ContentUri\":\"s3://layers/two.zip\"}"));

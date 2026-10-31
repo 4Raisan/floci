@@ -222,12 +222,29 @@ class SamTransformProcessor {
             JsonNode properties = source.path("Properties");
             JsonNode resolvedProperties = resolveParameterRefs(properties, template, parameterValues);
             // Deploy with the original ContentUri expressions so CloudFormation resolves parameters
-            // once, at deploy; the resolved copy is only what SAM hashes (a versioned bucket/key
-            // must not be baked in, and a resolved value that itself holds a ${...} would resolve twice).
+            // once, at deploy: a resolved value that itself holds a ${...} would resolve twice. The
+            // resolved copy is what SAM hashes, so a versioned package still changes the logical id.
             JsonNode uri = properties.path("ContentUri");
             ObjectNode content = objectMapper.createObjectNode();
-            if (uri.isTextual()) {
-                Matcher match = S3_DEFINITION_URI.matcher(uri.asText());
+            if (uri.isObject() && uri.hasNonNull("Bucket") && uri.hasNonNull("Key")) {
+                copyRenamed(uri, "Bucket", content, "S3Bucket");
+                copyRenamed(uri, "Key", content, "S3Key");
+                copyRenamed(uri, "Version", content, "S3ObjectVersion");
+            } else {
+                // A plain location is split as written, and a whole ContentUri reference resolves to
+                // the location itself, so the resolved value is what gets split. The object form
+                // above keeps its expressions for the template engine to resolve at deploy.
+                JsonNode resolvedUri = resolvedProperties.path("ContentUri");
+                String location = null;
+                if (uri.isTextual()) {
+                    location = uri.asText();
+                } else if (resolvedUri.isTextual()) {
+                    location = resolvedUri.asText();
+                }
+                if (location == null) {
+                    throw invalidResource(id, "'ContentUri' requires Bucket and Key properties to be specified.");
+                }
+                Matcher match = S3_DEFINITION_URI.matcher(location);
                 if (!match.matches()) {
                     throw invalidResource(id, "'ContentUri' must specify a packaged S3 location.");
                 }
@@ -236,12 +253,6 @@ class SamTransformProcessor {
                 if (match.group("version") != null) {
                     content.put("S3ObjectVersion", match.group("version"));
                 }
-            } else if (uri.isObject() && uri.hasNonNull("Bucket") && uri.hasNonNull("Key")) {
-                copyRenamed(uri, "Bucket", content, "S3Bucket");
-                copyRenamed(uri, "Key", content, "S3Key");
-                copyRenamed(uri, "Version", content, "S3ObjectVersion");
-            } else {
-                throw invalidResource(id, "'ContentUri' requires Bucket and Key properties to be specified.");
             }
             String retention = resolvedProperties.path("RetentionPolicy").asText(null);
             if (retention != null && !List.of("Retain", "Delete").contains(retention)) {
