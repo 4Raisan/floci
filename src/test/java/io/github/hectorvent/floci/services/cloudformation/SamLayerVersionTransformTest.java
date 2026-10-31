@@ -141,10 +141,44 @@ class SamLayerVersionTransformTest {
         ((ObjectNode) input.path("Parameters")).putObject("Env").put("Type", "String").put("Default", "staging");
         JsonNode content = processor.expandSamTemplate(input).path("Resources").elements().next()
                 .path("Properties").path("Content");
-        assertEquals("${Bucket}-staging", content.at("/S3Bucket/Fn::Sub/0").asText());
+        // The deployed Content keeps the original !Sub expressions, so CloudFormation resolves the
+        // parameter once at deploy and names the same !Sub declares locally stay local.
+        assertEquals("${Bucket}-${Env}", content.at("/S3Bucket/Fn::Sub/0").asText());
         assertEquals("layers", content.at("/S3Bucket/Fn::Sub/1/Bucket").asText());
-        assertEquals("staging/${Key}.zip", content.at("/S3Key/Fn::Sub/0").asText());
+        assertEquals("${Env}/${Key}.zip", content.at("/S3Key/Fn::Sub/0").asText());
         assertEquals("layer", content.at("/S3Key/Fn::Sub/1/Key").asText());
+    }
+
+    @Test
+    void deployedContentKeepsOriginalSubExpressionsForTheTemplateEngine() throws Exception {
+        // A parameter whose text itself contains ${Env} must not be re-substituted at deploy:
+        // CloudFormation resolves ${PackageKey} once, so the literal stays intact for the engine.
+        ObjectNode input = (ObjectNode) template("""
+                {"ContentUri":{"Bucket":"layers","Key":{"Fn::Sub":"${PackageKey}"}}}
+                """);
+        input.putObject("Parameters").putObject("PackageKey").put("Type", "String").put("Default", "layers/${Env}.zip");
+        ((ObjectNode) input.path("Parameters")).putObject("Env").put("Type", "String").put("Default", "staging");
+        JsonNode content = processor.expandSamTemplate(input).path("Resources").elements().next()
+                .path("Properties").path("Content");
+        assertEquals("${PackageKey}", content.at("/S3Key/Fn::Sub").asText());
+
+        // The deployed bucket and key keep their !Sub forms, but the generated logical id hashes the
+        // resolved copy, so two parameter values that select different packages get two distinct ids.
+        ObjectNode first = (ObjectNode) template("""
+                {"ContentUri":{"Bucket":{"Fn::Sub":"${Bucket}"},"Key":{"Fn::Sub":"${Key}"}}}
+                """);
+        addSubParams(first, "layers", "one.zip");
+        ObjectNode second = (ObjectNode) template("""
+                {"ContentUri":{"Bucket":{"Fn::Sub":"${Bucket}"},"Key":{"Fn::Sub":"${Key}"}}}
+                """);
+        addSubParams(second, "layers", "two.zip");
+        assertNotEquals(processor.expandSamTemplate(first).path("Resources").fieldNames().next(),
+                processor.expandSamTemplate(second).path("Resources").fieldNames().next());
+    }
+
+    private static void addSubParams(ObjectNode input, String bucket, String key) {
+        input.putObject("Parameters").putObject("Bucket").put("Type", "String").put("Default", bucket);
+        ((ObjectNode) input.path("Parameters")).putObject("Key").put("Type", "String").put("Default", key);
     }
 
     @Test

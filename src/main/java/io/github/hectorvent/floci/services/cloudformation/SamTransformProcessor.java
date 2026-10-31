@@ -221,7 +221,10 @@ class SamTransformProcessor {
             }
             JsonNode properties = source.path("Properties");
             JsonNode resolvedProperties = resolveParameterRefs(properties, template, parameterValues);
-            JsonNode uri = resolvedProperties.path("ContentUri");
+            // Deploy with the original ContentUri expressions so CloudFormation resolves parameters
+            // once, at deploy; the resolved copy is only what SAM hashes (a versioned bucket/key
+            // must not be baked in, and a resolved value that itself holds a ${...} would resolve twice).
+            JsonNode uri = properties.path("ContentUri");
             ObjectNode content = objectMapper.createObjectNode();
             if (uri.isTextual()) {
                 Matcher match = S3_DEFINITION_URI.matcher(uri.asText());
