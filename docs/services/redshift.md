@@ -678,10 +678,16 @@ Creating an external schema or table
 inside a transaction, including a Data API batch (which runs as one transaction), is rejected before changing the catalogs: AWS does not allow `CREATE EXTERNAL TABLE` inside a transaction block (SQLSTATE `25001`).
 Cold loads and reloads require database privileges to maintain the materialized table and catalog;
 ordinary users with schema USAGE and table SELECT can read an existing committed cache entry.
-The current floci-duck transfer uses account-scoped development credentials. Cold loads and reloads
-with `FLOCI_SERVICES_S3_ENFORCE_AUTH=true` are not supported by that transfer path yet.
-Role association and trust are still checked before cached reads; S3 policy checks follow the
-configured enforcement mode. This is a Floci limitation, not AWS behavior.
+Role association and trust are checked before every read, cached or not, and S3 policy checks follow
+the configured enforcement mode. With `FLOCI_SERVICES_S3_ENFORCE_AUTH=true` the floci-duck transfer of
+a cold load or reload is signed with the role's own short-lived session (access key, secret key and
+session token), so the role's identity policy and the bucket policy are evaluated for the transfer
+itself, and a deny stops it with SQLSTATE `42501`. The transfer writes its result to Floci's internal
+scratch bucket; because AWS Spectrum performs no S3 write and realistic role policies, permissions
+boundaries or SCPs follow AWS's read-only permissions on source data, this internal scratch write
+is authorized ahead of the role's policies directly for the minted transfer session key and scratch key,
+verifying Floci's internal tag on the bucket. Reads of the scratch bucket and every other bucket stay under
+normal policy evaluation.
 
 Writes to external relations are rejected. AWS prohibits external UPDATE/DELETE but supports
 some external INSERT operations; external INSERT is an intentional Floci limitation here. Use
