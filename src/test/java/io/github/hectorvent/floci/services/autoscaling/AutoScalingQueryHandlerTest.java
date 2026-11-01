@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgOptionalFields;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
@@ -13,7 +14,6 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -29,35 +29,107 @@ class AutoScalingQueryHandlerTest {
     private static final String REGION = "us-east-1";
 
     @ParameterizedTest
-    @ValueSource(strings = {"EnterStandby", "ExitStandby"})
-    void standbyMembersRetainNumericOrderAndRepeatedParameterValues(String action) {
+    @ValueSource(booleans = {false, true})
+    void repeatedDetachMembersCountEachDetachedInstanceOnce(boolean decrementDesiredCapacity) {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.createAutoScalingGroup(REGION, "repeated-detach", null, "lt", null, "1", null,
+                0, 3, 3, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(),
+                "EC2", 0, List.of("Default"), Map.of(), Map.of(), AsgOptionalFields.none());
+        service.ec2Service = mock(Ec2Service.class);
+        AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("repeated-detach")).getFirst();
+        for (String id : List.of("i-detached", "i-retained-one", "i-retained-two")) {
+            AsgInstance instance = new AsgInstance();
+            instance.setInstanceId(id);
+            instance.setLifecycleState("InService");
+            group.getInstances().add(instance);
+        }
+        MultivaluedHashMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("AutoScalingGroupName", "repeated-detach");
+        params.add("ShouldDecrementDesiredCapacity", Boolean.toString(decrementDesiredCapacity));
+        params.add("InstanceIds.member.1", "i-detached");
+        params.add("InstanceIds.member.1", "i-detached");
+        params.add("InstanceIds.member.3", "i-detached");
+
+        Response response = new AutoScalingQueryHandler(service).handle("DetachInstances", params, REGION);
+
+        assertEquals(200, response.getStatus());
+        assertEquals(decrementDesiredCapacity ? 2 : 3, group.getDesiredCapacity());
+        assertEquals(List.of("i-retained-one", "i-retained-two"),
+                group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        verify(service.ec2Service).deleteSystemTag(
+                REGION, List.of("i-detached"), "aws:autoscaling:groupName", "repeated-detach");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"AttachInstances", "DetachInstances", "SetInstanceProtection", "EnterStandby", "ExitStandby"})
+    void instanceMutationsRetainSparseOrderedAndRepeatedMembers(String action) {
         AutoScalingService service = mock(AutoScalingService.class);
         AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
         MultivaluedHashMap<String, String> params = new MultivaluedHashMap<>();
-        params.add("AutoScalingGroupName", "indexed-standby");
+        params.add("AutoScalingGroupName", "indexed-instances");
         params.add("ShouldDecrementDesiredCapacity", "true");
-        for (int index = 12; index >= 1; index--) {
-            params.add("InstanceIds.member." + index, "i-" + index);
-        }
+        params.add("ProtectedFromScaleIn", "true");
+        params.add("InstanceIds.member.999999999999999999999999", "i-large");
+        params.add("InstanceIds.member.10", "i-ten");
+        params.add("InstanceIds.member.2", "i-two");
         params.add("InstanceIds.member.2", "i-repeated");
-        List<String> expected = new ArrayList<>();
-        for (int index = 1; index <= 12; index++) {
-            expected.add("i-" + index);
-            if (index == 2) {
-                expected.add("i-repeated");
-            }
-        }
-        when(service.enterStandby(eq(REGION), eq("indexed-standby"), anyList(), eq(true)))
-                .thenReturn(List.of());
-        when(service.exitStandby(eq(REGION), eq("indexed-standby"), anyList())).thenReturn(List.of());
+        params.add("InstanceIds.member.01", "ignored");
+        params.add("InstanceIds.member.3.Other", "ignored");
+        List<String> expected = List.of("i-two", "i-repeated", "i-ten", "i-large");
 
         assertEquals(200, handler.handle(action, params, REGION).getStatus());
 
-        if ("EnterStandby".equals(action)) {
-            verify(service).enterStandby(REGION, "indexed-standby", expected, true);
+        if ("AttachInstances".equals(action)) {
+            verify(service).attachInstances(REGION, "indexed-instances", expected);
+        } else if ("DetachInstances".equals(action)) {
+            verify(service).detachInstances(REGION, "indexed-instances", expected, true);
+        } else if ("SetInstanceProtection".equals(action)) {
+            verify(service).setInstanceProtection(REGION, "indexed-instances", expected, true);
+        } else if ("EnterStandby".equals(action)) {
+            verify(service).enterStandby(REGION, "indexed-instances", expected, true);
         } else {
-            verify(service).exitStandby(REGION, "indexed-standby", expected);
+            verify(service).exitStandby(REGION, "indexed-instances", expected);
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"AttachInstances", "DetachInstances", "SetInstanceProtection"})
+    void instanceMutationsValidateMembersAfterGapBeforeChangingGroup(String action) {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.createAutoScalingGroup(REGION, "indexed-validation", null, "lt", null, "1", null,
+                0, 3, 1, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(),
+                "EC2", 0, List.of("Default"), Map.of(), Map.of(), AsgOptionalFields.none());
+        AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("indexed-validation")).getFirst();
+        service.ec2Service = mock(Ec2Service.class);
+        AsgInstance original = new AsgInstance();
+        original.setInstanceId("i-original");
+        original.setLifecycleState("InService");
+        group.getInstances().add(original);
+        AsgInstance moving = new AsgInstance();
+        moving.setInstanceId("i-moving");
+        moving.setLifecycleState("EnteringStandby");
+        group.getInstances().add(moving);
+        MultivaluedHashMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("AutoScalingGroupName", "indexed-validation");
+        params.add("ProtectedFromScaleIn", "true");
+        params.add("ShouldDecrementDesiredCapacity", "true");
+        params.add("InstanceIds.member.1", "AttachInstances".equals(action) ? "i-new" : "i-original");
+        params.add("InstanceIds.member.3", "SetInstanceProtection".equals(action) ? "i-missing" : "i-moving");
+        AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
+
+        Response response = handler.handle(action, params, REGION);
+
+        assertEquals(400, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("<Code>ValidationError</Code>"));
+        assertEquals(List.of("i-original", "i-moving"),
+                group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        assertEquals("InService", original.getLifecycleState());
+        assertEquals("EnteringStandby", moving.getLifecycleState());
+        assertFalse(original.isProtectedFromScaleIn());
+        verifyNoInteractions(service.ec2Service);
     }
 
     @ParameterizedTest
