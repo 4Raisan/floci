@@ -294,9 +294,10 @@ Some refusals stay as this service answers them, and the members behind them are
 vendored shapes so the walk cannot reword them. A service-linked role's principal and suffix answer
 `InvalidInput` rather than a validation error at all, and so does an empty `ServiceNamespaces` on
 `ListPoliciesGrantingServiceAccess`. An account alias carries AWS's own sentence about its own
-bounds, which is why neither alias operation is read at all. `statusType`, on all four operations
-that take it, is answered without the offending value and without the permitted set, which is what
-the recorded refusal carries and what the walk would spell out. `Encoding` on `GetSSHPublicKey`
+bounds, which is why neither alias operation is read at all. For `statusType` on the four credential
+updates, a missing `Status` answers `Member must not be null`; an invalid value answers `Member must
+satisfy enum value set: [Expired, Active, Inactive]` without echoing that value. These wordings
+follow the newer AWS capture. `Encoding` on `GetSSHPublicKey`
 answers the modelled `UnrecognizedPublicKeyEncoding` rather than a constraint violation. And
 `TagKeys` on the eight untag operations is answered against the list as a whole, `Value at
 'tagKeys' failed to satisfy constraint: Member must satisfy constraint: [...]`, where the walk
@@ -321,10 +322,11 @@ was already this service's choice for a list over its limit, and it is now what 
 whatever it breaks. Other services do quote a list, Lambda's `Value '[x86_64, arm64]' at
 'architectures'` being a captured one, which is why this is IAM's reading and not a rule.
 
-The one message that still carries a word where the value would go is the required member a request
-leaves out, `Value null at '<member>'`, which no capture covers in either form. The form is chosen
-in one place, so a direct capture that ever shows IAM carrying its values again moves it back in one
-edit rather than across the service.
+A captured missing `Status` on the four credential updates reads `Value at 'status' failed to satisfy
+constraint: Member must not be null`, without `null` after `Value`. Other omitted required members
+may still use `Value null at '<member>'`; this capture does not settle their wording. IAM's form for
+violations with a supplied value is chosen in one place, so a future capture that shows IAM carrying
+those values again moves it back in one edit rather than across the service.
 
 ### Permission Boundaries
 

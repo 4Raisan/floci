@@ -78,6 +78,9 @@ public class ResourceArnBuilder {
     /** The segment a tagging route names before the ARN it tags, which it captures whole, slashes included. */
     private static final String API_GATEWAY_TAGS_SEGMENT = "tags";
 
+    /** The route of Bedrock's resource-policy actions, which the ARN of the resource they act on may follow. */
+    private static final String BEDROCK_RESOURCE_POLICY_ROUTE = "/resource-policy";
+
     /** The SSM actions whose {@code ResourceArn} names the parameter they act on, in place of {@code Name}. */
     private static final Set<String> SSM_RESOURCE_POLICY_ACTIONS =
             Set.of("PutResourcePolicy", "GetResourcePolicies", "DeleteResourcePolicy");
@@ -187,7 +190,8 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
-        String path = ctx.getUriInfo().getPath();
+        String path = "s3".equals(credentialScope) ? ctx.getUriInfo().getPath()
+                : IamActionRegistry.decodedPath(ctx);
         return switch (credentialScope) {
             case "s3"             -> buildS3Resources(operation, path, region);
             case "lambda"         -> List.of(buildLambdaArn(path, ctx, region, accountId));
@@ -207,6 +211,7 @@ public class ResourceArnBuilder {
                     || "route53:DeleteReusableDelegationSet".equals(operation)
                     ? List.of(buildRoute53DelegationSetArn(ctx, partition))
                     : namedResources(credentialScope, operation, ctx, region, accountId, partition);
+            case "bedrock"        -> List.of(buildBedrockArn(path, ctx));
             default               -> namedResources(credentialScope, operation, ctx, region, accountId, partition);
         };
     }
@@ -253,7 +258,7 @@ public class ResourceArnBuilder {
         if (body == null) {
             return "*";
         }
-        String path = ctx.getUriInfo().getPath();
+        String path = IamActionRegistry.decodedPath(ctx);
         boolean create = path.endsWith("/groups") || path.endsWith("/groups/");
         String group = create ? body.path("Name").asText()
                 : body.path("Group").asText(body.path("GroupName").asText());
@@ -1019,7 +1024,7 @@ public class ResourceArnBuilder {
         if (!path.startsWith(layers)) {
             return null;
         }
-        String raw = IamActionRegistry.rawPath(ctx.getUriInfo());
+        String raw = IamActionRegistry.rawPath(ctx);
         if (!raw.startsWith(layers)) {
             return "*";
         }
@@ -1234,7 +1239,7 @@ public class ResourceArnBuilder {
      * stays escaped, so a segment cannot pass for more than one.
      */
     private static String buildApiGatewayArn(ContainerRequestContext ctx, String region, String partition) {
-        String[] raw = IamActionRegistry.routedPath(ctx.getUriInfo()).split("/", -1);
+        String[] raw = IamActionRegistry.routedPath(ctx).split("/", -1);
         List<String> segments = new ArrayList<>();
         for (int i = 1; i < raw.length; i++) {
             String segment = pathSegment(raw[i]);
@@ -1286,7 +1291,7 @@ public class ResourceArnBuilder {
             return slash < 0 || slash == tagged.length() - 1 ? "*"
                     : eksClusterArn(tagged.substring(slash + 1), region, accountId);
         }
-        String[] segments = IamActionRegistry.routedPath(ctx.getUriInfo()).substring(1).split("/", -1);
+        String[] segments = IamActionRegistry.routedPath(ctx).substring(1).split("/", -1);
         if (segments.length == 1) {
             JsonNode body = "clusters".equals(segments[0]) && "POST".equalsIgnoreCase(ctx.getMethod())
                     ? readJsonBody(ctx) : null;
@@ -1380,7 +1385,7 @@ public class ResourceArnBuilder {
      * names none.
      */
     public String taggedArn(ContainerRequestContext ctx) {
-        String path = ctx.getUriInfo().getPath();
+        String path = IamActionRegistry.decodedPath(ctx);
         for (String route : List.of("/tags", "/v1/tags")) {
             if (path.startsWith(route + "/")) {
                 return path.substring(route.length() + 1);
@@ -1494,6 +1499,24 @@ public class ResourceArnBuilder {
         return DurableTokens.callbackExecutionArn(path.substring(callbacks + prefix.length(), action))
                 .filter(arn -> LambdaArnUtils.DURABLE_EXECUTION_ARN.matcher(arn).matches())
                 .orElse(null);
+    }
+
+    // ── Bedrock ──────────────────────────────────────────────────────────────────
+
+    /**
+     * The resource of a Bedrock route. The resource-policy actions act on the resource whose ARN they carry,
+     * in the path, or in the body's {@code resourceArn} for {@code PutResourcePolicy}, as the Service
+     * Authorization Reference gives them; every other route, and a value that is not an ARN, is {@code *}.
+     */
+    private String buildBedrockArn(String path, ContainerRequestContext ctx) {
+        String resourceArn = null;
+        if (path.startsWith(BEDROCK_RESOURCE_POLICY_ROUTE + "/")) {
+            resourceArn = path.substring(BEDROCK_RESOURCE_POLICY_ROUTE.length() + 1);
+        } else if (BEDROCK_RESOURCE_POLICY_ROUTE.equals(path) && "POST".equalsIgnoreCase(ctx.getMethod())) {
+            JsonNode body = readJsonBody(ctx);
+            resourceArn = body == null ? null : body.path("resourceArn").asText(null);
+        }
+        return AwsArnUtils.isArn(resourceArn) ? resourceArn : "*";
     }
 
     // ── SQS ─────────────────────────────────────────────────────────────────────

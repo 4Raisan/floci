@@ -214,10 +214,16 @@ public class KinesisAnalyticsV2JsonHandler {
 
     private Response handleListApplicationSnapshots(JsonNode request, String region) {
         String applicationName = request.path("ApplicationName").asText(null);
+        Integer limit = Pagination.parseMaxResults(request, "Limit", "InvalidArgumentException");
+        String nextToken = Pagination.parseNextToken(request, "NextToken", "InvalidArgumentException");
+        PaginatedResult<Snapshot> page = service.listApplicationSnapshots(applicationName, region, limit, nextToken);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode summaries = response.putArray("SnapshotSummaries");
-        for (Snapshot snapshot : service.listApplicationSnapshots(applicationName, region)) {
+        for (Snapshot snapshot : page.items()) {
             summaries.add(snapshotDetailNode(snapshot));
+        }
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }
