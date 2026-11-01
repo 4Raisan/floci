@@ -17,6 +17,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
@@ -2064,6 +2065,137 @@ class NativeDynamoDbJsonHandlerTest {
                 () -> handler.handle("Query", request, "eu-west-1"));
         assertEquals("Number overflow. Attempting to store a number with magnitude larger than supported range",
                 ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            abc                                          | NOT_NUMERIC
+            ''                                           | NOT_NUMERIC
+            1e                                           | NOT_NUMERIC
+            1e9223372036854775808                        | NOT_NUMERIC
+            1e-9223372036854775809                       | NOT_NUMERIC
+            1e126                                        | OVERFLOW
+            0.1e127                                      | OVERFLOW
+            0e126                                        | OVERFLOW
+            1e2147483647                                 | OVERFLOW
+            1.5e9223372036854775807                      | OVERFLOW
+            1e-131                                       | UNDERFLOW
+            0.000e-128                                   | UNDERFLOW
+            1e-9223372036854775808                       | UNDERFLOW
+            1234567890123456789012345678901234567890     | DIGITS
+            1234567890123456789012345678901234567890e200 | DIGITS
+            9.9999999999999999999999999999999999999e125  | NONE
+            0.000e126                                    | NONE
+            1e-130                                       | NONE
+            1e+000000000000000000000000000005            | NONE
+            """)
+    void putItemReadsANumberExponentAsALongBeforeTheTableLookup(String number, String problem) {
+        ObjectNode request = mapper.createObjectNode();
+        request.put("TableName", "Missing");
+        request.set("Item", item("userId", "u1").set("n", attributeValue("N", number)));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("PutItem", request, "eu-west-1"));
+        String expected = numberProblem(problem, number);
+        if (expected == null) {
+            assertEquals("ResourceNotFoundException", ex.getErrorCode());
+        } else {
+            assertEquals("1 validation error detected: " + expected, ex.getMessage());
+        }
+    }
+
+    private static String numberProblem(String problem, String number) {
+        return switch (problem) {
+            case "NOT_NUMERIC" -> DynamoDbNumberUtils.PARAMETER_NOT_NUMERIC + ": " + number;
+            case "OVERFLOW" -> DynamoDbNumberUtils.NUMBER_OVERFLOW;
+            case "UNDERFLOW" -> DynamoDbNumberUtils.NUMBER_UNDERFLOW;
+            case "DIGITS" -> DynamoDbNumberUtils.TOO_MANY_DIGITS;
+            default -> null;
+        };
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            PutItem            | true  | OVERFLOW  | {"TableName":"Missing","Item":{"userId":{"S":"u1"},"n":{"NS":["1","%s"]}}}
+            PutItem            | true  | OVERFLOW  | {"TableName":"Users","Item":{"userId":{"S":"u1"}},"Expected":{"n":{"ComparisonOperator":"EQ","AttributeValueList":[{"N":"%s"}]}}}
+            PutItem            | true  | OVERFLOW  | {"TableName":"Missing","Item":{"userId":{"S":"u1"}},"ConditionExpression":"n = :v","ExpressionAttributeValues":{":v":{"M":{"x":{"L":[{"N":"%s"}]}}}}}
+            UpdateItem         | true  | OVERFLOW  | {"TableName":"Missing","Key":{"userId":{"N":"%s"}},"UpdateExpression":"SET a = :a","ExpressionAttributeValues":{":a":{"S":"x"}}}
+            UpdateItem         | true  | OVERFLOW  | {"TableName":"Missing","Key":{"userId":{"S":"u1"}},"AttributeUpdates":{"n":{"Action":"PUT","Value":{"N":"%s"}}}}
+            DeleteItem         | true  | OVERFLOW  | {"TableName":"Users","Key":{"userId":{"S":"u1"}},"Expected":{"n":{"Value":{"N":"%s"}}}}
+            GetItem            | false | OVERFLOW  | {"TableName":"Missing","Key":{"userId":{"N":"%s"}},"ProjectionExpression":"a","AttributesToGet":["a"]}
+            BatchGetItem       | false | OVERFLOW  | {"RequestItems":{"Missing":{"Keys":[{"userId":{"N":"%s"}}]}}}
+            Query              | false | OVERFLOW  | {"TableName":"Missing","KeyConditionExpression":"userId = :p","ExpressionAttributeValues":{":p":{"S":"u1"}},"ExclusiveStartKey":{"userId":{"S":"u1"},"n":{"N":"%s"}}}
+            Query              | false | OVERFLOW  | {"TableName":"Missing","KeyConditions":{"userId":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"u1"}]}},"QueryFilter":{"n":{"ComparisonOperator":"EQ","AttributeValueList":[{"N":"%s"}]}}}
+            Scan               | false | OVERFLOW  | {"TableName":"Missing","ScanFilter":{"n":{"ComparisonOperator":"EQ","AttributeValueList":[{"N":"%s"}]}}}
+            TransactWriteItems | false | OVERFLOW  | {"TransactItems":[{"Put":{"TableName":"Missing","Item":{"userId":{"S":"u1"},"n":{"N":"%s"}},"ConditionExpression":"a = = b"}}]}
+            TransactWriteItems | false | OVERFLOW  | {"TransactItems":[{"Update":{"TableName":"Missing","Key":{"userId":{"S":"u1"}},"UpdateExpression":"SET n = :v","ExpressionAttributeValues":{":v":{"N":"%s"}}}}]}
+            TransactGetItems   | false | OVERFLOW  | {"TransactItems":[{"Get":{"TableName":"Missing","Key":{"userId":{"N":"%s"}}}}]}
+            BatchWriteItem     | false | UNDERFLOW | {"RequestItems":{"Missing":[{"DeleteRequest":{"Key":{"userId":{"N":"%s"}}}}]}}
+            """)
+    void everyNumberInARequestIsReadBeforeTheOtherChecks(String operation, boolean enveloped, String problem,
+            String template) throws Exception {
+        createUsersTable("eu-west-1");
+        String number = "1e2147483647";
+        JsonNode request = mapper.readTree(template.formatted(number));
+
+        AwsException ex = assertThrows(AwsException.class, () -> handler.handle(operation, request, "eu-west-1"));
+        assertEquals((enveloped ? "1 validation error detected: " : "") + numberProblem(problem, number),
+                ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            GetItem            | {"TableName":"Missing","Key":{"userId":{"S":"u1"}},"Item":{"n":{"N":"abc"}}}
+            PutItem            | {"TableName":"Missing","Item":{"userId":{"S":"u1"}},"Key":{"userId":{"N":"abc"}}}
+            UpdateItem         | {"TableName":"Missing","Key":{"userId":{"S":"u1"}},"UpdateExpression":"SET a = :a","ExpressionAttributeValues":{":a":{"S":"x"}},"Item":{"n":{"N":"abc"}}}
+            DeleteItem         | {"TableName":"Missing","Key":{"userId":{"S":"u1"}},"ExclusiveStartKey":{"userId":{"N":"abc"}}}
+            Query              | {"TableName":"Missing","KeyConditionExpression":"userId = :p","ExpressionAttributeValues":{":p":{"S":"u1"}},"Key":{"userId":{"N":"abc"}}}
+            Scan               | {"TableName":"Missing","KeyConditions":{"userId":{"ComparisonOperator":"EQ","AttributeValueList":[{"N":"abc"}]}}}
+            TransactWriteItems | {"TransactItems":[{"Put":{"TableName":"Missing","Item":{"userId":{"S":"u1"}},"Key":{"userId":{"N":"abc"}}}}]}
+            TransactWriteItems | {"TransactItems":[{"Delete":{"TableName":"Missing","Key":{"userId":{"S":"u1"}},"ExpressionAttributeValues":{":v":{"N":"abc"}}}}]}
+            TransactGetItems   | {"TransactItems":[{"Get":{"TableName":"Missing","Key":{"userId":{"S":"u1"}},"Item":{"n":{"N":"abc"}}}}]}
+            """)
+    void aNumberThatTheOperationDoesNotReadIsIgnored(String operation, String request) throws Exception {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle(operation, mapper.readTree(request), "eu-west-1"));
+        assertEquals("ResourceNotFoundException", ex.getErrorCode(), ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            PutItem    | {"TableName":"Missing","Item":{"userId":{"S":"u1"}},"ConditionExpression":"n = :v","ExpressionAttributeValues":{":v":{"N":"abc"}},"Expected":{"n":{"Exists":false}}} | Can not use both expression and non-expression parameters
+            PutItem    | {"TableName":"Users","Item":{"userId":{"S":"u1"}},"Expected":{"n":{"Value":{"N":"abc"},"Exists":false}}} | Value cannot be used when Exists is false for Attribute: n
+            UpdateItem | {"TableName":"Missing","Key":{"userId":{"S":"u1"}},"UpdateExpression":"SET a = :a","ExpressionAttributeValues":{":a":{"S":"x"}},"AttributeUpdates":{"n":{"Action":"PUT","Value":{"N":"abc"}}}} | Can not use both expression and non-expression parameters
+            UpdateItem | {"TableName":"Missing","Key":{"userId":{"S":"u1"}},"ExpressionAttributeValues":{":a":{"S":"x"}},"AttributeUpdates":{"n":{"Action":"PUT","Value":{"N":"abc"}}}} | ExpressionAttributeValues can only be specified when using expressions
+            """)
+    void numbersInValuesAndLegacyConditionsAreReadAfterTheMemberChecks(String operation, String request,
+            String message) throws Exception {
+        createUsersTable("eu-west-1");
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle(operation, mapper.readTree(request), "eu-west-1"));
+        assertTrue(ex.getMessage().contains(message), ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            GetItem        | {"TableName":"Missing","Key":{"userId":{"N":"abc"}},"ReturnConsumedCapacity":"BAD"}
+            BatchWriteItem | {"RequestItems":{"Missing":[{"PutRequest":{"Item":{"userId":{"N":"abc"}}}}]},"ReturnConsumedCapacity":"BAD"}
+            """)
+    void returnConsumedCapacityIsCheckedBeforeTheNumbers(String operation, String request) throws Exception {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle(operation, mapper.readTree(request), "eu-west-1"));
+        assertTrue(ex.getMessage().startsWith("1 validation error detected: Value 'BAD' at 'returnConsumedCapacity'"),
+                ex.getMessage());
+    }
+
+    @Test
+    void batchGetItemRefusesRepeatedKeysBeforeItReadsTheirNumbers() throws Exception {
+        JsonNode request = mapper.readTree(
+                "{\"RequestItems\":{\"Missing\":{\"Keys\":[{\"userId\":{\"N\":\"abc\"}},{\"userId\":{\"N\":\"abc\"}}]}}}");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("BatchGetItem", request, "eu-west-1"));
+        assertEquals("Provided list of item keys contains duplicates", ex.getMessage());
     }
 
     @Test
