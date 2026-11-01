@@ -1271,7 +1271,20 @@ public class ElastiCacheService implements ResourceProvider {
             String ipDiscovery,
             Boolean atRestEncryptionEnabled,
             String region,
-            Map<String, String> tags) {
+            Map<String, String> tags,
+            Boolean autoMinorVersionUpgrade) {
+        public CreateCacheClusterRequest(String cacheClusterId, String engine, String engineVersion,
+                String cacheNodeType, Integer numCacheNodes, Integer port, AuthMode authMode,
+                String authToken, String cacheParameterGroupName, String cacheSubnetGroupName,
+                Integer snapshotRetentionLimit, String snapshotWindow, String preferredMaintenanceWindow,
+                String preferredAvailabilityZone, List<String> securityGroupIds, String networkType,
+                String ipDiscovery, Boolean atRestEncryptionEnabled, String region,
+                Map<String, String> tags) {
+            this(cacheClusterId, engine, engineVersion, cacheNodeType, numCacheNodes, port, authMode,
+                    authToken, cacheParameterGroupName, cacheSubnetGroupName, snapshotRetentionLimit,
+                    snapshotWindow, preferredMaintenanceWindow, preferredAvailabilityZone, securityGroupIds,
+                    networkType, ipDiscovery, atRestEncryptionEnabled, region, tags, null);
+        }
     }
 
     public CacheCluster createCacheCluster(CreateCacheClusterRequest request) {
@@ -1501,6 +1514,7 @@ public class ElastiCacheService implements ResourceProvider {
         cluster.setIpDiscovery(request.ipDiscovery() != null && !request.ipDiscovery().isBlank()
                 ? request.ipDiscovery() : "ipv4");
         cluster.setAtRestEncryptionEnabled(Boolean.TRUE.equals(request.atRestEncryptionEnabled()));
+        cluster.setAutoMinorVersionUpgrade(request.autoMinorVersionUpgrade());
         if (request.securityGroupIds() != null && !request.securityGroupIds().isEmpty()) {
             cluster.setSecurityGroupIds(new ArrayList<>(request.securityGroupIds()));
         }
