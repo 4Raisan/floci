@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.JsonNumberCoercion;
 import io.github.hectorvent.floci.services.cloudtrail.model.AdvancedEventSelector;
 import io.github.hectorvent.floci.services.cloudtrail.model.DataResource;
 import io.github.hectorvent.floci.services.cloudtrail.model.EventSelector;
@@ -14,7 +15,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -256,15 +256,7 @@ public class CloudTrailJsonHandler {
         }
         int value;
         if (maxResults.isNumber()) {
-            double doubleValue = maxResults.doubleValue();
-            if (maxResults.isFloatingPointNumber() && !Double.isFinite(doubleValue)) {
-                value = doubleValue > 0 ? Integer.MAX_VALUE : Integer.MIN_VALUE;
-            } else {
-                BigDecimal number = maxResults.decimalValue();
-                value = number.compareTo(BigDecimal.valueOf(Integer.MIN_VALUE)) < 0
-                        ? Integer.MIN_VALUE : number.compareTo(BigDecimal.valueOf(Integer.MAX_VALUE)) > 0
-                        ? Integer.MAX_VALUE : number.intValue();
-            }
+            value = JsonNumberCoercion.truncateAndClampToInt(maxResults);
         } else if (maxResults.isTextual()) {
             throw serialization("STRING_VALUE can not be converted to an Integer");
         } else if (maxResults.isArray()) {
