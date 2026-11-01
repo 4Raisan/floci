@@ -256,10 +256,15 @@ public class CloudTrailJsonHandler {
         }
         int value;
         if (maxResults.isNumber()) {
-            BigDecimal number = maxResults.decimalValue();
-            value = number.compareTo(BigDecimal.valueOf(Integer.MIN_VALUE)) < 0
-                    ? Integer.MIN_VALUE : number.compareTo(BigDecimal.valueOf(Integer.MAX_VALUE)) > 0
-                    ? Integer.MAX_VALUE : number.intValue();
+            double doubleValue = maxResults.doubleValue();
+            if (maxResults.isFloatingPointNumber() && !Double.isFinite(doubleValue)) {
+                value = doubleValue > 0 ? Integer.MAX_VALUE : Integer.MIN_VALUE;
+            } else {
+                BigDecimal number = maxResults.decimalValue();
+                value = number.compareTo(BigDecimal.valueOf(Integer.MIN_VALUE)) < 0
+                        ? Integer.MIN_VALUE : number.compareTo(BigDecimal.valueOf(Integer.MAX_VALUE)) > 0
+                        ? Integer.MAX_VALUE : number.intValue();
+            }
         } else if (maxResults.isTextual()) {
             throw serialization("STRING_VALUE can not be converted to an Integer");
         } else if (maxResults.isArray()) {

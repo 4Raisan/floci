@@ -249,6 +249,14 @@ class CloudTrailIntegrationTest {
             .then().statusCode(400)
                 .body(containsString("InvalidMaxResultsException"))
                 .body(containsString("A max results value of -2147483648 is invalid."));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":1e309}")
+            .then().statusCode(400)
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of 2147483647 is invalid."));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":-1e309}")
+            .then().statusCode(400)
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of -2147483648 is invalid."));
     }
 
     @Test
