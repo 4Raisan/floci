@@ -3613,6 +3613,7 @@ public class NativeDynamoDbJsonHandler {
     }
 
     private Response handleExecuteStatement(JsonNode request, String region) {
+        decodePartiQLParameters(request.path("Parameters"));
         List<String> validationErrors = new ArrayList<>();
         addPartiQLReturnValuesError(request, "returnValuesOnConditionCheckFailure", validationErrors);
         addLengthError(request, "NextToken", "nextToken", MAX_NEXT_TOKEN_LENGTH, validationErrors);
@@ -3642,6 +3643,7 @@ public class NativeDynamoDbJsonHandler {
 
     private Response handleExecuteTransaction(JsonNode request, String region) {
         JsonNode stmts = request.path("TransactStatements");
+        stmts.forEach(s -> decodePartiQLParameters(s.path("Parameters")));
         List<String> validationErrors = new ArrayList<>();
         addLengthError(request, "ClientRequestToken", "clientRequestToken", MAX_CLIENT_REQUEST_TOKEN_LENGTH,
                 validationErrors);
@@ -3771,6 +3773,7 @@ public class NativeDynamoDbJsonHandler {
 
     private Response handleBatchExecuteStatement(JsonNode request, String region) {
         JsonNode stmts = request.path("Statements");
+        stmts.forEach(s -> decodePartiQLParameters(s.path("Parameters")));
         List<String> validationErrors = new ArrayList<>();
         addReturnConsumedCapacityError(request, validationErrors);
         addStatementListErrors(stmts, "statements", validationErrors);
@@ -3867,10 +3870,43 @@ public class NativeDynamoDbJsonHandler {
         }
         List<JsonNode> params = new ArrayList<>();
         for (JsonNode parameter : node) {
-            DynamoDbAttributeValueValidator.requireParameterNestingWithinLimit(parameter);
-            checkAttrSets(parameter);
+            requirePartiQLParameter(parameter, 1);
             params.add(parameter);
         }
         return params;
+    }
+
+    // DynamoDB decodes the binary values of every statement before it checks anything else.
+    private static void decodePartiQLParameters(JsonNode parameters) {
+        for (JsonNode parameter : parameters) {
+            DynamoDbAttributeValueValidator.dropNullMembers(parameter);
+            DynamoDbAttributeValueValidator.requireBase64(parameter);
+        }
+    }
+
+    // DynamoDB reads the parameters in order and refuses the first value it cannot take. It reads the
+    // members of a map in the order of a HashMap sized for them, and a number before the type count.
+    private void requirePartiQLParameter(JsonNode value, int level) {
+        DynamoDbAttributeValueValidator.requireParameterLevelWithinLimit(level);
+        if (value.has("N")) {
+            DynamoDbNumberUtils.requirePartiQLParameterNumber(value.get("N").asText());
+        } else if (value.has("NS")) {
+            DynamoDbNumberUtils.requirePartiQLParameterNumberSet(value.get("NS"));
+        }
+        switch (DynamoDbAttributeValueValidator.typeOf(value)) {
+            case "M" -> {
+                Map<String, JsonNode> members = HashMap.newHashMap(value.get("M").size());
+                value.get("M").properties().forEach(member -> members.put(member.getKey(), member.getValue()));
+                for (JsonNode member : members.values()) {
+                    requirePartiQLParameter(member, level + 1);
+                }
+            }
+            case "L" -> {
+                for (JsonNode member : value.get("L")) {
+                    requirePartiQLParameter(member, level + 1);
+                }
+            }
+            default -> checkAttrSets(value);
+        }
     }
 }
