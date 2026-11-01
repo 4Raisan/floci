@@ -102,7 +102,8 @@ public class TargetDispatcher implements Resettable {
                 attempt(delivery, target, now);
             }
         } catch (RuntimeException e) {
-            handleFailure(delivery, target, now, e);
+            LOG.warnv("EventBridge rule {0} could not dispatch to target {1}: {2}",
+                    ruleArn, target.getId(), e.getMessage());
         }
     }
 
@@ -158,30 +159,26 @@ public class TargetDispatcher implements Resettable {
         try {
             invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), delivery.ruleArn());
         } catch (Exception e) {
-            handleFailure(delivery, target, now, e);
-        }
-    }
-
-    private void handleFailure(Delivery delivery, Target target, Instant now, Exception e) {
-        if (delivery.generation() != generation.get()) {
-            return;
-        }
-        String errorCode = classify(e);
-        String message = e.getMessage() != null && !e.getMessage().isBlank()
-                ? e.getMessage()
-                : e.getClass().getSimpleName();
-        LOG.warnv("EventBridge rule {0} target {1} delivery failed with {2}: {3}",
-                delivery.ruleArn(), target.getId(), errorCode, message);
-        long backoffSeconds = Math.min(MAXIMUM_BACKOFF_SECONDS, 1L << Math.min(delivery.retryAttempts(), 9));
-        Instant backoff = now.plusSeconds(backoffSeconds);
-        Instant expiresAt = expiresAt(delivery, target);
-        Delivery failed = delivery.failed(errorCode, message, backoff.isBefore(expiresAt) ? backoff : expiresAt);
-        if (!RETRYABLE_ERROR_CODES.contains(errorCode)) {
-            deadLetter(failed, target, null);
-        } else if (failed.retryAttempts() >= maximumRetryAttempts(target)) {
-            deadLetter(failed, target, EXHAUSTED_BY_ATTEMPTS);
-        } else {
-            pending.add(failed);
+            if (delivery.generation() != generation.get()) {
+                return;
+            }
+            String errorCode = classify(e);
+            String message = e.getMessage() != null && !e.getMessage().isBlank()
+                    ? e.getMessage()
+                    : e.getClass().getSimpleName();
+            LOG.warnv("EventBridge rule {0} target {1} delivery failed with {2}: {3}",
+                    delivery.ruleArn(), target.getId(), errorCode, message);
+            long backoffSeconds = Math.min(MAXIMUM_BACKOFF_SECONDS, 1L << Math.min(delivery.retryAttempts(), 9));
+            Instant backoff = now.plusSeconds(backoffSeconds);
+            Instant expiresAt = expiresAt(delivery, target);
+            Delivery failed = delivery.failed(errorCode, message, backoff.isBefore(expiresAt) ? backoff : expiresAt);
+            if (!RETRYABLE_ERROR_CODES.contains(errorCode)) {
+                deadLetter(failed, target, null);
+            } else if (failed.retryAttempts() >= maximumRetryAttempts(target)) {
+                deadLetter(failed, target, EXHAUSTED_BY_ATTEMPTS);
+            } else {
+                pending.add(failed);
+            }
         }
     }
 
