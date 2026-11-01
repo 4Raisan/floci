@@ -480,6 +480,26 @@ class TargetDispatcherTest {
     }
 
     @Test
+    void repeatedFailureToEstablishRuleAccountScopeStopsAtEventAgeLimit() {
+        Target target = sqsTarget(new Target.RetryPolicy(5, 2), DLQ_ARN);
+        try (MockedStatic<RequestScopes> scopes =
+                     mockStatic(RequestScopes.class, withSettings().mockMaker(MockMakers.INLINE))) {
+            scopes.when(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)))
+                    .thenThrow(new IllegalStateException("Request scope is not active"));
+
+            dispatcher.dispatch("arn:aws:events:us-east-1:123456789012:rule/orders", target, EVENT, REGION,
+                    () -> List.of(target));
+            tickAt(T0.plusSeconds(1));
+            tickAt(T0.plusSeconds(2));
+
+            scopes.verify(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)), times(3));
+            Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+            assertAttribute(attributes, "EXHAUSTED_RETRY_CONDITION", "MaximumEventAgeInSeconds");
+            assertAttribute(attributes, "RETRY_ATTEMPTS", "1");
+        }
+    }
+
+    @Test
     void retryEstablishesRuleAccountScope() {
         Target target = sqsTarget(null, null);
         when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))

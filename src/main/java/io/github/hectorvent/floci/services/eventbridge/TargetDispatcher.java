@@ -142,6 +142,10 @@ public class TargetDispatcher implements Resettable {
                     delivery.ruleArn(), delivery.targetId());
             return;
         }
+        if (!now.isBefore(expiresAt(delivery, target))) {
+            deadLetter(delivery, target, EXHAUSTED_BY_AGE);
+            return;
+        }
         handleFailure(delivery.nextRetry(), target, now, e);
     }
 
