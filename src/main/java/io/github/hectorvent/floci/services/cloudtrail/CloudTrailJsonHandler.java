@@ -14,6 +14,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -242,9 +243,45 @@ public class CloudTrailJsonHandler {
     }
 
     private Response lookupEvents(JsonNode req, String region) {
+        validateMaxResults(req.path("MaxResults"));
         ObjectNode resp = mapper.createObjectNode();
         resp.putArray("Events");
         return Response.ok(resp).build();
+    }
+
+    /** An omitted or null {@code MaxResults} is optional and takes the service default. */
+    private static void validateMaxResults(JsonNode maxResults) {
+        if (maxResults.isMissingNode() || maxResults.isNull()) {
+            return;
+        }
+        int value;
+        if (maxResults.isNumber()) {
+            BigDecimal number = maxResults.decimalValue();
+            value = number.compareTo(BigDecimal.valueOf(Integer.MIN_VALUE)) < 0
+                    ? Integer.MIN_VALUE : number.compareTo(BigDecimal.valueOf(Integer.MAX_VALUE)) > 0
+                    ? Integer.MAX_VALUE : number.intValue();
+        } else if (maxResults.isTextual()) {
+            throw serialization("STRING_VALUE can not be converted to an Integer");
+        } else if (maxResults.isArray()) {
+            throw serialization("Start of list found where not expected");
+        } else if (maxResults.isObject()) {
+            throw serialization("Start of structure or map found where not expected.");
+        } else {
+            throw serialization((maxResults.booleanValue() ? "TRUE_VALUE" : "FALSE_VALUE")
+                    + " can not be converted to an Integer");
+        }
+        if (value < 1) {
+            throw invalidMaxResults(value);
+        }
+    }
+
+    private static AwsException invalidMaxResults(int value) {
+        return new AwsException("InvalidMaxResultsException",
+                "A max results value of " + value + " is invalid. Specify max results between 1 and 1000.", 400);
+    }
+
+    private static AwsException serialization(String message) {
+        return new AwsException("SerializationException", message, 400);
     }
 
     private Response addTags(JsonNode req) {
