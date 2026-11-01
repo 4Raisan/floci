@@ -469,7 +469,8 @@ class KinesisAnalyticsV2IntegrationTest {
             .post("/")
         .then()
             .statusCode(400)
-            .body("__type", equalTo("InvalidArgumentException"));
+            .body("__type", equalTo("InvalidArgumentException"))
+            .body("message", equalTo("Page size must be between 1 and 50."));
     }
 
     @Test

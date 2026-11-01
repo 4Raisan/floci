@@ -488,15 +488,21 @@ class KinesisAnalyticsV2JsonHandlerTest {
         double creationTimestamp = firstPage.get("SnapshotSummaries").get(0)
                 .get("SnapshotCreationTimestamp").asDouble();
 
-        handler.handle("DeleteApplicationSnapshot", MAPPER.createObjectNode()
+        assertThat(handler.handle("DeleteApplicationSnapshot", MAPPER.createObjectNode()
                 .put("ApplicationName", "streaming").put("SnapshotName", token)
-                .put("SnapshotCreationTimestamp", creationTimestamp), REGION);
+                .put("SnapshotCreationTimestamp", creationTimestamp), REGION).getStatus(), is(200));
 
         ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
                 MAPPER.createObjectNode().put("ApplicationName", "streaming")
                         .put("Limit", 1).put("NextToken", token), REGION));
         assertEquals("snap-b",
                 secondPage.get("SnapshotSummaries").get(0).get("SnapshotName").asText());
+
+        // The delete is what makes this a cursor-vs-offset proof, so confirm it really happened:
+        // offset semantics would resume at snap-c once snap-a is gone.
+        ObjectNode allPages = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming"), REGION));
+        assertEquals(2, allPages.get("SnapshotSummaries").size());
     }
 
     @Test
@@ -513,9 +519,29 @@ class KinesisAnalyticsV2JsonHandlerTest {
 
         ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
                 MAPPER.createObjectNode().put("ApplicationName", "streaming")
-                        .put("NextToken", "snap-49"), REGION));
+                        .put("NextToken", firstPage.get("NextToken").asText()), REGION));
         assertEquals(1, secondPage.get("SnapshotSummaries").size());
         assertThat(secondPage.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationSnapshotsAcceptsAnyTokenWithinTheModeledLengthAsACursor() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+
+        // AWS declares no pattern for this NextToken (unlike ListApplications, whose token reuses the
+        // ApplicationName shape), so a token is only a cursor: any string up to 512 characters is
+        // accepted, including one that names no snapshot.
+        ObjectNode fromPunctuation = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming").put("NextToken", "!!!"), REGION));
+        assertEquals("snap-a",
+                fromPunctuation.get("SnapshotSummaries").get(0).get("SnapshotName").asText());
+
+        ObjectNode pastTheEnd = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("NextToken", "z".repeat(512)), REGION));
+        assertEquals(0, pastTheEnd.get("SnapshotSummaries").size());
+        assertThat(pastTheEnd.has("NextToken"), is(false));
     }
 
     @Test
