@@ -454,6 +454,88 @@ class KinesisAnalyticsV2JsonHandlerTest {
     }
 
     @Test
+    void listApplicationSnapshotsHonorsLimitAndReturnsNextToken() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+        createSnapshot("streaming", "snap-b");
+
+        ObjectNode firstPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming").put("Limit", 1), REGION));
+        JsonNode summaries = firstPage.get("SnapshotSummaries");
+        assertEquals(1, summaries.size());
+        assertEquals("snap-a", summaries.get(0).get("SnapshotName").asText());
+        assertThat(firstPage.hasNonNull("NextToken"), is(true));
+        assertEquals("snap-a", firstPage.get("NextToken").asText());
+
+        ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("Limit", 1).put("NextToken", "snap-a"), REGION));
+        assertEquals("snap-b",
+                secondPage.get("SnapshotSummaries").get(0).get("SnapshotName").asText());
+        assertThat(secondPage.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationSnapshotsResumesAfterTheNamedSnapshotIsDeleted() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+        createSnapshot("streaming", "snap-b");
+        createSnapshot("streaming", "snap-c");
+
+        ObjectNode firstPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming").put("Limit", 1), REGION));
+        String token = firstPage.get("NextToken").asText();
+        double creationTimestamp = firstPage.get("SnapshotSummaries").get(0)
+                .get("SnapshotCreationTimestamp").asDouble();
+
+        handler.handle("DeleteApplicationSnapshot", MAPPER.createObjectNode()
+                .put("ApplicationName", "streaming").put("SnapshotName", token)
+                .put("SnapshotCreationTimestamp", creationTimestamp), REGION);
+
+        ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("Limit", 1).put("NextToken", token), REGION));
+        assertEquals("snap-b",
+                secondPage.get("SnapshotSummaries").get(0).get("SnapshotName").asText());
+    }
+
+    @Test
+    void listApplicationSnapshotsUsesDefaultPageSizeAndEndsWithoutToken() {
+        createRunningCodedApplication("streaming");
+        for (int i = 0; i < 51; i++) {
+            createSnapshot("streaming", String.format("snap-%02d", i));
+        }
+
+        ObjectNode firstPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming"), REGION));
+        assertEquals(50, firstPage.get("SnapshotSummaries").size());
+        assertEquals("snap-49", firstPage.get("NextToken").asText());
+
+        ObjectNode secondPage = entity(handler.handle("ListApplicationSnapshots",
+                MAPPER.createObjectNode().put("ApplicationName", "streaming")
+                        .put("NextToken", "snap-49"), REGION));
+        assertEquals(1, secondPage.get("SnapshotSummaries").size());
+        assertThat(secondPage.has("NextToken"), is(false));
+    }
+
+    @Test
+    void listApplicationSnapshotsRejectsInvalidLimitAndToken() {
+        createRunningCodedApplication("streaming");
+        createSnapshot("streaming", "snap-a");
+
+        for (int limit : new int[]{0, 51}) {
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("ListApplicationSnapshots",
+                    MAPPER.createObjectNode().put("ApplicationName", "streaming").put("Limit", limit), REGION));
+            assertEquals("InvalidArgumentException", error.getErrorCode());
+        }
+        for (String token : new String[]{"", "a".repeat(513)}) {
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("ListApplicationSnapshots",
+                    MAPPER.createObjectNode().put("ApplicationName", "streaming").put("NextToken", token), REGION));
+            assertEquals("InvalidArgumentException", error.getErrorCode());
+        }
+    }
+
+    @Test
     void createApplicationSnapshotFailsWhenApplicationNotRunning() {
         createApplication("demo");
 
@@ -483,6 +565,12 @@ class KinesisAnalyticsV2JsonHandlerTest {
         ObjectNode start = MAPPER.createObjectNode();
         start.put("ApplicationName", name);
         assertThat(handler.handle("StartApplication", start, REGION).getStatus(), is(200));
+    }
+
+    private void createSnapshot(String applicationName, String snapshotName) {
+        assertThat(handler.handle("CreateApplicationSnapshot", MAPPER.createObjectNode()
+                .put("ApplicationName", applicationName)
+                .put("SnapshotName", snapshotName), REGION).getStatus(), is(200));
     }
 
     private String describeArn(String name) {
