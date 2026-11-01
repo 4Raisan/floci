@@ -81,6 +81,7 @@ public class ElastiCacheService implements ResourceProvider {
      * is one namespace whatever engine claims it, and only a reader of both can say it is free.
      */
     private final StorageBackend<String, CacheCluster> memcachedClusters;
+    private static final String DEFAULT_USER_ID = "default";
     private final AccountAwareStorageBackend<ElastiCacheUser> users;
     private final AccountAwareStorageBackend<ElastiCacheUserGroup> userGroups;
     private final AccountAwareStorageBackend<CacheParameterGroup> parameterGroups;
@@ -1801,7 +1802,7 @@ public class ElastiCacheService implements ResourceProvider {
                         if (userGroup.isPresent()) {
                             requireAssociable(userGroup.get(), encryptedInTransit, group.getEngine());
                             userGroupsToAdd.add(userGroup.get().getUserGroupId());
-                        } else if (users.get(id).isPresent()) {
+                        } else if (findUser(id).isPresent()) {
                             directUsersToAdd.add(id);
                         } else {
                             throw userGroupNotFound(id);
@@ -1827,7 +1828,7 @@ public class ElastiCacheService implements ResourceProvider {
                 }
                 Set<String> seenUserNames = new HashSet<>();
                 for (String userId : nextUserIds) {
-                    ElastiCacheUser u = users.get(userId).orElse(null);
+                    ElastiCacheUser u = findUser(userId).orElse(null);
                     if (u != null && !seenUserNames.add(u.getUserName())) {
                         throw new AwsException("DuplicateUserName",
                                 "Duplicate user name " + u.getUserName() + " in user group.", 400);
@@ -1907,7 +1908,7 @@ public class ElastiCacheService implements ResourceProvider {
     public ElastiCacheUser createUser(String userId, String userName, AuthMode authMode,
                                       List<String> passwords, String accessString, String engine,
                                       Map<String, String> tags) {
-        if (users.get(userId).isPresent()) {
+        if (findUser(userId).isPresent()) {
             throw new AwsException("UserAlreadyExists",
                     "User " + userId + " already exists.", 400);
         }
@@ -2109,19 +2110,55 @@ public class ElastiCacheService implements ResourceProvider {
         }
     }
 
+    /**
+     * AWS provisions a built-in user with id and name {@code default} in every account; redis
+     * user groups must contain a user named default. Seeded on first touch of the user store.
+     *
+     * ponytail: users are keyed per account, not per region, so the ARN carries the region of the
+     * first request that seeded it; region-scope the user store if per-region ARNs matter.
+     */
+    private void ensureDefaultUser() {
+        if (users.get(DEFAULT_USER_ID).isPresent()) {
+            return;
+        }
+        // re-checked under the lock tag updates hold, so a racing seed cannot overwrite a tag just added
+        synchronized (userGroupLock) {
+            if (users.get(DEFAULT_USER_ID).isEmpty()) {
+                ElastiCacheUser user = new ElastiCacheUser(DEFAULT_USER_ID, DEFAULT_USER_ID, AuthMode.NO_AUTH,
+                        List.of(), "on ~* +@all", "redis", "active", Instant.now());
+                user.setArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(),
+                        "user:" + DEFAULT_USER_ID));
+                users.put(DEFAULT_USER_ID, user);
+            }
+        }
+    }
+
+    /** AWS: the built-in default user cannot be modified or deleted; a custom user named default can. */
+    private static void requireNotBuiltInDefault(String userId, String action) {
+        if (DEFAULT_USER_ID.equals(userId)) {
+            throw new AwsException("InvalidParameterValue", "The default user cannot be " + action + ".", 400);
+        }
+    }
+
+    private Optional<ElastiCacheUser> findUser(String userId) {
+        ensureDefaultUser();
+        return users.get(userId);
+    }
+
     public ElastiCacheUser getUser(String userId) {
-        return users.get(userId).orElseThrow(() ->
+        return findUser(userId).orElseThrow(() ->
                 new AwsException("UserNotFound", "User " + userId + " not found.", 404));
     }
 
     public Collection<ElastiCacheUser> listUsers(String filterUserId, String filterEngine) {
         // UserId wins when both filters are sent; AWS documents no interaction between them.
         if (filterUserId != null && !filterUserId.isBlank()) {
-            return users.get(filterUserId)
+            return findUser(filterUserId)
                     .map(List::of)
                     .orElseThrow(() -> new AwsException("UserNotFound",
                             "User " + filterUserId + " not found.", 404));
         }
+        ensureDefaultUser();
         if (filterEngine != null && !filterEngine.isBlank()) {
             return users.scan(k -> true).stream()
                     .filter(u -> filterEngine.equalsIgnoreCase(u.getEngine()))
@@ -2138,6 +2175,7 @@ public class ElastiCacheService implements ResourceProvider {
     public ElastiCacheUser modifyUser(String userId, AuthMode authMode, List<String> passwords,
                                       String accessString, String appendAccessString, String engine) {
         ElastiCacheUser user = getUser(userId);
+        requireNotBuiltInDefault(userId, "modified");
         // Storage backends hand back the live stored object, so validate everything
         // before the first setter — a rejected request must not leave changes behind.
         String normalizedEngine = (engine == null || engine.isBlank()) ? null : normalizeEngine(engine);
@@ -2203,9 +2241,10 @@ public class ElastiCacheService implements ResourceProvider {
     }
 
     public void deleteUser(String userId) {
-        if (users.get(userId).isEmpty()) {
+        if (findUser(userId).isEmpty()) {
             throw new AwsException("UserNotFound", "User " + userId + " not found.", 404);
         }
+        requireNotBuiltInDefault(userId, "deleted");
         synchronized (userGroupLock) {
             users.delete(userId);
             // AWS removes a deleted user from every user group it belongs to
