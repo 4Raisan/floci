@@ -7,6 +7,7 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.api.parallel.Isolated;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.ecr.EcrClient;
 import software.amazon.awssdk.services.ecr.model.*;
@@ -23,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @DisplayName("ECR Container Registry")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@Isolated
 class EcrTest {
 
     private static EcrClient ecr;
@@ -33,6 +35,12 @@ class EcrTest {
     @BeforeAll
     static void setup() {
         ecr = TestFixtures.ecrClient();
+        // Floci removes the backing registry when the last repository goes and starts a new one
+        // on the next create, which can stall for as long as Floci caches the old container's
+        // address. These tests are not about that, so one repository stays for the whole class.
+        String keepRegistry = "floci-it/keep-registry-" + System.nanoTime();
+        ecr.createRepository(b -> b.repositoryName(keepRegistry));
+        reposToCleanup.add(keepRegistry);
     }
 
     @AfterAll
