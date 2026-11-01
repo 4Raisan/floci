@@ -5758,7 +5758,7 @@ public class Ec2QueryHandler {
                 if (!networkInterface.getGroups().isEmpty()) {
                     xml.start("groupSet");
                     for (String group : networkInterface.getGroups()) {
-                        xml.elem("item", group);
+                        xml.elem("groupId", group);
                     }
                     xml.end("groupSet");
                 }
