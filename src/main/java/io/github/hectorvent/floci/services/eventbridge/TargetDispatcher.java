@@ -124,10 +124,25 @@ public class TargetDispatcher implements Resettable {
                     retry(delivery, now);
                 }
             } catch (RuntimeException e) {
-                LOG.warnv("EventBridge retry for rule {0} target {1} failed: {2}",
-                        delivery.ruleArn(), delivery.targetId(), e.getMessage());
+                handleRetryScopeFailure(delivery, now, e);
             }
         }
+    }
+
+    private void handleRetryScopeFailure(Delivery delivery, Instant now, RuntimeException e) {
+        if (delivery.generation() != generation.get()) {
+            return;
+        }
+        Target target = delivery.currentTargets().get().stream()
+                .filter(candidate -> delivery.targetId().equals(candidate.getId()))
+                .findFirst()
+                .orElse(null);
+        if (target == null) {
+            LOG.debugv("Dropped pending retry for rule {0} target {1}: target or rule removed",
+                    delivery.ruleArn(), delivery.targetId());
+            return;
+        }
+        handleFailure(delivery.nextRetry(), target, now, e);
     }
 
     private void retry(Delivery delivery, Instant now) {
