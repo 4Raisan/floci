@@ -1357,6 +1357,16 @@ public class RdsQueryHandler {
                             manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted,
                             requestedPort);
             }
+            Map<String, String> tags = parseTags(params);
+            String kmsKeyId = params.getFirst("KmsKeyId");
+            if (!tags.isEmpty()) {
+                service.addTagsToResource(cluster.getDbClusterArn(), tags, region);
+            }
+            if (kmsKeyId != null && !kmsKeyId.isBlank()) {
+                cluster = service.setNewDbClusterKmsKeyId(region, id, kmsKeyId);
+            } else if (!tags.isEmpty()) {
+                cluster = service.getDbCluster(id, region);
+            }
             if (!associatedRoles.isEmpty()) {
                 try {
                     cluster = service.addRolesToNewDbCluster(region, id, associatedRoles);
@@ -3474,6 +3484,7 @@ public class RdsQueryHandler {
            .elem("HttpEndpointEnabled", c.isHttpEndpointEnabled())
            .elem("MultiAZ", c.isMultiAz())
            .elem("StorageEncrypted", c.isStorageEncrypted())
+           .elem("KmsKeyId", c.getKmsKeyId())
            .elem("AvailabilityZone", c.getAvailabilityZone() != null ? c.getAvailabilityZone() : config.defaultAvailabilityZone())
            .elem("PreferredMaintenanceWindow", "mon:00:00-mon:03:00")
            .elem("PreferredBackupWindow", "04:00-06:00")
@@ -3527,6 +3538,9 @@ public class RdsQueryHandler {
         }
         xml.end("DBClusterMembers");
         writeAssociatedRoles(xml, c.getAssociatedRoles(), "DBClusterRole");
+        xml.start("TagList");
+        writeTags(xml, c.getTags());
+        xml.end("TagList");
         return xml.build();
     }
 
