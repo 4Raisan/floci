@@ -429,6 +429,33 @@ class TargetDispatcherTest {
     }
 
     @Test
+    void failureToEstablishRuleAccountScopeIsRetried() {
+        Target target = sqsTarget(null, DLQ_ARN);
+        AtomicReference<Boolean> failFirstScope = new AtomicReference<>(true);
+        try (MockedStatic<RequestScopes> scopes =
+                     mockStatic(RequestScopes.class, withSettings().mockMaker(MockMakers.INLINE))) {
+            scopes.when(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)))
+                    .thenAnswer(invocation -> {
+                        if (failFirstScope.getAndSet(false)) {
+                            throw new IllegalStateException("Request scope is not active");
+                        }
+                        invocation.<Runnable>getArgument(1).run();
+                        return null;
+                    });
+
+            dispatcher.dispatch("arn:aws:events:us-east-1:123456789012:rule/orders", target, EVENT, REGION,
+                    () -> List.of(target));
+            verify(sqsService, never()).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+            tickAt(T0.plusSeconds(1));
+
+            scopes.verify(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)), times(2));
+            verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+            verifyNoDeadLetter();
+        }
+    }
+
+    @Test
     void retryEstablishesRuleAccountScope() {
         Target target = sqsTarget(null, null);
         when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
