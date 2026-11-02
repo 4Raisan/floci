@@ -24,7 +24,7 @@ final class RedshiftDestinationValidator {
     private static final String ROLE_ARN_REGEX = "arn:.*:iam::\\d{12}:role/[a-zA-Z_0-9+=,.@\\-_/]+";
     private static final Pattern ROLE_ARN = Pattern.compile(ROLE_ARN_REGEX);
     private static final String SECRET_ARN_REGEX =
-            "arn:.*:secretsmanager:[a-zA-Z0-9\\-]+:\\d{12}:secret:[a-zA-Z0-9\\-/_+=.@]+";
+            "arn:.*:secretsmanager:[a-zA-Z0-9\\-]+:\\d{12}:secret:[a-zA-Z0-9\\-/_+=.@!]+";
     private static final Pattern SECRET_ARN = Pattern.compile(SECRET_ARN_REGEX);
     private static final Pattern UNREADABLE_KEY_CHARS = Pattern.compile("[\\s'\"]");
     private static final Set<String> BACKUP_MODES = Set.of("Disabled", "Enabled");
@@ -161,6 +161,7 @@ final class RedshiftDestinationValidator {
                         "secretsManagerConfiguration.secretARN", violations);
             }
         }
+        S3DestinationValidator.collectProcessingViolations(dest.getProcessingConfiguration(), shape, violations);
         S3Destination s3 = dest.getS3();
         if (s3 != null && s3.getPrefix() != null && UNREADABLE_KEY_CHARS.matcher(s3.getPrefix()).find()) {
             violations.add(violation(shape, "s3Configuration.prefix",

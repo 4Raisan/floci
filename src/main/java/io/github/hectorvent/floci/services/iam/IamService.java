@@ -176,6 +176,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private final Object tagLock = new Object();
 
+    /**
+     * Guards the read-modify-write of a customer managed policy's AttachmentCount. Attaching or
+     * detaching one policy on several principals at once would otherwise lose updates, leaving a
+     * fully detached policy that DeletePolicy still refuses as attached.
+     */
+    private final Object policyAttachmentCountLock = new Object();
+
     /** CSPRNG for long-term secret access keys; ordinary resource IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
 
@@ -1267,9 +1274,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * five entities and passes everything else through, which would make the {@code Role} this
      * action and {@code GetRole} answer unparsable.
      *
-     * <p>The rendering names neither the offending value nor the set, the way
-     * {@link #requireStatusFromEnum} does, which is the one IAM constraint rendering a recording
-     * covers. It also keeps the refused description out of the error body, where a control
+     * <p>The rendering keeps the refused description out of the error body, where a control
      * character would break the answer it is being refused for.
      */
     private static void validateRoleDescription(String description) {
@@ -1418,9 +1423,21 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * {@code _}, and that attribute forces replacement, so a name without one never converges.
      */
     public IamRole createServiceLinkedRole(String awsServiceName, String customSuffix, String description) {
-        if (awsServiceName == null || !SERVICE_PRINCIPAL_PATTERN.matcher(awsServiceName).matches()) {
-            throw new AwsException("InvalidInput",
-                    "AWSServiceName must be 1-128 characters matching [\\w+=,.@-], for example es.amazonaws.com.", 400); // partition-literal: AWS's own message text
+        if (awsServiceName == null) {
+            throw SmithyValidationErrors.validationError(SmithyValidationErrors.notNull("aWSServiceName"));
+        }
+        String constraint;
+        if (awsServiceName.isEmpty()) {
+            constraint = "Member must have length greater than or equal to 1";
+        } else if (awsServiceName.length() > 128) {
+            constraint = "Member must have length less than or equal to 128";
+        } else if (!SERVICE_PRINCIPAL_PATTERN.matcher(awsServiceName).matches()) {
+            constraint = "Member must satisfy regular expression pattern: [\\w+=.@-]*";
+        } else {
+            constraint = null;
+        }
+        if (constraint != null) {
+            throw IamValidationErrors.validationError("aWSServiceName", awsServiceName, constraint);
         }
         if (customSuffix != null && !customSuffix.isEmpty()
                 && !CUSTOM_SUFFIX_PATTERN.matcher(customSuffix).matches()) {
@@ -1708,21 +1725,23 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     private void incrementCustomerManagedPolicyAttachmentCount(IamPolicy policy) {
-        if (AwsManagedPolicies.isManagedPolicyArn(policy.getArn())) {
-            return;
-        }
-        policy.setAttachmentCount(policy.getAttachmentCount() + 1);
-        policies.put(policy.getArn(), policy);
+        adjustCustomerManagedPolicyAttachmentCount(policy.getArn(), 1);
     }
 
     private void decrementCustomerManagedPolicyAttachmentCount(String policyArn) {
+        adjustCustomerManagedPolicyAttachmentCount(policyArn, -1);
+    }
+
+    private void adjustCustomerManagedPolicyAttachmentCount(String policyArn, int delta) {
         if (AwsManagedPolicies.isManagedPolicyArn(policyArn)) {
             return;
         }
-        policies.get(policyArn).ifPresent(policy -> {
-            policy.setAttachmentCount(Math.max(0, policy.getAttachmentCount() - 1));
-            policies.put(policyArn, policy);
-        });
+        synchronized (policyAttachmentCountLock) {
+            policies.get(policyArn).ifPresent(policy -> {
+                policy.setAttachmentCount(Math.max(0, policy.getAttachmentCount() + delta));
+                policies.put(policyArn, policy);
+            });
+        }
     }
 
     private void rejectIfAwsManaged(String policyArn) {
@@ -3443,17 +3462,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     /**
-     * {@code statusType}, shared by UpdateAccessKey, UpdateSigningCertificate, UpdateSSHPublicKey
-     * and UpdateServiceSpecificCredential. One rendering serves all four because one front end
-     * validates one shape: the recording is of UpdateServiceSpecificCredential, and AWS names
-     * neither the offending value nor the permitted set, unlike this message elsewhere in the
-     * tree. Matched rather than made uniform.
+     * {@code statusType} is shared by four credential updates. AWS distinguishes a missing member
+     * from an invalid value and lists the permitted values in its recorded error-message order.
      */
     private void requireStatusFromEnum(String status) {
-        if (status == null || !CREDENTIAL_STATUSES.contains(status)) {
+        if (status == null) {
             throw SmithyValidationErrors.validationError(
-                    "Value at 'status' failed to satisfy "
-                            + "constraint: Member must satisfy enum value set");
+                    SmithyValidationErrors.notNullWithoutValue("status"));
+        }
+        if (!CREDENTIAL_STATUSES.contains(status)) {
+            throw SmithyValidationErrors.validationError(
+                    IamValidationErrors.MESSAGES.notInEnum(status, "status",
+                            List.of(CREDENTIAL_STATUS_EXPIRED, CREDENTIAL_STATUS_ACTIVE, "Inactive")));
         }
     }
 
@@ -4480,6 +4500,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .isPresent();
     }
 
+    /** Role chaining requires a live role credential with this request's matching issued token. */
+    public boolean isRoleSession(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getRoleArn)
+                .filter(AwsArnUtils::isArn)
+                .map(AwsArnUtils::parse)
+                .filter(arn -> "iam".equals(arn.service()) && arn.resource().startsWith("role/"))
+                .isPresent();
+    }
+
     /**
      * The session token issued alongside a temporary credential, for callers that must tell a
      * missing token apart from one that does not match.
@@ -4807,6 +4838,31 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                         && session.getPresignedResourceArn() != null)
                 .map(session -> new PresignedScope(
                         session.getPresignedAction(), session.getPresignedResourceArn()));
+    }
+
+    /** Binds a Redshift Spectrum scratch object ARN to an active transfer role session. */
+    public void registerSpectrumScratchResource(String accessKeyId, String resourceArn) {
+        currentSession(accessKeyId).ifPresent(session -> {
+            session.setSpectrumScratchResourceArn(resourceArn);
+            String accountId = session.getOriginAccountId() != null ? session.getOriginAccountId() : "000000000000";
+            putSessionForAccount(accountId, accessKeyId, session);
+        });
+    }
+
+    /** Clears the Spectrum scratch object permission from the session when the transfer completes. */
+    public void clearSpectrumScratchResource(String accessKeyId) {
+        currentSession(accessKeyId).ifPresent(session -> {
+            session.setSpectrumScratchResourceArn(null);
+            String accountId = session.getOriginAccountId() != null ? session.getOriginAccountId() : "000000000000";
+            putSessionForAccount(accountId, accessKeyId, session);
+        });
+    }
+
+    /** The exact scratch object ARN permitted for this session, if it is a Spectrum transfer session. */
+    public Optional<String> spectrumScratchResourceArn(String accessKeyId) {
+        return currentSession(accessKeyId)
+                .map(SessionCredential::getSpectrumScratchResourceArn)
+                .filter(arn -> arn != null && !arn.isBlank());
     }
 
     /**

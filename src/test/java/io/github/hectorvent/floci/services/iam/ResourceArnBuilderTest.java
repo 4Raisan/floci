@@ -1932,6 +1932,28 @@ class ResourceArnBuilderTest {
     }
 
     @Test
+    void bedrockResourcePolicyRoutesResolveTheArnTheyCarry() {
+        String guardrail = "arn:aws:bedrock:us-east-1:000000000000:guardrail/abc123def456";
+        for (String method : List.of("GET", "DELETE")) {
+            when(ctx.getMethod()).thenReturn(method);
+            when(uriInfo.getPath()).thenReturn("/resource-policy/" + guardrail);
+            assertEquals(List.of(guardrail), builder.buildResources("bedrock", ctx, "us-east-1", ACCOUNT), method);
+        }
+        when(ctx.getMethod()).thenReturn("POST");
+        when(uriInfo.getPath()).thenReturn("/resource-policy");
+        setJsonBody("{\"resourceArn\":\"" + guardrail + "\",\"resourcePolicy\":\"{}\"}");
+        assertEquals(List.of(guardrail), builder.buildResources("bedrock", ctx, "us-east-1", ACCOUNT));
+        // A value that is not an ARN, and every other Bedrock route, name no resource.
+        setJsonBody("{\"resourceArn\":\"abc123def456\",\"resourcePolicy\":\"{}\"}");
+        assertEquals(List.of("*"), builder.buildResources("bedrock", ctx, "us-east-1", ACCOUNT));
+        when(ctx.getMethod()).thenReturn("GET");
+        when(uriInfo.getPath()).thenReturn("/resource-policy/abc123def456");
+        assertEquals(List.of("*"), builder.buildResources("bedrock", ctx, "us-east-1", ACCOUNT));
+        when(uriInfo.getPath()).thenReturn("/guardrails/abc123def456");
+        assertEquals(List.of("*"), builder.buildResources("bedrock", ctx, "us-east-1", ACCOUNT));
+    }
+
+    @Test
     void apiGatewayRoutesResolveThePathTheyNameWithNoAccount() {
         request("/restapis/abc123/stages");
         assertEquals(List.of("arn:aws:apigateway:us-east-1::/restapis/abc123/stages"),
@@ -2106,10 +2128,13 @@ class ResourceArnBuilderTest {
             when(uriInfo.getPath()).thenReturn("/2017-03-31/tags/" + arn);
             assertEquals(arn, builder.build("lambda", ctx, "us-east-1", "000000000000"), arn);
         }
-        // The MicroVM tag handler takes a target without the arn: prefix too, and reads it the same way.
+        // A version-qualified connector is no tag target, so it stays as written rather than naming the connector.
+        String qualified = "arn:aws:lambda:eu-west-1:111122223333:network-connector:nc-1:1";
+        when(uriInfo.getPath()).thenReturn("/2017-03-31/tags/" + qualified);
+        assertEquals(qualified, builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        // A target without the arn: prefix names no resource.
         when(uriInfo.getPath()).thenReturn("/2017-03-31/tags/x:y:z:eu-west-1:microvm-image:img");
-        assertEquals("arn:aws:lambda:eu-west-1:000000000000:microvm-image:img",
-                builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        assertEquals("*", builder.build("lambda", ctx, "us-east-1", "000000000000"));
         when(uriInfo.getPath()).thenReturn("/2017-03-31/tags/shared");
         assertEquals("*", builder.build("lambda", ctx, "us-east-1", "000000000000"));
         // A streaming invoke is an invoke: its qualifier and the account its function ARN names count.
