@@ -766,7 +766,7 @@ order) through its own S3 service and streams the rows into the backing PostgreS
   compatible with output from `UNLOAD ... MANIFEST`. Missing files marked `mandatory: true` abort the load.
   When `mandatory` is omitted, it defaults to `false`. All entries in the manifest must reside in the same S3
   bucket as the manifest file itself; cross-bucket manifest entries are rejected as an intentional deviation.
-- `IGNOREHEADER` and `HEADER` skip lines from the first resolved object only.
+- `IGNOREHEADER` and `HEADER` skip lines from the start of every resolved object, as AWS does for a parallel load of several files.
 - `GZIP` is the only input compression recognized; `BZIP2`, `LZOP` and `ZSTD` are not.
 - `IAM_ROLE '<role-arn>'` is supported. The role must be associated with the cluster (at
   `CreateCluster` or through `ModifyClusterIamRoles`; connections opened before a change keep the
@@ -811,8 +811,16 @@ order) through its own S3 service and streams the rows into the backing PostgreS
   value into `NULL`, so a value PostgreSQL rejects fails the COPY; `TIMESTAMPTZ` columns are read by
   PostgreSQL whatever the format, since AWS requires `'auto'` for a format other than its default there; a
   two-digit `YY` year below 70 means 20YY and otherwise 19YY, which AWS does not document.
+- `FILLRECORD` loads a text or CSV record that stops short of the last columns: the missing columns of a
+  `VARCHAR` or `TEXT` type get a zero-length string, as in AWS, and every other missing column gets
+  `NULL`. With `EMPTYASNULL`, or `NULL AS ''`, which behaves the same, the missing character columns get `NULL`
+  too. A column that does not allow `NULL` fails the COPY as it would without `FILLRECORD`, and a record with
+  too many fields still fails. The number and types of the columns come from the catalog (generated columns
+  left out), or from the column list, in which a name that matches no column counts as a non-character column.
+  A domain over a character type counts as a non-character column. It works only over the Simple Query
+  protocol, and it is not combined with `FORMAT AS JSON`.
 - Any other clause (`FIXEDWIDTH`, `PARQUET`, `AVRO`, `ORC`, `MAXERROR`,
-  `FILLRECORD`, `ENCODING`, `ESCAPE`, `ENCRYPTED`, `MASTER_SYMMETRIC_KEY`,
+  `ENCODING`, `ESCAPE`, `ENCRYPTED`, `MASTER_SYMMETRIC_KEY`,
   `KMS_KEY_ID`, and so on) is not recognized: the statement is forwarded unchanged and PostgreSQL
   returns its own error.
 - A multi-statement query whose COPY is followed by another statement is not intercepted; send the
@@ -930,7 +938,7 @@ These views expose the documented Redshift column names, types, and ordering map
 - Real Redshift SQL semantics: the data plane is stock PostgreSQL. Redshift-only table DDL keywords (DISTSTYLE / DISTKEY / SORTKEY / ENCODE) are stripped so CREATE TABLE / ALTER TABLE executes (see [SQL Interceptor](#sql-interceptor)), but the distribution/sort behavior they request is not; SUPER and Spectrum features outside the documented [Phase 1 subset](#redshift-spectrum-phase-1) are not emulated.
 - Multi-node clusters: `NodeType` and `NumberOfNodes` are stored as metadata; every cluster is a single PostgreSQL container.
 - Parameter groups apply no real engine settings; values are stored and echoed back only.
-- Subnet groups, VPC routing, and security groups are metadata only.
+- Subnet groups, VPC routing, and security groups are metadata only. A subnet group still records its tags, and takes its VPC and each subnet's availability zone from EC2 when the subnets exist there; subnets EC2 does not know are kept as given.
 - Resize, pause/resume, and IAM authentication.
 - Cross-account role ARNs are not supported for COPY or UNLOAD.
 - The auth proxy validates the master user's password and any live `GetClusterCredentials` credential. Other non-master users pass straight through to PostgreSQL, which remains the authority for their credentials.

@@ -78,6 +78,7 @@ public final class RequestConstraintCheck {
             case "structure", "map" -> value.isObject();
             case "list" -> value.isArray();
             case "string" -> value.isTextual();
+            case "boolean" -> value.isBoolean();
             case "integer", "long" -> value.isIntegralNumber() && value.canConvertToLong();
             default -> false;
         };
@@ -95,7 +96,7 @@ public final class RequestConstraintCheck {
             throw messages.bounds(path, type, min, max, size);
         }
         if (patterns.containsKey(name) && !patterns.get(name).matcher(value.asText()).matches()) {
-            throw messages.pattern(path, shape.get("pattern").asText());
+            throw messages.pattern(path, VendoredPatterns.quoted(shape));
         }
         if (shape.has("enum")) {
             boolean known = false;

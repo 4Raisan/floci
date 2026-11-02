@@ -5,6 +5,7 @@ Run with: pytest tools/aws -q  (or: make iam-request-resources-test)
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -183,6 +184,7 @@ def corrections(monkeypatch):
     monkeypatch.setattr(r, "UNQUALIFIED", {})
     monkeypatch.setattr(r, "MINTED_IDS", {})
     monkeypatch.setattr(r, "FOUND_BY", {})
+    monkeypatch.setattr(r, "THROUGH", {})
     monkeypatch.setattr(r, "CLIENTS_NOT_READ", {})
     return monkeypatch
 
@@ -225,6 +227,28 @@ def test_a_member_holding_an_account_id_gives_the_account_of_the_types_named_by_
                           ["registryId"]) == [{"type": "catalog", "fill": {}}]
     # Two account members, either of which it could be, give none.
     assert r.with_account([{"type": "thing", "fill": {}}], FORMATS, ["a", "b"]) == [{"type": "thing", "fill": {}}]
+
+
+def test_a_file_that_is_not_json_is_reported_and_not_read(corrections, tmp_path, capsys):
+    output = tmp_path / "iam-request-resources.json"
+    output.write_text("{not json", encoding="utf-8")
+
+    for mode in ("--check", "--verify"):
+        assert r.main([mode, "--output", str(output)]) == 1
+        assert "could not be read" in capsys.readouterr().err
+
+
+def test_a_file_that_cannot_be_read_is_reported(corrections, tmp_path, capsys):
+    output = tmp_path / "iam-request-resources.json"
+    output.write_text("{}", encoding="utf-8")
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    # The read is refused rather than the file made unreadable, which a run as root could read anyway.
+    corrections.setattr(Path, "read_text", refuse)
+    assert r.main(["--check", "--output", str(output)]) == 1
+    assert "could not be read" in capsys.readouterr().err
 
 
 def test_a_hand_edited_entry_does_not_match_botocore(corrections, tmp_path):
@@ -290,6 +314,31 @@ def test_a_type_whose_arn_is_all_an_id_its_service_mints_is_found_by_the_members
     operations["svc:PutTarget"]["resources"] = [{"type": "target", "fill": {"ResourceId": "ResourceId"}}]
     assert r.validate(document) == [] and len(r.derive(document, tmp_path)) == 1
     corrections.setattr(r, "FOUND_BY", {"svc:gone": (["Namespace"], "no longer there")})
+    with pytest.raises(ValueError, match="svc:gone"):
+        r.build(documents, "test", tmp_path, "botocore test")
+
+
+def test_a_member_naming_a_resource_of_no_type_names_the_one_it_runs_on_through_it(corrections, tmp_path):
+    documents = [reference("svc", {"Run": ["cluster", "group"], "RunOnGroup": ["group"], "RunOnCluster": ["cluster"],
+                                   "ListSessions": []},
+                           {"cluster": "arn:${Partition}:svc:${Region}:${Account}:cluster:${ClusterName}",
+                            "group": "arn:${Partition}:svc:${Region}:${Account}:group/${GroupId}"})]
+    write_models(tmp_path, {"svc": model({"Run": {"SessionId": "String"}, "RunOnGroup": {"SessionId": "String"},
+                                          "RunOnCluster": {"Sql": "String"}, "ListSessions": {"SessionId": "String"}})})
+    corrections.setattr(r, "THROUGH", {"svc:SessionId": (["cluster", "group"], "a session runs on one")})
+    document = r.build(documents, "test", tmp_path, "botocore test")
+    assert r.validate(document) == [] and r.derive(document, tmp_path) == []
+    operations = document["operations"]
+    # Named through the session, as one of the types the action acts on.
+    assert operations["svc:Run"]["resources"] == [{"types": ["cluster", "group"], "through": "SessionId"}]
+    assert operations["svc:RunOnGroup"]["resources"][-1] == {"types": ["group"], "through": "SessionId"}
+    # Not by a request without the member, nor for an action acting on none of the types.
+    assert not any("through" in resource for resource in operations["svc:RunOnCluster"]["resources"])
+    assert operations["svc:ListSessions"]["resources"] == []
+    # A hand edit no longer matches, and a type the file has no format for fails the build.
+    operations["svc:Run"]["resources"] = []
+    assert r.validate(document) == [] and len(r.derive(document, tmp_path)) == 1
+    corrections.setattr(r, "THROUGH", {"svc:SessionId": (["gone"], "no longer there")})
     with pytest.raises(ValueError, match="svc:gone"):
         r.build(documents, "test", tmp_path, "botocore test")
 
@@ -387,6 +436,10 @@ def test_a_well_formed_document_validates():
     document = good_document()
     document["operations"]["svc:B"]["resources"][0].update(fill={}, find=["Namespace", "Id"])
     assert r.validate(document) == []
+    # A resource named through a member naming another of its service's own, which it runs on.
+    document = good_document()
+    document["operations"]["svc:A"]["resources"] = [{"types": ["thing"], "through": "SessionId"}]
+    assert r.validate(document) == []
 
 
 def with_a_create() -> dict:
@@ -400,6 +453,14 @@ def with_a_create() -> dict:
     (lambda d: d["operations"]["svc:A"]["resources"][0].update(types=["pool"]), "not resource types"),
     (lambda d: d["operations"]["svc:A"]["resources"][0].update(arn="a.b.c"), "no member"),
     (lambda d: d["operations"]["svc:A"]["resources"][0].update(arn="a[][]"), "no member"),
+    (lambda d: d["operations"]["svc:A"]["resources"].__setitem__(0, {"types": ["thing"], "through": "Ids[]"}),
+     "no member of one value"),
+    (lambda d: d["operations"]["svc:A"]["resources"].__setitem__(0, {"types": ["thing"], "through": "a.b"}),
+     "no member of one value"),
+    (lambda d: d["operations"]["svc:A"]["resources"].__setitem__(0, {"types": ["pool"], "through": "SessionId"}),
+     "not resource types"),
+    (lambda d: d["operations"]["svc:A"]["resources"].__setitem__(0, {"types": ["thing"], "through": "SessionId",
+                                                                     "before": "#"}), "neither an ARN member"),
     (lambda d: d["operations"]["svc:B"]["resources"][0]["fill"].update(GroupName="Group.Names[]"), "no variables"),
     (lambda d: d["operations"]["svc:B"]["resources"][0]["fill"].update(GroupName="A.B.Name"), "no variables"),
     (lambda d: d["operations"]["svc:B"]["resources"][0].update(fixed={"Other": "x"}), "fixes"),
@@ -581,8 +642,13 @@ def test_the_vendored_file_is_well_formed():
     # A Data API request runs on the cluster it names, or on the serverless workgroup its name or ARN finds.
     assert operations["redshift-data:ExecuteStatement"]["resources"][1:] == [
         {"type": "cluster", "fill": {"ClusterName": "ClusterIdentifier"}},
-        {"type": "workgroup", "fill": {}, "find": ["WorkgroupName"]}]
+        {"type": "workgroup", "fill": {}, "find": ["WorkgroupName"]},
+        {"types": ["cluster", "workgroup"], "through": "SessionId"}]
+    # A request naming its session alone runs on the cluster or workgroup the session was opened on.
+    assert operations["redshift-data:BatchExecuteStatement"]["resources"][-1] == {
+        "types": ["cluster", "workgroup"], "through": "SessionId"}
     assert operations["redshift-data:ListStatements"]["resources"] == []
+    assert operations["redshift-data:ListSessions"]["resources"] == []
     # The v2 API's Type picks the load balancer it creates, application when it gives none.
     assert operations["elasticloadbalancing:CreateLoadBalancer"]["resources"][1] == {
         "type": "loadbalancer/app/", "fill": {"LoadBalancerName": "Name"}, "when": {"Type": ["application", None]}}

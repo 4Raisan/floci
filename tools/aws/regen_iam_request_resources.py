@@ -91,7 +91,12 @@ members: each operation whose request has them all names the type by them (`find
 asks the service for the ARN they find, or else checks the ARN with its id open, as for a create; an
 Application Auto Scaling scalable target, `scalable-target/<id>`, is named by its service namespace,
 resource id and scalable dimension, and the Redshift Serverless workgroup a Data API request runs on,
-`workgroup/<id>`, by its name or ARN.
+`workgroup/<id>`, by its name or ARN. `THROUGH` are the members naming a resource the reference gives no
+type, through which a request names a resource of one it does, with those types: each operation whose
+request has the member, and whose action acts on one of them, names its resource through it (`through`),
+and the reader asks the service for the ARN of the caller's resource at the other end, or else names
+none; a Data API session, by its `SessionId`, runs on the cluster or the serverless workgroup it was
+opened on.
 
 The Service Reference is live rather than a pinned dependency, so a fresh generation is not
 byte-identical. The two gates split along the sources:
@@ -120,7 +125,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from regen_iam_authorized_actions import authorized_actions_from, fetch_references
-from regen_iam_passed_roles import NAMESPACE_RE, OPERATION_RE, _shown, load_models, namespace_of
+from regen_iam_passed_roles import (
+    NAMESPACE_RE,
+    OPERATION_RE,
+    _shown,
+    load_models,
+    namespace_of,
+)
 from regen_partitions import resolve_botocore_data
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -130,8 +141,8 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 # are the ones its handlers mint.
 NAMESPACES = ("acm", "application-autoscaling", "athena", "bcm-data-exports", "bcm-pricing-calculator", "budgets", "ce", "cloudtrail",
               "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "cur", "ecr", "elasticloadbalancing",
-              "events", "firehose", "globalaccelerator", "kinesisanalytics", "redshift-data", "servicediscovery",
-              "servicequotas", "states", "textract", "timestream-influxdb", "translate")
+              "events", "firehose", "globalaccelerator", "kinesisanalytics", "payment-cryptography", "redshift-data",
+              "servicediscovery", "servicequotas", "states", "textract", "timestream-influxdb", "translate")
 
 # SDK clients the reference lists for a namespace's operations whose requests Floci does not serve, and why: their
 # members are not read.
@@ -452,6 +463,19 @@ FOUND_BY: dict[str, tuple[list[str], str]] = {
         "workgroup name or Amazon Resource Name (ARN)'"),
 }
 
+# Members naming a resource of their service's own the reference gives no type, through which a request names a
+# resource of one it does, the types that resource may be of, and why: an operation whose request has the member,
+# and whose action acts on one of those types, names it through the member, and the reader asks the service for the
+# ARN of the caller's resource at the other end.
+THROUGH: dict[str, tuple[list[str], str]] = {
+    "redshift-data:SessionId": (
+        ["cluster", "workgroup"],
+        "a Data API session runs on the cluster or the serverless workgroup it was opened on (ListSessions filters "
+        "sessions 'by session status, compute target (cluster or serverless workgroup), or database'), and its "
+        "SessionId 'can then be used in subsequent ExecuteStatement and BatchExecuteStatement operations' "
+        "(Amazon Redshift Management Guide), which then run there"),
+}
+
 # The variables of an ARN format the account, partition and Region fill.
 KNOWN_VARIABLES = {"Partition", "Region", "Account"}
 VARIABLE_RE = re.compile(r"\$\{(\w+)}")
@@ -648,6 +672,12 @@ def with_account(resources: list[dict], formats: dict[str, str], accounts: list[
             and "${Account}" in formats.get(resource["type"], "") else resource for resource in resources]
 
 
+def _kinds(resource: dict) -> list[str]:
+    """The resource types a resource names, as the strings they are: the types it acts on, or the one it names."""
+    named: list = list(resource.get("types") or [resource.get("type")])
+    return [kind for kind in named if isinstance(kind, str)]
+
+
 def kind_of(name: str) -> str:
     """Whether a name ends as a name, an id, or an identifier (which is either), or neither."""
     lower = name.lower()
@@ -732,12 +762,13 @@ def with_made(resources: list[dict], operation: str, formats: dict[str, str]) ->
         return related(created, stem(kind)) or (word is not None and related(created, stem(word.group(1))))
 
     def makes(resource: dict) -> bool:
-        return all(is_created(kind) for kind in resource.get("types") or [resource.get("type")])
+        return all(is_created(kind) for kind in _kinds(resource))
 
     made = [makes(resource) for resource in resources]
     if all(made) or not any(made):
         return resources
-    return [dict(resource, made=True) if is_made else resource for resource, is_made in zip(resources, made)]
+    return [dict(resource, made=True) if is_made else resource
+            for resource, is_made in zip(resources, made, strict=True)]
 
 
 def child_id(child: str, parent: str) -> str | None:
@@ -809,8 +840,9 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
             raise ValueError(f"CORRECTIONS serves {operation} on {sorted(unknown)}, no endpoint prefix of the clients "
                              f"it reads ({sorted(endpoints)})")
     else:
-        resources = with_found(resources_for(operation, types, formats, members), namespace_of(operation), types,
-                               members)
+        resources = with_through(with_found(resources_for(operation, types, formats, members),
+                                            namespace_of(operation), types, members),
+                                 namespace_of(operation), types, members)
     resources = with_account(resources, formats, account_members(models, operation.split(":", 1)[1]))
     resources = with_arn_of(resources, formats, name_or_arn_members(models, operation.split(":", 1)[1]))
     resources = with_made(resources, operation, formats)
@@ -832,6 +864,18 @@ def with_found(resources: list[dict], namespace: str, types: list[str], members:
     return found
 
 
+def with_through(resources: list[dict], namespace: str, types: list[str], members: dict[str, str]) -> list[dict]:
+    """The resources, and the one of the `THROUGH` types the action acts on that each member of the request naming
+    a resource of its service's own runs on."""
+    through = []
+    for key, (kinds, _) in sorted(THROUGH.items()):
+        member = key.split(":", 1)[1]
+        on = [kind for kind in types if kind in kinds]
+        if key.startswith(f"{namespace}:") and on and members.get(member) == member:
+            through.append({"types": on, "through": member})
+    return resources + through
+
+
 def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> dict:
     upstream = checked_actions(documents)
     covered = {operation: value for operation, value in upstream.items() if namespace_of(operation) in NAMESPACES}
@@ -851,6 +895,9 @@ def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> 
                 if kind in formats.get(namespace, {}) and not ONE_VARIABLE_RE.match(_resource(formats[namespace][kind]))]
     missing += [f"FOUND_BY names {key}, no resource type with an ARN format of a namespace the file reads"
                 for key in sorted(FOUND_BY) if key.split(":", 1)[1] not in formats.get(key.split(":", 1)[0], {})]
+    missing += [f"THROUGH names {key.split(':', 1)[0]}:{kind}, no resource type with an ARN format of a namespace the "
+                f"file reads" for key, (kinds, _) in sorted(THROUGH.items()) for kind in kinds
+                if kind not in formats.get(key.split(":", 1)[0], {})]
     if missing:
         raise ValueError("; ".join(missing))
     operations = {}
@@ -1012,6 +1059,7 @@ def validate(document: dict) -> list[str]:
 def _resource_problems(operation: str, resource: object, types: set[str], formats: dict[str, str]) -> list[str]:
     if not isinstance(resource, dict) or not ({"types", "arn"} <= set(resource) <= {"types", "arn", "before", "made",
                                                                                      "endpoint"}
+                                              or {"types", "through"} <= set(resource) <= {"types", "through", "endpoint"}
                                               or {"type", "fill"} <= set(resource) <= {"type", "fill", "when", "unless", "absent", "arnOf", "account",
                                                                                        "fixed", "made", "before", "find", "endpoint"}):
         return [f"{operation} names {resource!r}, which is neither an ARN member nor a type's variables"]
@@ -1022,12 +1070,18 @@ def _resource_problems(operation: str, resource: object, types: set[str], format
     before = resource.get("before", "#")
     if not isinstance(before, str) or len(before) != 1:
         return [f"{operation} reads its members before {before!r}, which is no one character"]
-    kinds = resource.get("types") or [resource.get("type")]
-    if not all(isinstance(kind, str) and kind in types and kind in formats for kind in kinds):
-        return [f"{operation} names {kinds}, not resource types its action acts on with an ARN format"]
+    named = resource.get("types") or [resource.get("type")]
+    kinds = _kinds(resource)
+    if len(kinds) != len(named) or not all(kind in types and kind in formats for kind in kinds):
+        return [f"{operation} names {named}, not resource types its action acts on with an ARN format"]
     if "arn" in resource:
         if not isinstance(resource["arn"], str) or not ARN_PATH_RE.match(resource["arn"]):
             return [f"{operation} reads an ARN at {resource['arn']!r}, which is no member"]
+        return []
+    if "through" in resource:
+        through = resource["through"]
+        if not isinstance(through, str) or not PATH_RE.match(through) or through.endswith("[]"):
+            return [f"{operation} names {kinds} through {through!r}, which is no member of one value"]
         return []
     fill = resource["fill"]
     find = resource.get("find", [])
@@ -1146,7 +1200,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.output.exists():
             print(f"error: {args.output} does not exist", file=sys.stderr)
             return 1
-        document = json.loads(args.output.read_text(encoding="utf-8"))
+        try:
+            document = json.loads(args.output.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"error: {_shown(args.output)} could not be read ({e})", file=sys.stderr)
+            return 1
         problems = validate(document)
         if not problems and args.check:
             data, _ = resolve_botocore_data(args.botocore_data)

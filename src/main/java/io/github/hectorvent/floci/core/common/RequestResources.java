@@ -64,7 +64,8 @@ public final class RequestResources {
     /**
      * As {@link #of(String, ContainerRequestContext, String, String, String)}, a resource of a type whose service
      * mints an id after its name, or as all of its ARN, being the one {@code stored} finds for the caller under the
-     * name or the members the request gives, or else its ARN with that id open, as it is with no {@code stored}.
+     * name or the members the request gives, or else its ARN with that id open, as it is with no {@code stored}; and
+     * one a request names through another of its service's own, the one {@code stored} gives, or none.
      */
     public static List<String> of(String operation, ContainerRequestContext ctx, String partition, String region,
                                   String accountId, StoredResourceArns stored) {
@@ -96,6 +97,8 @@ public final class RequestResources {
                             .findFirst().ifPresent(format -> addNamed(arns, format.checked(named), partition, region,
                                     accountId));
                 }
+            } else if (resource.through() != null) {
+                through(arns, resource, formats, form, body, region, stored);
             } else if (!resource.find().isEmpty()) {
                 found(arns, resource, formats, form, body, partition, region, accountId, stored);
             } else {
@@ -368,28 +371,47 @@ public final class RequestResources {
         arns.add(found.orElseGet(() -> render(formats.get(type).format(), Map.of(), partition, region, accountId)));
     }
 
+    /**
+     * The resource of one of the types a request names through a member naming another of its service's own, which
+     * runs on it ({@code through}), when the request gives it one value: the ARN {@code stored} gives for the caller's
+     * resource of that name; none when there is no such resource, which its handler refuses.
+     */
+    private static void through(Set<String> arns, RequestResourceMembers.Resource resource,
+                                Map<String, RequestResourceMembers.ArnFormat> formats, Map<String, String> form,
+                                JsonNode body, String region, StoredResourceArns stored) {
+        List<String> values = values(form, body, resource.through());
+        if (stored == null || isNull(body, resource.through()) || values.size() != 1) {
+            return;
+        }
+        stored.through(resource.through().name(), values.getFirst(), region)
+                .filter(arn -> resource.types().stream().map(formats::get)
+                        .anyMatch(format -> format.pattern().matcher(arn).matches()))
+                .ifPresent(arns::add);
+    }
+
     /** Whether a member that may give an ARN of a type instead of its name gives one. */
     private static boolean isArnOf(RequestResourceMembers.ArnFormat named, String value) {
         return named != null && named.pattern().matcher(value).matches();
     }
 
     /**
-     * The ARN of a resource of a type whose service follows its name with an id it mints: the one {@code stored}
-     * finds the caller's resource of that name under in the Region, or else the ARN with that id open; any other
-     * type's as rendered.
+     * The ARN of a resource the namespace's service stores under the name the request gives: the one {@code stored}
+     * finds the caller's resource of that name under in the Region.
+     *
+     * <p>The service is asked for every type of the namespace, not only for the ones whose ARN carries an id it
+     * mints, so a service may answer for a type whose ARN it does not mint: a key an alias names is the key the
+     * alias points at. A type whose service follows its name with an id it mints has that id open when the service
+     * stores none, and any other type's is as rendered.
      */
     private static String withId(String arn, RequestResourceMembers.ArnFormat format, String type,
                                  Map<String, String> filling, StoredResourceArns stored, String region) {
-        if (!format.minted()) {
-            return arn;
-        }
         if (stored != null && filling.size() == 1) {
             Optional<String> found = stored.find(type, List.of(filling.values().iterator().next()), region);
             if (found.isPresent()) {
                 return found.get();
             }
         }
-        return arn + "/*";
+        return format.minted() ? arn + "/*" : arn;
     }
 
     /**

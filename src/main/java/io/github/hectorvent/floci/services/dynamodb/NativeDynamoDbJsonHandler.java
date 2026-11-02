@@ -572,6 +572,15 @@ public class NativeDynamoDbJsonHandler {
                 + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
     }
 
+    private static String returnItemCollectionMetricsError(JsonNode request) {
+        JsonNode value = request.get("ReturnItemCollectionMetrics");
+        if (value == null || value.isNull() || VALID_RETURN_ITEM_COLLECTION_METRICS.contains(value.asText())) {
+            return null;
+        }
+        return "Value '" + value.asText() + "' at 'returnItemCollectionMetrics' failed to satisfy constraint: "
+                + "Member must satisfy enum value set: [SIZE, NONE]";
+    }
+
     private Response handlePutItem(JsonNode request, String region) {
         String tableName = request.has("TableName") ? request.path("TableName").asText() : null;
         DynamoDbTableNames.resolve(tableName); // validate tableName before other params
@@ -2418,39 +2427,11 @@ public class NativeDynamoDbJsonHandler {
     }
 
     private Response handleTransactWriteItems(JsonNode request, String region) {
-        JsonNode transactItemsNode = requireValidTransactRequest(request);
+        TransactRequest checked = requireValidTransactRequest(request, true);
+        JsonNode transactItemsNode = checked.items();
 
-        for (JsonNode txItem : transactItemsNode) {
-            for (Map.Entry<String, JsonNode> action : txItem.properties()) {
-                JsonNode op = action.getValue();
-                String conditionExpression = op.has("ConditionExpression")
-                        ? op.get("ConditionExpression").asText() : null;
-                String updateExpression = op.has("UpdateExpression")
-                        ? op.get("UpdateExpression").asText() : null;
-                JsonNode opExprAttrNames = op.get("ExpressionAttributeNames");
-                JsonNode opExprAttrValues = op.get("ExpressionAttributeValues");
-                // AWS checks the depth of every value of a member before anything else,
-                // so even an unused or condition-only value fails the request.
-                DynamoDbAttributeValueValidator.requireNestingWithinLimit(op.get("Item"), false);
-                DynamoDbAttributeValueValidator.requireNestingWithinLimit(op.get("Key"), false);
-                DynamoDbAttributeValueValidator.requireNestingWithinLimit(opExprAttrValues, false);
-                requireReadableValues(op.get("Put".equals(action.getKey()) ? "Item" : "Key"), "");
-                // An action without an expression ignores its ExpressionAttributeValues.
-                if (conditionExpression != null || updateExpression != null) {
-                    requireReadableValues(opExprAttrValues, "");
-                }
-                DynamoDbExpressionSize.checkRead(op.path("UpdateExpression").textValue(), "UpdateExpression");
-                DynamoDbExpressionSize.checkReadWithSize(conditionExpression, "ConditionExpression");
-                ExpressionEvaluator.validateSyntax(conditionExpression, "ConditionExpression");
-                // Undefined tokens must fail here as a ValidationException, never a
-                // TransactionCanceledException with a false ConditionalCheckFailed reason.
-                requireDefinedTokens(updateExpression, "UpdateExpression", opExprAttrNames, opExprAttrValues);
-                requireDefinedTokens(conditionExpression, "ConditionExpression", opExprAttrNames, opExprAttrValues);
-                ExpressionEvaluator.validateSemantics(conditionExpression, "ConditionExpression",
-                        opExprAttrNames, opExprAttrValues);
-                dynamoDbService.requireAddOrDeleteOperandTypes(op.path("UpdateExpression").textValue(),
-                        opExprAttrValues, false);
-            }
+        for (TransactAction action : checked.actions()) {
+            requireValidTransactAction(action, checked.older());
         }
 
         // Check 4MB total item size limit
@@ -2515,22 +2496,224 @@ public class NativeDynamoDbJsonHandler {
         }
     }
 
-    private static JsonNode requireValidTransactRequest(JsonNode request) {
-        JsonNode transactItems = request.path("TransactItems");
-        List<String> validationErrors = new ArrayList<>();
-        if (transactItems.isMissingNode() || transactItems.isNull() || !transactItems.isArray()) {
-            validationErrors.add("Value null at 'transactItems' failed to satisfy constraint: "
-                    + "Member must have length greater than or equal to 1");
-        } else if (transactItems.isEmpty()) {
-            validationErrors.add("Value '[]' at 'transactItems' failed to satisfy constraint: "
-                    + "Member must have length greater than or equal to 1");
-        } else if (transactItems.size() > 100) {
-            validationErrors.add("Value '" + transactItems + "' at 'transactItems' failed to satisfy constraint: "
-                    + "Member must have length less than or equal to 100");
+    // DynamoDB reads an action with more than one operation as the first one in this order.
+    private static final List<String> TRANSACT_WRITE_OPS = List.of("ConditionCheck", "Put", "Delete", "Update");
+
+    private static final int MAX_TRANSACT_ITEMS = 100;
+
+    // DynamoDB names the required members of an action in this order.
+    private static final Map<String, List<String>> TRANSACT_REQUIRED_MEMBERS = Map.of(
+            "Put", List.of("Item", "TableName"),
+            "Delete", List.of("Key", "TableName"),
+            "Update", List.of("UpdateExpression", "Key", "TableName"),
+            "ConditionCheck", List.of("ConditionExpression", "Key", "TableName"),
+            "Get", List.of("Key", "TableName"));
+
+    // DynamoDB's newer validator gives up on a request nested this deep, and the older one answers.
+    private static final int OLDER_VALIDATOR_DEPTH = 128;
+
+    private record TransactAction(int index, String type, JsonNode op) {
+        String path(String member) {
+            return "transactItems." + (index + 1) + ".member." + decapitalize(type) + "." + decapitalize(member);
         }
-        addReturnConsumedCapacityError(request, validationErrors);
+    }
+
+    private record TransactRequest(JsonNode items, List<TransactAction> actions, boolean older) {}
+
+    // DynamoDB checks the lengths with its newer validator first. It skips that validator when a
+    // required member is missing or the request is nested too deep, and the older one checks the rest.
+    private static TransactRequest requireValidTransactRequest(JsonNode request, boolean write) {
+        String token = write ? request.path("ClientRequestToken").textValue() : null;
+        List<String> memberErrors = new ArrayList<>();
+        if (token != null) {
+            addIfPresent(memberErrors, SmithyValidationErrors.lengthOutOfRange("clientRequestToken", token, 1,
+                    MAX_CLIENT_REQUEST_TOKEN_LENGTH));
+        }
+        addReturnConsumedCapacityError(request, memberErrors);
+        if (write) {
+            addIfPresent(memberErrors, returnItemCollectionMetricsError(request));
+        }
+        JsonNode transactItems = request.path("TransactItems");
+        if (transactItems.isMissingNode() || transactItems.isNull() || !transactItems.isArray()) {
+            List<String> validationErrors = new ArrayList<>();
+            validationErrors.add(SmithyValidationErrors.notNull("transactItems"));
+            validationErrors.addAll(memberErrors);
+            throwValidationErrors(validationErrors);
+        }
+        List<String> ops = write ? TRANSACT_WRITE_OPS : List.of("Get");
+        List<TransactAction> actions = new ArrayList<>();
+        List<String> required = new ArrayList<>();
+        boolean missing = false;
+        boolean noOperation = false;
+        boolean manyOperations = false;
+        for (int i = 0; i < transactItems.size(); i++) {
+            JsonNode txItem = transactItems.get(i);
+            List<String> types = ops.stream().filter(txItem::hasNonNull).toList();
+            noOperation |= types.isEmpty();
+            manyOperations |= types.size() > 1;
+            if (!write && types.isEmpty()) {
+                required.add(SmithyValidationErrors.notNull("transactItems." + (i + 1) + ".member.get"));
+                missing = true;
+            }
+            if (types.isEmpty()) {
+                continue;
+            }
+            TransactAction action = new TransactAction(i, types.getFirst(), txItem.get(types.getFirst()));
+            actions.add(action);
+            for (String member : TRANSACT_REQUIRED_MEMBERS.get(action.type())) {
+                JsonNode value = action.op().get(member);
+                if (value == null || value.isNull()) {
+                    required.add(SmithyValidationErrors.notNull(action.path(member)));
+                    missing = true;
+                } else if ("TableName".equals(member) && value.asText().isEmpty()) {
+                    required.add(SmithyValidationErrors.lengthTooShort(action.path(member), "", 1));
+                }
+            }
+        }
+        boolean older = transactDepth(transactItems, ops) >= OLDER_VALIDATOR_DEPTH;
+        if (!missing && !older) {
+            requireTransactLengths(transactItems.size(), actions, token);
+        }
+
+        if (transactItems.size() > MAX_TRANSACT_ITEMS) {
+            required.addFirst("Value '" + transactItems + "' at 'transactItems' failed to satisfy constraint: "
+                    + "Member must have length less than or equal to " + MAX_TRANSACT_ITEMS);
+        }
+        // The older validator stops at a missing member, before the operation and name checks.
+        if (!required.isEmpty()) {
+            required.addAll(memberErrors);
+            throwValidationErrors(required);
+        }
+        List<String> tableNames = new ArrayList<>();
+        for (TransactAction action : actions) {
+            String name = action.op().get("TableName").asText();
+            if (!AwsArnUtils.looksLikeArn(name)) {
+                tableNames.addAll(nameViolations(name, action.path("TableName")));
+            }
+        }
+        boolean refuseNoOperation = write && noOperation;
+        // A request too deep for the newer validator also gets an older answer for an empty action.
+        if (older) {
+            throwValidationErrors(memberErrors);
+            if (refuseNoOperation) {
+                throw new AwsException("ValidationException",
+                        "Invalid Request: TransactWriteRequest should contain Delete or Put or Update request", 400);
+            }
+            throwValidationErrors(tableNames);
+        } else {
+            List<String> listed = refuseNoOperation
+                    ? new ArrayList<>(List.of("Value '' at 'transactItems' failed to satisfy constraint: "
+                            + "TransactWriteRequest should contain Delete or Put or Update or ConditionCheck"))
+                    : tableNames;
+            listed.addAll(memberErrors);
+            throwValidationErrors(listed);
+        }
+        if (manyOperations) {
+            throw new AwsException("ValidationException",
+                    "TransactItems can only contain one of Check, Put, Update or Delete", 400);
+        }
+        return new TransactRequest(transactItems, actions, older);
+    }
+
+    // The newer validator names a member by its 0-based position and leaves the value out.
+    private static void requireTransactLengths(int count, List<TransactAction> actions, String token) {
+        SmithyValidationErrors.Violations unquoted = SmithyValidationErrors.Violations.WITHOUT_VALUES;
+        List<String> validationErrors = new ArrayList<>();
+        if (token != null) {
+            addIfPresent(validationErrors, unquoted.lengthOutOfRange("ClientRequestToken", token, 1,
+                    MAX_CLIENT_REQUEST_TOKEN_LENGTH));
+        }
+        addIfPresent(validationErrors, SmithyValidationErrors.sizeOutOfRange("TransactItems", count, 1,
+                MAX_TRANSACT_ITEMS));
+        for (TransactAction action : actions) {
+            addIfPresent(validationErrors, unquoted.lengthOutOfRange(
+                    "TransactItems." + action.index() + ".member." + action.type() + ".TableName",
+                    action.op().get("TableName").asText(), 1, 1024));
+        }
         throwValidationErrors(validationErrors);
-        return transactItems;
+    }
+
+    // DynamoDB checks an action's ConditionExpression in full before its UpdateExpression.
+    private void requireValidTransactAction(TransactAction action, boolean older) {
+        JsonNode op = action.op();
+        String conditionExpression = textOrNull(op, "ConditionExpression");
+        String updateExpression = textOrNull(op, "UpdateExpression");
+        JsonNode exprAttrNames = op.get("ExpressionAttributeNames");
+        JsonNode exprAttrValues = op.get("ExpressionAttributeValues");
+        DynamoDbAttributeValueValidator.requireNestingWithinLimit(op.get("Item"), false);
+        DynamoDbAttributeValueValidator.requireNestingWithinLimit(op.get("Key"), false);
+        requireReadableValues(op.get("Put".equals(action.type()) ? "Item" : "Key"), "");
+        List<String> onFailureErrors = new ArrayList<>();
+        addPartiQLReturnValuesError(op, action.path("ReturnValuesOnConditionCheckFailure"), onFailureErrors);
+        throwValidationErrors(onFailureErrors);
+        // AWS checks the depth of every value, so even an unused or condition-only value fails the request.
+        DynamoDbAttributeValueValidator.requireNestingWithinLimit(exprAttrValues, false);
+        // An action without an expression ignores its ExpressionAttributeNames and ExpressionAttributeValues.
+        if (conditionExpression == null && updateExpression == null) {
+            return;
+        }
+        requireReadableValues(exprAttrValues, "");
+
+        requireNonEmptyExpression(conditionExpression, "ConditionExpression");
+        // Only a request too deep for the newer validator reports the condition's size.
+        if (older) {
+            DynamoDbExpressionSize.checkReadWithSize(conditionExpression, "ConditionExpression");
+        } else {
+            DynamoDbExpressionSize.checkRead(conditionExpression, "ConditionExpression");
+        }
+        ExpressionEvaluator.validateSyntax(conditionExpression, "ConditionExpression");
+        // Undefined tokens must fail here as a ValidationException, never a
+        // TransactionCanceledException with a false ConditionalCheckFailed reason.
+        requireDefinedTokens(conditionExpression, "ConditionExpression", exprAttrNames, exprAttrValues);
+        ExpressionEvaluator.validateSemantics(conditionExpression, "ConditionExpression",
+                exprAttrNames, exprAttrValues);
+
+        requireNonEmptyExpression(updateExpression, "UpdateExpression");
+        DynamoDbExpressionSize.checkRead(updateExpression, "UpdateExpression");
+        requireDefinedTokens(updateExpression, "UpdateExpression", exprAttrNames, exprAttrValues);
+        dynamoDbService.requireAddOrDeleteOperandTypes(updateExpression, exprAttrValues, false);
+
+        checkUnusedEan(exprAttrNames, extractHashTokens(conditionExpression, updateExpression));
+        checkUnusedEav(exprAttrValues, extractColonTokens(conditionExpression, updateExpression));
+    }
+
+    private static void requireNonEmptyExpression(String expression, String exprType) {
+        if (expression != null && expression.isEmpty()) {
+            throw new AwsException("ValidationException",
+                    "Invalid " + exprType + ": The expression can not be empty;", 400);
+        }
+    }
+
+    // DynamoDB leaves unknown members out when it measures how deep a request nests.
+    private static int transactDepth(JsonNode transactItems, List<String> ops) {
+        int deepest = 0;
+        for (JsonNode txItem : transactItems) {
+            for (String op : ops) {
+                for (String member : List.of("Item", "Key", "ExpressionAttributeValues")) {
+                    deepest = Math.max(deepest, jsonDepth(txItem.path(op).path(member)));
+                }
+            }
+        }
+        // The request, TransactItems, the action and the operation hold these members.
+        return deepest + 4;
+    }
+
+    private static int jsonDepth(JsonNode node) {
+        int deepest = 0;
+        for (JsonNode child : node) {
+            deepest = Math.max(deepest, jsonDepth(child));
+        }
+        return node.isContainerNode() ? deepest + 1 : 0;
+    }
+
+    private static String decapitalize(String name) {
+        return Character.toLowerCase(name.charAt(0)) + name.substring(1);
+    }
+
+    private static void addIfPresent(List<String> validationErrors, String error) {
+        if (error != null) {
+            validationErrors.add(error);
+        }
     }
 
     private static void addReturnConsumedCapacityError(JsonNode request, List<String> validationErrors) {
@@ -2585,7 +2768,7 @@ public class NativeDynamoDbJsonHandler {
     }
 
     private Response handleTransactGetItems(JsonNode request, String region) {
-        JsonNode transactItemsNode = requireValidTransactRequest(request);
+        JsonNode transactItemsNode = requireValidTransactRequest(request, false).items();
         transactItemsNode.forEach(txItem -> requireReadableValues(txItem.path("Get").path("Key"), ""));
 
         for (JsonNode txItem : transactItemsNode) {
