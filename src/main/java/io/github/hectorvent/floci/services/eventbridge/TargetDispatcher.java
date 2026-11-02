@@ -130,40 +130,16 @@ public class TargetDispatcher implements Resettable {
     }
 
     private void handleRetryScopeFailure(Delivery delivery, Instant now, RuntimeException e) {
-        if (delivery.generation() != generation.get()) {
-            return;
-        }
-        Target target = delivery.currentTargets().get().stream()
-                .filter(candidate -> delivery.targetId().equals(candidate.getId()))
-                .findFirst()
-                .orElse(null);
+        Target target = retryTarget(delivery, now);
         if (target == null) {
-            LOG.debugv("Dropped pending retry for rule {0} target {1}: target or rule removed",
-                    delivery.ruleArn(), delivery.targetId());
-            return;
-        }
-        if (!now.isBefore(expiresAt(delivery, target))) {
-            deadLetter(delivery, target, EXHAUSTED_BY_AGE);
             return;
         }
         handleFailure(delivery.nextRetry(), target, now, e);
     }
 
     private void retry(Delivery delivery, Instant now) {
-        if (delivery.generation() != generation.get()) {
-            return;
-        }
-        Target target = delivery.currentTargets().get().stream()
-                .filter(candidate -> delivery.targetId().equals(candidate.getId()))
-                .findFirst()
-                .orElse(null);
+        Target target = retryTarget(delivery, now);
         if (target == null) {
-            LOG.debugv("Dropped pending retry for rule {0} target {1}: target or rule removed",
-                    delivery.ruleArn(), delivery.targetId());
-            return;
-        }
-        if (!now.isBefore(expiresAt(delivery, target))) {
-            deadLetter(delivery, target, EXHAUSTED_BY_AGE);
             return;
         }
         if (delivery.retryAttempts() >= maximumRetryAttempts(target)) {
@@ -171,6 +147,26 @@ public class TargetDispatcher implements Resettable {
             return;
         }
         attempt(delivery.nextRetry(), target, now);
+    }
+
+    private Target retryTarget(Delivery delivery, Instant now) {
+        if (delivery.generation() != generation.get()) {
+            return null;
+        }
+        Target target = delivery.currentTargets().get().stream()
+                .filter(candidate -> delivery.targetId().equals(candidate.getId()))
+                .findFirst()
+                .orElse(null);
+        if (target == null) {
+            LOG.debugv("Dropped pending retry for rule {0} target {1}: target or rule removed",
+                    delivery.ruleArn(), delivery.targetId());
+            return null;
+        }
+        if (!now.isBefore(expiresAt(delivery, target))) {
+            deadLetter(delivery, target, EXHAUSTED_BY_AGE);
+            return null;
+        }
+        return target;
     }
 
     private void attempt(Delivery delivery, Target target, Instant now) {
