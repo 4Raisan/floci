@@ -140,7 +140,7 @@ The attributes follow the [CloudFormation resource schema](https://docs.aws.amaz
 | `DeleteTags` | Remove tags by key from a resource |
 | `DescribeTags` | List tagged resources and their tags |
 | `CreateClusterSubnetGroup` | Register a cluster subnet group (metadata only) |
-| `CreateIntegration` | Create a DynamoDB Streams to provisioned Redshift zero-ETL integration. Accepts `Description`, `KMSKeyId`, `AdditionalEncryptionContext` and `TagList` |
+| `CreateIntegration` | Create a DynamoDB zero-ETL integration from a table (or a stream) to a Redshift Serverless namespace (or a provisioned cluster). Accepts `Description`, `KMSKeyId`, `AdditionalEncryptionContext` and `TagList` |
 | `DescribeIntegrations` | List integrations with `Filters`, `MaxRecords` and `Marker` pagination, or the one an `IntegrationArn` names |
 | `DeleteIntegration` | Remove a zero-ETL integration |
 | `DescribeClusterSubnetGroups` | List subnet groups, optionally filtered by name |
@@ -375,9 +375,28 @@ Set `FLOCI_SERVICES_REDSHIFT_CLOUDWATCH_METRICS_ENABLED=false` to turn publishin
 
 ## DynamoDB zero-ETL
 
-The supported zero-ETL path is DynamoDB Streams to a provisioned Redshift cluster. The source ARN
-must identify an enabled local DynamoDB stream, and the target ARN must identify an existing
-provisioned Redshift cluster.
+As in AWS, `SourceArn` is a DynamoDB table ARN and `TargetArn` is a Redshift Serverless namespace
+ARN. Floci also accepts a DynamoDB stream ARN as the source and a provisioned cluster ARN
+(`arn:aws:redshift:<region>:<account>:cluster:<identifier>`) as the target. A source table that
+does not exist is refused with `IntegrationSourceNotFoundFault`, and a namespace that does not exist
+with `IntegrationTargetNotFoundFault`. A source stream that does not exist is refused with DynamoDB's
+`ResourceNotFoundException`, and a provisioned cluster target that does not exist with `ClusterNotFound`.
+
+```bash
+aws --endpoint-url http://localhost:4566 redshift create-integration \
+  --integration-name orders-zero-etl \
+  --source-arn arn:aws:dynamodb:us-east-1:000000000000:table/orders \
+  --target-arn arn:aws:redshift-serverless:us-east-1:000000000000:namespace/<namespace-id>
+```
+
+A namespace target is written through the namespace's workgroup, into the namespace's database as
+its admin user. Until the namespace has a workgroup, polling fails and the integration reports
+`failed`; it becomes `active` on the first poll after the workgroup exists.
+
+AWS reads the changes of a table source without DynamoDB Streams. Floci reads them from the table's
+latest stream, so a table source replicates changes only while the table has one, and a table that
+never had a stream gets its initial backfill only. The integration picks up a stream turned on after
+it was created, and moves to the new stream when streams are turned off and on again.
 
 Each stream record is written to a stable landing table named `floci_zetl_<integration-id>`.
 The landing table stores the event id, event name, source, region, sequence number, creation time,
@@ -422,8 +441,9 @@ data-type, pause and resume, serverless restore and modification events do not o
 is best effort. It is skipped when the EventBridge service is disabled, a refused or failed
 delivery is logged, and neither changes the outcome of the Redshift operation.
 
-Serverless Redshift targets, schema inference, and relational projection are not supported in this
-first implementation.
+Schema inference, relational projection and `CREATE DATABASE ... FROM INTEGRATION` are not
+supported, and a provisioned cluster's namespace ARN (`arn:aws:redshift:<region>:<account>:namespace:<id>`)
+is not accepted as a target.
 
 ## CloudFormation
 
@@ -777,9 +797,13 @@ order) through its own S3 service and streams the rows into the backing PostgreS
   request. `IAM_ROLE default` uses the cluster's default role with the same permission checks.
 - `REGION '<region>'` is accepted and ignored: Floci has one S3.
 - `CREDENTIALS 'aws_iam_role=<arn>'` behaves like `IAM_ROLE`. `ACCESS_KEY_ID` with `SECRET_ACCESS_KEY`
-  (and an optional `SESSION_TOKEN`), or `CREDENTIALS 'aws_access_key_id=...;aws_secret_access_key=...'`,
-  are accepted but never verified or stored: S3 is read as an unsigned request, the same as with no
-  authorization clause. Combining key credentials with `IAM_ROLE`, or giving only one of the pair, is
+  (and an optional `SESSION_TOKEN`), or `CREDENTIALS 'aws_access_key_id=...;aws_secret_access_key=...[;token=...]'`,
+  make S3 be read as that principal when S3 authorization is enforced. IAM must know the access key (a temporary
+  key also needs its session token) and the secret must match, otherwise the `COPY` fails with SQLSTATE `XX000`.
+  The key's identity policy must allow `s3:ListBucket` and `s3:GetObject`, and any bucket policy must not deny
+  the request (`42501` otherwise). With S3 authorization off the keys are ignored, so placeholder keys keep
+  working, and a statement with no authorization clause reads S3 as an unsigned request. The keys are not
+  stored. Combining key credentials with `IAM_ROLE`, or giving only one of the pair, is
   not intercepted, and neither is a blank key, secret, token or role.
 - `EMPTYASNULL`, `BLANKSASNULL`, `REMOVEQUOTES` (not with `CSV` or `JSON`), `ACCEPTINVCHARS [AS 'c']`
   (default `?`, one ASCII character) and `TRUNCATECOLUMNS` rewrite field content before loading. Field
@@ -798,14 +822,18 @@ order) through its own S3 service and streams the rows into the backing PostgreS
   `TIMEFORMAT` also takes `'epochsecs'` and `'epochmillisecs'`, read as UTC. A `DATEFORMAT` may name a time
   of day, which is dropped; a `TIMEFORMAT` without one gives midnight. A format that names a time zone, or
   any other text, is not recognized and the statement is forwarded to PostgreSQL. A value that does not
-  match its format fails the COPY, as it does with Redshift's default `MAXERROR` of 0; the message names the
-  column and the format, and Floci writes no `stl_load_errors` row. `ACCEPTANYDATE` loads such a value as
+  match its format fails the COPY, whatever `MAXERROR` says; the message names the column and the format, and
+  Floci writes no `stl_load_errors` row. `ACCEPTANYDATE` loads such a value as
   `NULL` instead; when no format is given it reads the ISO form of a date, with an optional time of day, and
-  turns anything else into `NULL`. Numeric parts with no separator between them, as in `YYYYMMDD`, need their
+  turns anything else into `NULL`. An empty unquoted field of a `DATE`, `TIMESTAMP` or other non-character column
+  is loaded as `NULL`, as in AWS, without requiring `ACCEPTANYDATE` or `EMPTYASNULL`. Numeric parts with no
+  separator between them, as in `YYYYMMDD`, need their
   full width, a part may be named once, and `HH12` needs `AM` or `PM`; any other format string is not
   recognized.
-  Like `TRUNCATECOLUMNS`, these read column types from the catalog, so they work only over the Simple Query
-  protocol and are not combined with `FORMAT AS JSON`. Floci deviations: `'auto'` is accepted but converts
+  Like `TRUNCATECOLUMNS`, these and the empty non-character rule read column types from the catalog, so
+  they apply only with the options that query column types (`DATEFORMAT`, `TIMEFORMAT`, `FILLRECORD`), over the
+  Simple Query protocol, and are not combined with `FORMAT AS JSON`; a plain `COPY` without those options does
+  not read the catalog. Floci deviations: `'auto'` is accepted but converts
   nothing, leaving every value to PostgreSQL, which reads ISO 8601, Julian and `YYYYMMDD HHMISS` but not every
   form Redshift recognizes (for example `BC` dates and `YYYY.DDD`), and with it `ACCEPTANYDATE` cannot turn a
   value into `NULL`, so a value PostgreSQL rejects fails the COPY; `TIMESTAMPTZ` columns are read by
@@ -819,7 +847,20 @@ order) through its own S3 service and streams the rows into the backing PostgreS
   left out), or from the column list, in which a name that matches no column counts as a non-character column.
   A domain over a character type counts as a non-character column. It works only over the Simple Query
   protocol, and it is not combined with `FORMAT AS JSON`.
-- Any other clause (`FIXEDWIDTH`, `PARQUET`, `AVRO`, `ORC`, `MAXERROR`,
+- `MAXERROR [AS] n` (0 to 100000) lets the load go on past records that cannot be converted. With `n` of 0 or 1 the
+  COPY fails at the first error, as it does without the option. With a larger `n` Floci asks the backend to skip
+  the failing records (`ON_ERROR ignore`) and to fail the COPY, rolling it back, once `n` of them have been
+  skipped (`REJECT_LIMIT n - 1`). This uses the PostgreSQL `COPY` options of the same names, so it needs a
+  PostgreSQL 18 backend (set `floci.services.redshift.image-version`, for example `postgres:18-alpine`); the
+  default backend rejects the option as unknown and the COPY fails with that error. The COPY fails when the
+  `n`-th record is rejected, counted across all the files of the load. Floci deviations: only a value that the
+  backend cannot convert to its column type is skipped, whereas Redshift also skips a record with too many or too
+  few fields, a `NOT NULL` violation and other errors, which still fail the COPY here. So do a value that does
+  not match a `DATEFORMAT` or `TIMEFORMAT` (use `ACCEPTANYDATE` to load it as `NULL`), a quoted field without its
+  closing quote under `REMOVEQUOTES`, and a line that `FORMAT AS JSON 'auto'` cannot read, since Floci rejects
+  those before the backend sees them. The backend reports the count of skipped records in its own notice, not
+  Redshift's `Load into table ... completed` message, and no `stl_load_errors` row is written.
+- Any other clause (`FIXEDWIDTH`, `PARQUET`, `AVRO`, `ORC`,
   `ENCODING`, `ESCAPE`, `ENCRYPTED`, `MASTER_SYMMETRIC_KEY`,
   `KMS_KEY_ID`, and so on) is not recognized: the statement is forwarded unchanged and PostgreSQL
   returns its own error.
@@ -869,8 +910,9 @@ the result to S3 as one or more objects under `<prefix>`.
   AWS, the compression suffix is added only when no extension is given, so `EXTENSION 'txt.gz' GZIP`
   gives `<prefix>0000_part_00.txt.gz`. The value is not validated; an empty value or one containing
   `/` is not intercepted. AWS does not document whether it inserts the dot itself.
-- `REGION` and the credential clauses (`CREDENTIALS`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`,
-  `SESSION_TOKEN`) behave as described for COPY.
+- `REGION` behaves as described for COPY. The key credential clauses (`CREDENTIALS 'aws_access_key_id=...'`,
+  `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `SESSION_TOKEN`) are accepted but ignored by UNLOAD, which writes
+  as the role or as an unsigned request. Only COPY reads S3 as the principal those clauses name.
 - `ESCAPE` is accepted and relies on PostgreSQL text framing, which already escapes the backslash,
   newline, carriage return and the delimiter. It is only valid with text framing: combined with
   `CSV`, `ADDQUOTES` or `HEADER` (which switch the framing to CSV here) the statement is not

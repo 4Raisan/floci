@@ -226,7 +226,7 @@ class CopyStatementParserTest {
         assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' FORMAT AS PARQUET"));
         assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' JSON 's3://mybucket/jsonpaths.json'"));
         assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' FIXEDWIDTH 'a:1,b:2'"));
-        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' GZIP MAXERROR 10"));
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' GZIP ESCAPE"));
         assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' TRIMBLANKS"));
     }
 
@@ -420,6 +420,42 @@ class CopyStatementParserTest {
     }
 
     @Test
+    void copyKeepsTheKeysAndTokenOfACredentialsString() {
+        CopyStatementParser.S3CopyFrom c = copyFrom("COPY t FROM 's3://b/k' CREDENTIALS "
+                + "'aws_access_key_id=ASIAEXAMPLE;aws_secret_access_key=s3cr3t/+x;token=tok/+en=='");
+
+        assertEquals("ASIAEXAMPLE", c.accessKeys().accessKeyId());
+        assertEquals("s3cr3t/+x", c.accessKeys().secretAccessKey());
+        assertEquals("tok/+en==", c.accessKeys().sessionToken());
+    }
+
+    @Test
+    void copyKeepsTheKeysOfSeparateClauses() {
+        CopyStatementParser.S3CopyFrom c = copyFrom(
+                "COPY t FROM 's3://b/k' ACCESS_KEY_ID 'AKIAEXAMPLE' SECRET_ACCESS_KEY 'secret'");
+
+        assertEquals("AKIAEXAMPLE", c.accessKeys().accessKeyId());
+        assertEquals("secret", c.accessKeys().secretAccessKey());
+        assertNull(c.accessKeys().sessionToken());
+    }
+
+    @Test
+    void copyWithoutKeysHasNoAccessKeys() {
+        assertNull(copyFrom("COPY t FROM 's3://b/k' IAM_ROLE 'arn:aws:iam::000000000000:role/r'").accessKeys());
+    }
+
+    @Test
+    void accessKeysStringFormHidesTheSecretAndToken() {
+        CopyStatementParser.S3CopyFrom c = copyFrom("COPY t FROM 's3://b/k' CREDENTIALS "
+                + "'aws_access_key_id=ASIAEXAMPLE;aws_secret_access_key=s3cr3t;token=tok'");
+
+        String text = c.toString();
+        assertTrue(text.contains("ASIAEXAMPLE"));
+        assertFalse(text.contains("s3cr3t"));
+        assertFalse(text.contains("tok'") || text.contains("token=tok"));
+    }
+
+    @Test
     void copyRejectsConflictingOrIncompleteAuthorization() {
         assertNull(CopyStatementParser.parse(
                 "COPY t FROM 's3://b/k' IAM_ROLE 'arn:aws:iam::000000000000:role/r' "
@@ -518,6 +554,54 @@ class CopyStatementParserTest {
         assertTrue(transforms.acceptAnyDate());
         assertEquals("YYYY-MM-DD[ HH:MI:SS]", transforms.dateFormat().spec());
         assertEquals("YYYY-MM-DD[ HH:MI:SS]", transforms.timeFormat().spec());
+    }
+
+    @Test
+    void copyParsesMaxError() {
+        CopyStatementParser.CopyTransforms tolerant =
+                copyFrom("COPY t FROM 's3://b/k' MAXERROR AS 10").transforms();
+
+        assertEquals(10, tolerant.maxError());
+        assertTrue(tolerant.toleratesErrors());
+        assertFalse(tolerant.fieldLevel());
+        assertEquals(100_000, copyFrom("COPY t FROM 's3://b/k' MAXERROR 100000").transforms().maxError());
+        assertTrue(copyFrom("COPY t FROM 's3://b/k' FORMAT AS JSON 'auto' MAXERROR 5").transforms()
+                .toleratesErrors());
+    }
+
+    @Test
+    void aMaxErrorOfZeroOrOneFailsAtTheFirstErrorAsWithoutTheOption() {
+        for (String count : new String[] {"0", "1"}) {
+            CopyStatementParser.CopyTransforms transforms =
+                    copyFrom("COPY t FROM 's3://b/k' MAXERROR " + count).transforms();
+
+            assertFalse(transforms.toleratesErrors(), count);
+        }
+        assertEquals(0, copyFrom("COPY t FROM 's3://b/k'").transforms().maxError());
+    }
+
+    @Test
+    void copyRejectsAMaxErrorOutOfRangeOrRepeated() {
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' MAXERROR 100001"));
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' MAXERROR 5 MAXERROR 6"));
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' MAXERROR"));
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' MAXERROR -1"));
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' MAXERROR AS"));
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' MAXERROR abc"));
+        assertNull(CopyStatementParser.parse("COPY t FROM 's3://b/k' MAXERROR 1234567890"));
+    }
+
+    @Test
+    void maxErrorReadsLeadingZerosAndFollowsAnyClauseOrder() {
+        assertEquals(7, copyFrom("COPY t FROM 's3://b/k' MAXERROR 007").transforms().maxError());
+
+        CopyStatementParser.S3CopyFrom before = copyFrom("COPY t FROM 's3://b/k' MAXERROR 5 GZIP IGNOREHEADER 1");
+        CopyStatementParser.S3CopyFrom after = copyFrom("COPY t FROM 's3://b/k' GZIP IGNOREHEADER 1 MAXERROR 5");
+
+        assertEquals(5, before.transforms().maxError());
+        assertEquals(5, after.transforms().maxError());
+        assertTrue(before.gzip() && after.gzip());
+        assertEquals(1, after.headerLines());
     }
 
     @Test

@@ -22,7 +22,7 @@ final class CopyRecordTransformer {
 
     /** What a COPY column holds, as far as the date and time formats are concerned. */
     enum ColumnKind {
-        DATE, TIMESTAMP, TEXT, OTHER
+        DATE, TIMESTAMP, TEXT, CHAR, OTHER
     }
 
     private record Field(int tokenEnd, byte[] value, boolean quoted) {
@@ -221,8 +221,13 @@ final class CopyRecordTransformer {
 
     private void writeField(Field field, int column, ByteArrayOutputStream out) {
         byte[] value = field.value();
+        boolean emptyField = !field.quoted() && value.length == 0;
+        boolean nonCharacter = columnKinds != null && column < columnKinds.size()
+                && columnKinds.get(column) != ColumnKind.TEXT
+                && columnKinds.get(column) != ColumnKind.CHAR;
         boolean nulled = (transforms.blanksAsNull() && isBlank(value))
-                || (transforms.emptyAsNull() && value.length == 0);
+                || (transforms.emptyAsNull() && value.length == 0)
+                || (emptyField && nonCharacter);
         if (nulled) {
             out.writeBytes(nullMarker);
             return;
@@ -286,8 +291,8 @@ final class CopyRecordTransformer {
     /**
      * Rewrites a DATE or TIMESTAMP field from the DATEFORMAT or TIMEFORMAT to the ISO text PostgreSQL reads.
      * Returns the field as it is when no format applies to its column, and null when ACCEPTANYDATE turns a
-     * value that does not match into NULL; without it such a value fails the COPY, as it does with the
-     * default MAXERROR of 0.
+     * value that does not match into NULL; without it such a value fails the COPY, whatever MAXERROR says,
+     * because it never reaches the backend that skips records under MAXERROR.
      */
     private byte[] convertTemporal(byte[] value, int column) {
         if (!transforms.temporal() || columnKinds == null || column >= columnKinds.size()) {
@@ -297,7 +302,7 @@ final class CopyRecordTransformer {
         CopyTemporalFormat format = switch (kind) {
             case DATE -> transforms.dateFormat();
             case TIMESTAMP -> transforms.timeFormat();
-            case TEXT, OTHER -> null;
+            case TEXT, CHAR, OTHER -> null;
         };
         if (format == null || !format.converts()) {
             return value;

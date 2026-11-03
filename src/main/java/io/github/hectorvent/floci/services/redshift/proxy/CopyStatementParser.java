@@ -20,6 +20,15 @@ public final class CopyStatementParser {
         boolean defaultIamRoleRequested();
     }
 
+    /** Access keys a COPY names, as {@code CREDENTIALS 'aws_access_key_id=...'} or {@code ACCESS_KEY_ID}. */
+    public record AccessKeys(String accessKeyId, String secretAccessKey, String sessionToken) {
+        // Keeps the secret and token out of logs and error messages that print the statement
+        @Override
+        public String toString() {
+            return "AccessKeys[accessKeyId=" + accessKeyId + "]";
+        }
+    }
+
     /** COPY options that change field content; {@link #NONE} keeps the plain byte-copy path. */
     public record CopyTransforms(
             boolean blanksAsNull,
@@ -30,14 +39,15 @@ public final class CopyStatementParser {
             CopyTemporalFormat dateFormat,
             CopyTemporalFormat timeFormat,
             boolean acceptAnyDate,
-            boolean fillRecord) {
+            boolean fillRecord,
+            int maxError) {
 
         public static final CopyTransforms NONE = new CopyTransforms(false, false, false, false, null);
 
         public CopyTransforms(boolean blanksAsNull, boolean emptyAsNull, boolean removeQuotes,
                               boolean truncateColumns, Character invalidCharReplacement) {
             this(blanksAsNull, emptyAsNull, removeQuotes, truncateColumns, invalidCharReplacement,
-                    null, null, false, false);
+                    null, null, false, false, 0);
         }
 
         public CopyTransforms(boolean blanksAsNull, boolean emptyAsNull, boolean removeQuotes,
@@ -45,7 +55,23 @@ public final class CopyStatementParser {
                               CopyTemporalFormat dateFormat, CopyTemporalFormat timeFormat,
                               boolean acceptAnyDate) {
             this(blanksAsNull, emptyAsNull, removeQuotes, truncateColumns, invalidCharReplacement,
-                    dateFormat, timeFormat, acceptAnyDate, false);
+                    dateFormat, timeFormat, acceptAnyDate, false, 0);
+        }
+
+        public CopyTransforms(boolean blanksAsNull, boolean emptyAsNull, boolean removeQuotes,
+                              boolean truncateColumns, Character invalidCharReplacement,
+                              CopyTemporalFormat dateFormat, CopyTemporalFormat timeFormat,
+                              boolean acceptAnyDate, boolean fillRecord) {
+            this(blanksAsNull, emptyAsNull, removeQuotes, truncateColumns, invalidCharReplacement,
+                    dateFormat, timeFormat, acceptAnyDate, fillRecord, 0);
+        }
+
+        /**
+         * Whether the load goes on past a record the backend cannot convert. A {@code MAXERROR} of 0 or 1 fails
+         * the COPY at the first error, which is how it runs without the option.
+         */
+        public boolean toleratesErrors() {
+            return maxError > 1;
         }
 
         /** Whether the options depend on the type of each column, which only the catalog can tell. */
@@ -82,12 +108,34 @@ public final class CopyStatementParser {
             boolean jsonAutoIgnoreCase,
             boolean manifest,
             CopyTransforms transforms,
-            boolean defaultIamRoleRequested) implements S3Statement {
+            boolean defaultIamRoleRequested,
+            AccessKeys accessKeys) implements S3Statement {
 
         public S3CopyFrom {
             if (transforms == null) {
                 transforms = CopyTransforms.NONE;
             }
+        }
+
+        public S3CopyFrom(
+                String targetTable,
+                List<String> columns,
+                String bucket,
+                String keyOrPrefix,
+                String delimiter,
+                int headerLines,
+                boolean gzip,
+                boolean csv,
+                String nullAs,
+                String iamRoleArn,
+                boolean jsonAuto,
+                boolean jsonAutoIgnoreCase,
+                boolean manifest,
+                CopyTransforms transforms,
+                boolean defaultIamRoleRequested) {
+            this(targetTable, columns, bucket, keyOrPrefix, delimiter, headerLines, gzip, csv,
+                    nullAs, iamRoleArn, jsonAuto, jsonAutoIgnoreCase, manifest, transforms,
+                    defaultIamRoleRequested, null);
         }
 
         public S3CopyFrom(
@@ -301,6 +349,8 @@ public final class CopyStatementParser {
     private static final Pattern TIMEFORMAT_PATTERN = Pattern.compile("(?i)\\bTIMEFORMAT\\s+(?:AS\\s+)?'([^']*)'");
     private static final Pattern ACCEPTANYDATE_PATTERN = Pattern.compile("(?i)\\bACCEPTANYDATE\\b");
     private static final Pattern FILLRECORD_PATTERN = Pattern.compile("(?i)\\bFILLRECORD\\b");
+    private static final Pattern MAXERROR_PATTERN = Pattern.compile("(?i)\\bMAXERROR\\s+(?:AS\\s+)?(\\d{1,9})\\b");
+    private static final int MAX_MAXERROR = 100_000;
     private static final Pattern CREDENTIALS_PATTERN = Pattern.compile(
             "(?i)\\bCREDENTIALS\\s+(?:AS\\s+)?(?:'((?:[^']|'')*)'|\"([^\"]*)\")");
     private static final Pattern ACCESS_KEY_ID_PATTERN = Pattern.compile(
@@ -314,9 +364,11 @@ public final class CopyStatementParser {
     private static final Pattern CREDENTIALS_ROLE = Pattern.compile(
             "(?i)(?:^|;)\\s*aws_iam_role\\s*=\\s*([^;\\s]+)");
     private static final Pattern CREDENTIALS_KEY_ID = Pattern.compile(
-            "(?i)(?:^|;)\\s*aws_access_key_id\\s*=\\s*[^;\\s]+");
+            "(?i)(?:^|;)\\s*aws_access_key_id\\s*=\\s*([^;\\s]+)");
     private static final Pattern CREDENTIALS_SECRET = Pattern.compile(
-            "(?i)(?:^|;)\\s*aws_secret_access_key\\s*=\\s*[^;\\s]+");
+            "(?i)(?:^|;)\\s*aws_secret_access_key\\s*=\\s*([^;\\s]+)");
+    private static final Pattern CREDENTIALS_TOKEN = Pattern.compile(
+            "(?i)(?:^|;)\\s*token\\s*=\\s*([^;\\s]+)");
     private static final Pattern IGNOREHEADER_PATTERN = Pattern.compile(
             "(?i)\\bIGNOREHEADER\\s+(?:AS\\s+)?(\\d+)\\b");
     private static final Pattern HEADER_PATTERN = Pattern.compile("(?i)\\bHEADER\\b");
@@ -331,7 +383,7 @@ public final class CopyStatementParser {
      * silently loading the data with the wrong framing.
      */
     private static final Pattern UNSUPPORTED_CLAUSE = Pattern.compile(
-            "(?i)\\b(FIXEDWIDTH|PARQUET|AVRO|ORC|SHAPEFILE|BZIP2|LZOP|ZSTD|MAXERROR"
+            "(?i)\\b(FIXEDWIDTH|PARQUET|AVRO|ORC|SHAPEFILE|BZIP2|LZOP|ZSTD"
                     + "|ENCRYPTED|ENCODING"
                     + "|MASTER_SYMMETRIC_KEY|KMS_KEY_ID"
                     + "|TRIMBLANKS"
@@ -656,6 +708,8 @@ public final class CopyStatementParser {
         CopyTemporalFormat timeFormat = null;
         boolean acceptAnyDate = false;
         boolean fillRecord = false;
+        int maxError = 0;
+        boolean seenMaxError = false;
 
         boolean seenDateFormat = false;
         boolean seenTimeFormat = false;
@@ -689,6 +743,7 @@ public final class CopyStatementParser {
         Matcher timeFormatMatcher = TIMEFORMAT_PATTERN.matcher(options);
         Matcher acceptAnyDateMatcher = ACCEPTANYDATE_PATTERN.matcher(options);
         Matcher fillRecordMatcher = FILLRECORD_PATTERN.matcher(options);
+        Matcher maxErrorMatcher = MAXERROR_PATTERN.matcher(options);
         AuthClauses auth = new AuthClauses(options, defaultIamRoleArn);
 
         int next;
@@ -822,6 +877,14 @@ public final class CopyStatementParser {
                 }
                 fillRecord = true;
                 offset = fillRecordMatcher.end();
+            } else if (matchClause(maxErrorMatcher, offset, len)) {
+                int parsed = seenMaxError ? -1 : Integer.parseInt(maxErrorMatcher.group(1));
+                if (parsed < 0 || parsed > MAX_MAXERROR) {
+                    return null;
+                }
+                seenMaxError = true;
+                maxError = parsed;
+                offset = maxErrorMatcher.end();
             } else if ((next = auth.consume(offset, len)) != AuthClauses.NO_MATCH) {
                 if (next == AuthClauses.REJECT) {
                     return null;
@@ -850,7 +913,7 @@ public final class CopyStatementParser {
         }
         CopyTransforms transforms = new CopyTransforms(
                 blanksAsNull, emptyAsNull, removeQuotes, truncateColumns, invalidChar,
-                dateFormat, timeFormat, acceptAnyDate, fillRecord);
+                dateFormat, timeFormat, acceptAnyDate, fillRecord, maxError);
         if (transforms.any() && jsonAuto) {
             return null;
         }
@@ -865,13 +928,14 @@ public final class CopyStatementParser {
         }
 
         return new S3CopyFrom(table, columns, bucket, keyOrPrefix, delimiter, headerLines, gzip, csv,
-                nullAs, iamRoleArn, jsonAuto, jsonAutoIgnoreCase, manifest, transforms, auth.defaultIamRoleRequested);
+                nullAs, iamRoleArn, jsonAuto, jsonAutoIgnoreCase, manifest, transforms, auth.defaultIamRoleRequested,
+                auth.accessKeys());
     }
 
     /**
-     * Collects the S3 authorization and region clauses shared by COPY and UNLOAD. Key material is
-     * checked for shape only and never stored: the simulator reads S3 as the cluster role or as an
-     * unsigned request.
+     * Collects the S3 authorization and region clauses shared by COPY and UNLOAD. COPY keeps the
+     * keys it names so the simulator reads S3 as that principal; UNLOAD ignores them and writes as
+     * the cluster role or as an unsigned request.
      */
     private static final class AuthClauses {
         static final int NO_MATCH = -1;
@@ -896,6 +960,9 @@ public final class CopyStatementParser {
         private boolean seenRegion;
         private boolean credentialsHaveKeys;
         private boolean credentialsMalformed;
+        private String clauseAccessKeyId;
+        private String clauseSecretAccessKey;
+        private String clauseSessionToken;
 
         AuthClauses(String options, String defaultIamRoleArn) {
             this.defaultIamRoleArn = defaultIamRoleArn;
@@ -930,21 +997,24 @@ public final class CopyStatementParser {
                     return REJECT;
                 }
                 seenAccessKeyId = true;
-                return isBlank(extractNullValue(accessKeyId)) ? REJECT : accessKeyId.end();
+                clauseAccessKeyId = extractNullValue(accessKeyId);
+                return isBlank(clauseAccessKeyId) ? REJECT : accessKeyId.end();
             }
             if (matchClause(secretAccessKey, offset, end)) {
                 if (seenSecretAccessKey) {
                     return REJECT;
                 }
                 seenSecretAccessKey = true;
-                return isBlank(extractNullValue(secretAccessKey)) ? REJECT : secretAccessKey.end();
+                clauseSecretAccessKey = extractNullValue(secretAccessKey);
+                return isBlank(clauseSecretAccessKey) ? REJECT : secretAccessKey.end();
             }
             if (matchClause(sessionToken, offset, end)) {
                 if (seenSessionToken) {
                     return REJECT;
                 }
                 seenSessionToken = true;
-                return isBlank(extractNullValue(sessionToken)) ? REJECT : sessionToken.end();
+                clauseSessionToken = extractNullValue(sessionToken);
+                return isBlank(clauseSessionToken) ? REJECT : sessionToken.end();
             }
             if (matchClause(region, offset, end)) {
                 if (seenRegion) {
@@ -961,10 +1031,25 @@ public final class CopyStatementParser {
             if (role.find()) {
                 credentialsRoleArn = role.group(1);
             }
-            boolean hasId = CREDENTIALS_KEY_ID.matcher(value).find();
-            boolean hasSecret = CREDENTIALS_SECRET.matcher(value).find();
+            Matcher id = CREDENTIALS_KEY_ID.matcher(value);
+            Matcher secret = CREDENTIALS_SECRET.matcher(value);
+            Matcher token = CREDENTIALS_TOKEN.matcher(value);
+            boolean hasId = id.find();
+            boolean hasSecret = secret.find();
             credentialsHaveKeys = hasId && hasSecret;
             credentialsMalformed = hasId != hasSecret;
+            if (credentialsHaveKeys) {
+                clauseAccessKeyId = id.group(1);
+                clauseSecretAccessKey = secret.group(1);
+                clauseSessionToken = token.find() ? token.group(1) : null;
+            }
+        }
+
+        AccessKeys accessKeys() {
+            if (clauseAccessKeyId == null || clauseSecretAccessKey == null) {
+                return null;
+            }
+            return new AccessKeys(clauseAccessKeyId, clauseSecretAccessKey, clauseSessionToken);
         }
 
         boolean consistent() {

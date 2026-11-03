@@ -325,10 +325,17 @@ whatever it breaks. Other services do quote a list, Lambda's `Value '[x86_64, ar
 A required member the request leaves out reads the same way, `Value at 'status' failed to satisfy
 constraint: Member must not be null`, with no `null` standing where the value would. That was the
 one message carrying a word in the value's place until 2026-10-31, when a capture from a real
-account answered an omitted `Status` and showed the word gone with every other value this service
-leaves out. The form is chosen in one place, so the capture moved it in one edit rather than across
-the service, and the services that do quote their values, STS among them, still write `Value null at
-'<member>'`.
+account answered an omitted `Status` without it.
+
+What that capture settles is one member. `Status`, on the four credential operations that share it,
+is the only omitted member any recording covers. Every other one this service answers, the members
+checked by hand and each required member the model walk reads, carries that form on Floci's reading
+rather than on a capture: the word `null` was never a value AWS sent, an absent member having none
+to carry, so one rendering for the whole service is the likelier reading of a message that names the
+member and nothing else. The form is chosen in one place, which is what let the capture move it in
+one edit rather than across the service, and a capture of some other omitted member would confirm it
+or split `Status` from the rest in one edit too. The services that do quote their values, STS among
+them, still write `Value null at '<member>'`.
 
 ### Two answers the model carries since a capture settled them
 
@@ -1713,6 +1720,9 @@ its tag operations name it by its ARN. A Redshift Data API request is checked on
 names by name or by ARN, which ends in the id Redshift Serverless gives it, `workgroup/<id>`, and on
 `workgroup/*` when there is no such workgroup; one naming its session, by `SessionId`, on the
 cluster or workgroup the caller's session runs on, and on `*` when the caller has no such session.
+AWS does not document which resource a request naming a session is authorized on, so the session's
+target is Floci's inference: a session runs on the cluster or workgroup named by the statement that
+opened it.
 EventBridge V2's requests are read beside EventBridge's, each checked on the resources the API serving
 it names (an EventBridge V2 `PutEvents` on the bus its `EventBusArn` names). A
 state machine's version or alias
@@ -2521,6 +2531,16 @@ floci populates:
   body). AWS does not document how it counts the remaining retention days; floci counts a part
   day as a whole one, so a Deny on retention longer than N days refuses a date a few hours past
   N days.
+- `s3:x-amz-server-side-encryption` and `s3:x-amz-server-side-encryption-aws-kms-key-id`: the
+  encryption a request asks for, for `s3:PutObject`, from the `x-amz-server-side-encryption` and
+  `x-amz-server-side-encryption-aws-kms-key-id` headers of a `PutObject`, `CopyObject` or
+  `CreateMultipartUpload`. The value is the header's text: an alias or a bare key id is not resolved
+  to an ARN, and a bucket's default encryption fills neither key. A part or a
+  `CompleteMultipartUpload` sends neither header and carries what its upload recorded when it was
+  created. An upload holds only what its creation asked for, so one created with no encryption
+  carries neither key, where S3 gives it the bucket's default. A part naming an upload floci does
+  not hold answers `NoSuchUpload`, as on AWS, whatever the policy says, unless it copies from a
+  source.
 - An object creation offers its tag and Object Lock keys to each action it is checked as: its
   `s3:PutObject` and the extra actions its settings need.
 - `iam:PassedToService`: the service principal a request passes a role to, for the
