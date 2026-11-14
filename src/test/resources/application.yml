@@ -9,11 +9,6 @@ quarkus:
       max-body-size: ${floci.protocols.max-request-size}M
       max-header-size: 256K
       max-initial-line-length: 262144
-  # Groovy (a REST Assured dependency) starts DFA-cache-cleaner threads that never stop.
-  # Loaded parent-first they live in the shared system classloader, so they cannot pin a
-  # per-profile application classloader across the many app restarts of a test run.
-  class-loading:
-    parent-first-artifacts: org.apache.groovy:groovy
 
 floci:
   base-url: "http://localhost:4566"
@@ -34,6 +29,8 @@ floci:
     wal:
       compaction-interval-ms: 60000
     services:
+      rekognition:
+        flush-interval-ms: 60000
       ssm:
         flush-interval-ms: 60000
       dynamodb:
@@ -43,6 +40,7 @@ floci:
       lambda:
         flush-interval-ms: 60000
       cloudwatchlogs:
+        # Includes saved Logs Insights query definitions.
         flush-interval-ms: 60000
       cloudwatchmetrics:
         flush-interval-ms: 60000
@@ -148,6 +146,7 @@ floci:
       enforce-auth: false
       default-presign-expiry-seconds: 3600
       global-bucket-namespace: false
+      restore-completion-delay-seconds: 0
       lifecycle-sweep-enabled: false   # tests run the sweep themselves, so no bucket's rules apply behind another test's back
       lifecycle-sweep-interval-seconds: 60
     dynamodb:
@@ -160,6 +159,7 @@ floci:
       enabled: true
     lambda:
       enabled: true
+      reconcile-containers-on-startup: true
       container-drain-timeout-seconds: 15
       docker-flags: ""
       honour-architectures: false
@@ -405,6 +405,8 @@ floci:
     elbv2:
       enabled: true
       mock: true
+      backend-keep-alive: true
+      backend-keep-alive-timeout-seconds: 60
     codebuild:
       enabled: true
       # docker-network: floci-network
@@ -436,6 +438,7 @@ floci:
       enabled: true
     applicationautoscaling:
       enabled: true
+      scheduled-action-interval-seconds: ${FLOCI_SERVICES_APPLICATIONAUTOSCALING_SCHEDULED_ACTION_INTERVAL_SECONDS:1}
     elasticbeanstalk:
       enabled: true
     transfer:
@@ -510,6 +513,8 @@ floci:
       enabled: true
     efs:
       enabled: true
+    ec2instanceconnect:
+      enabled: true
     organizations:
       enabled: true
     rum:
@@ -559,6 +564,10 @@ floci:
       enabled: true
     dlm:
       enabled: true
+    signer:
+      enabled: true
+    xray:
+      enabled: true
     cognitoidentity:
       enabled: true
     globalaccelerator:
@@ -596,6 +605,9 @@ floci:
       enabled: true
     codeartifact:
       enabled: true
+    quicksight:
+      enabled: true
+      embed-base-url: ${floci.base-url}
     marketplace:
       enabled: true
     dms:

@@ -11,7 +11,7 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 |---|---|
 | `CreateCluster` | Create a new EKS cluster |
 | `DescribeCluster` | Describe a cluster by name |
-| `ListClusters` | List all cluster names |
+| `ListClusters` | List cluster names with pagination (`maxResults` 1-100 and `nextToken`) |
 | `DeleteCluster` | Delete a cluster |
 | `CreateAccessEntry` | Create STANDARD or EC2_LINUX access-entry metadata |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
@@ -111,8 +111,12 @@ A matching pod is patched exactly the way real EKS patches it. Every init contai
 | `AWS_CONTAINER_CREDENTIALS_FULL_URI` | `http://169.254.170.23/v1/credentials` |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | `/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token` |
 | Volume mount | `/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, read-only, from volume `eks-pod-identity-token` |
+| `AWS_ENDPOINT_URL` | Floci's endpoint, as a cluster container reaches it (Floci only) |
+| `AWS_ENDPOINT_URL_STS` | The same endpoint (Floci only) |
 
-The volume is a projected service account token with audience `pods.eks.amazonaws.com`, `expirationSeconds: 86400` and path `eks-pod-identity-token`. A name the pod already carries (a volume, a mount, or either environment variable) is left as the workload set it.
+The volume is a projected service account token with audience `pods.eks.amazonaws.com`, `expirationSeconds: 86400` and path `eks-pod-identity-token`. A name the pod already carries (a volume, a mount, or any of the environment variables) is left as the workload set it.
+
+Real EKS sets neither endpoint variable. Floci adds them so the credentials it hands out are used against Floci, as every container Floci launches already is, instead of being sent to AWS, which rejects them. `AWS_ENDPOINT_URL_STS` is set beside the global variable because the AWS SDK for Go v2 builds the STS client of its web identity provider before it reads `AWS_ENDPOINT_URL`. A pod cannot resolve the Docker host name (`host.docker.internal` lives only in the cluster container's `/etc/hosts`) or Floci's hostname (on a custom Docker network k3s replaces the loopback resolver `127.0.0.11` with a public one, so `localhost.floci.io` answers `127.0.0.1`), so the endpoint is the Docker host address and is injected only when that is an IP address, as it is when Floci runs in a container. A container that sets `AWS_ENDPOINT_URL` itself gets no `AWS_ENDPOINT_URL_STS`, which would override its choice for STS. A container with any `envFrom` source gets no endpoint variable, because its values are unknown at admission and an injected `env` entry would take precedence over them; it still gets the credentials variables.
 
 ### Credential endpoint
 
@@ -400,7 +404,7 @@ Cluster metadata is stored in-process. No Docker containers are started. The clu
 
 Floci starts a **k3s** (`rancher/k3s`) container for each cluster. The k3s API server is exposed on a host port from the configured range (`6500-6599`). Once `/readyz` responds, the cluster transitions to `ACTIVE` and the CA certificate is extracted from the kubeconfig.
 
-By default `describe-cluster` returns a **host-reachable** endpoint (`https://localhost:<hostPort>`); the k3s server certificate includes a `localhost` SAN, so it verifies against the CA in `cluster.certificateAuthority.data`. Set `endpoint-mode: network` to return the container DNS name (`https://floci-eks-<name>:6443`) instead: reachable from other containers on the Docker network (the pre-#1118 behaviour). Set `endpoint-host` to advertise a hostname other than `localhost` in `host` mode, for example when `kubectl` runs on another machine; Floci adds it to the k3s certificate too. It takes a DNS name (letters, digits, hyphens and dots), a dotted IPv4 address, or an IPv6 address with or without brackets, without scheme, port or path; anything else stops Floci at startup with an error naming the setting, whenever EKS runs real clusters (even in `network` mode). The certificate is fixed when the k3s container is created, so when `endpoint-host` changes, Floci recreates a surviving container on its next restart (keeping its data volume and port). If that replacement fails, the old container is kept and keeps advertising the host its certificate carries. `network` mode ignores it when Floci runs in a container, and metadata-only clusters (mock mode, or no Docker daemon) do not use it. In `network` mode the endpoint falls back to the host-reachable form when Floci runs natively, since there is no container DNS name a host client could use.
+By default `describe-cluster` returns a **host-reachable** endpoint (`https://localhost:<hostPort>`); the k3s server certificate includes a `localhost` SAN, so it verifies against the CA in `cluster.certificateAuthority.data`. Set `endpoint-mode: network` to return the container DNS name (`https://floci-aws-eks-<name>:6443`) instead: reachable from other containers on the Docker network (the pre-#1118 behaviour). Set `endpoint-host` to advertise a hostname other than `localhost` in `host` mode, for example when `kubectl` runs on another machine; Floci adds it to the k3s certificate too. It takes a DNS name (letters, digits, hyphens and dots), a dotted IPv4 address, or an IPv6 address with or without brackets, without scheme, port or path; anything else stops Floci at startup with an error naming the setting, whenever EKS runs real clusters (even in `network` mode). The certificate is fixed when the k3s container is created, so when `endpoint-host` changes, Floci recreates a surviving container on its next restart (keeping its data volume and port). If that replacement fails, the old container is kept and keeps advertising the host its certificate carries. `network` mode ignores it when Floci runs in a container, and metadata-only clusters (mock mode, or no Docker daemon) do not use it. In `network` mode the endpoint falls back to the host-reachable form when Floci runs natively, since there is no container DNS name a host client could use.
 
 #### Connecting with `kubectl` (native AWS workflow)
 
@@ -450,8 +454,8 @@ With a persistent [storage mode](../configuration/storage.md) (the default), clu
 - A surviving container (for example after a Docker Desktop / daemon reboot) is adopted and
   started in place, keeping its published API server port and data volume: deployments come
   back as they were.
-- A missing container is recreated. Its named k3s data volume (`floci-eks-<name>`; for a
-  [non-default account](../configuration/multi-account.md), `floci-eks-<account>.<name>`) is
+- A missing container is recreated. Its named k3s data volume (`floci-aws-eks-<name>`; for a
+  [non-default account](../configuration/multi-account.md), `floci-aws-eks-<account>.<name>`) is
   reused if it survived; volumes follow the global prune policy
   (`FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE`, default `false`), so they are retained when the
   container is stopped or the cluster deleted, except in `memory` storage mode.
@@ -459,6 +463,12 @@ With a persistent [storage mode](../configuration/storage.md) (the default), clu
   `floci-eks-<name>` container and volume: restoration adopts the surviving container when its
   `io.floci.account` label matches the owning account, so pre-upgrade workloads are not
   orphaned.
+- Cluster names are unique only within a Region of an account, so a cluster outside the default
+  Region, or one sharing its name with a cluster in another Region, puts its Region first in its
+  container and volume names: `floci-aws-eks-<region>.<name>`, or
+  `floci-aws-eks-<region>.<account>.<name>` for a non-default account. A cluster in the default
+  Region keeps the unqualified name, and so does any cluster created before Region qualification:
+  its record moves to a Region-scoped key on startup, but its container and volume keep their names.
 
 A restored cluster reports `CREATING` until its API server answers again, then returns to
 `ACTIVE` with a freshly extracted certificate authority. If the container cannot be brought
@@ -485,6 +495,15 @@ capacity. Memory is capped at 80% of the Docker host's memory so other processes
 run. `floci.services.eks.max-memory-mib` and `floci.services.eks.max-vcpus` provide optional lower
 ceilings; zero means no extra ceiling. Their environment variables are `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB`
 and `FLOCI_SERVICES_EKS_MAX_VCPUS`.
+
+Those ceilings can only lower the node. To give a workload more room locally than its node group
+asks for on AWS, set `floci.services.eks.node-instance-type` (`FLOCI_SERVICES_EKS_NODE_INSTANCE_TYPE`)
+to a catalog type such as `t2.2xlarge`. The node container's memory and CPU and its kubelet
+reservations are then sized from that type (k3s `maxPods` does not change), while
+`DescribeNodegroup`, the node's `node.kubernetes.io/instance-type` label and the synthesized EC2
+instance keep the requested type, so the same Terraform plans no changes. The two ceilings still apply on top. A type absent from the catalog is ignored with a
+warning. Changing the setting recreates a surviving node on the next start, keeping its data volume.
+This setting is Floci-only; it has no AWS equivalent.
 
 The same calculation sets kubelet's `kube-reserved`, `system-reserved`, and `eviction-hard` flags.
 The EKS AMI reserves `255 + 11 * maxPods` MiB and a tiered CPU fraction for kubelet and the
@@ -548,13 +567,13 @@ The node name, the instance ID in `spec.providerID`, and the synthetic EC2 insta
 
 Stock Amazon EKS clusters historically define a default `gp2` StorageClass pointing to the legacy in-tree `kubernetes.io/aws-ebs` plugin, but run no active storage provisioner without the EBS CSI driver. Unqualified PersistentVolumeClaims remain `Pending` on EKS because nothing can provision them. Floci matches this behavior by disabling k3s's bundled `local-path` provisioner and StorageClass, preventing unqualified claims from silently binding to the node filesystem.
 
-Callers requiring dynamic volume provisioning can install a driver (such as the `aws-ebs-csi-driver` addon) and define their desired StorageClass.
+Callers requiring dynamic volume provisioning can install a driver (such as the `aws-ebs-csi-driver` addon) and define their desired StorageClass. As on an EKS node, the cluster node's mounts are shared, so a driver's node plugin can mount volumes under `/var/lib/kubelet` with `Bidirectional` propagation.
 
 For local testing workflows that rely on automatic volume binding without a CSI driver, set `floci.services.eks.default-storage-class: true` (or `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS=true`) to retain k3s's bundled `local-path` provisioner and default StorageClass.
 
 ## Joining EC2 instances as cluster nodes
 
-Floci allows EC2 instances to join an EKS cluster as Kubernetes worker nodes. Launching an instance via `RunInstances` with user data targeting a cluster automatically registers a matching Kubernetes node.
+Floci allows EC2 instances to join an EKS cluster as Kubernetes worker nodes. Launching an instance via `RunInstances` with user data targeting a cluster records its join and, by default, registers a matching Kubernetes node.
 
 ### Join mechanisms
 
@@ -566,15 +585,27 @@ On AWS, EC2 does not fail instance launches if a target cluster is missing. Floc
 
 ### Node metadata and AWS outcome alignment
 
-When an instance joins a cluster, Floci registers a Kubernetes `Node` matching AWS conventions:
+For simulated workers, Floci registers a Kubernetes `Node` matching AWS conventions:
 - **Node name**: Uses the instance's private DNS name (`privateDnsName`), matching AWS EKS conventions.
 - **Provider ID**: Set to `spec.providerID: aws:///<availability-zone>/<instance-id>`.
 - **Labels & Status**: Includes topology and instance-type labels, ready status, internal IP, and catalog capacity.
 - **EC2 persistence**: The instance remains an authentic EC2 instance reported by `DescribeInstances`.
 
+### Guest kubelet registration
+
+For custom images that run kubelet, set `kubeletRegistersNode: true` in the
+[EC2 image catalog](ec2.md#external-image-catalog). Floci then leaves Node creation,
+capacity, allocatable resources and readiness to the guest kubelet, on both initial
+join and replay. Join tracking, persisted instance IDs and registration listeners
+still run. The image and bootstrap configuration remain responsible for starting
+and authenticating kubelet and providing worker networking.
+
+The capability is opt-in per image, including its aliases. A systemd runtime alone
+does not enable it; omitted or false values keep the simulated behavior.
+
 ### Differences and limitations
 
-- Floci registers the `Node` directly in the control plane with matching provider ID, labels, and ready status.
+- For simulated workers, Floci registers the `Node` directly in the control plane with matching provider ID, labels, and ready status.
 - Node cleanup on termination is handled in part two; an instance can belong to at most one cluster at a time.
 
 ## Configuration
@@ -585,6 +616,7 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_MOCK` | `false` | Metadata-only mode (no Docker) |
 | `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB` | `0` | Optional k3s container memory ceiling in MiB |
 | `FLOCI_SERVICES_EKS_MAX_VCPUS` | `0` | Optional k3s container vCPU ceiling |
+| `FLOCI_SERVICES_EKS_NODE_INSTANCE_TYPE` | *(unset)* | Catalog instance type the k3s node container is sized from; the API keeps the node group's type |
 | `FLOCI_SERVICES_EKS_DEFAULT_IMAGE` | `rancher/k3s:latest` | k3s Docker image fallback |
 | `FLOCI_SERVICES_EKS_IMAGE_TEMPLATE` | *(unset)* | Format string for custom k3s images (e.g. `myregistry.io/k3s:v%s`), taking cluster version |
 | `FLOCI_SERVICES_EKS_API_SERVER_BASE_PORT` | `6500` | First port in the k3s API server range |
@@ -693,11 +725,15 @@ Requirements and limits:
   when Floci's container publishes `4566` on another one (see [ECR](ecr.md#docker-compose-port-mapping)).
 - Repository URIs using a non-default `registryId` (account) are not covered.
 - The mirror set is snapshotted when the cluster is created. Clusters created before this
-  feature can be fixed manually because the k3s container filesystem survives a restart:
+  feature can be fixed manually because the k3s container filesystem survives a restart. A surviving
+  container keeps the name it was created with, so those clusters are still `floci-eks-<cluster>`
+  while newer ones are `floci-aws-eks-<cluster>`, and a non-default account adds `<account>.` before
+  the cluster name. Look the name up first:
 
   ```bash
-  docker cp registries.yaml floci-eks-<cluster>:/etc/rancher/k3s/registries.yaml
-  docker restart floci-eks-<cluster>
+  docker ps --filter name=<cluster> --format '{{.Names}}'
+  docker cp registries.yaml <container>:/etc/rancher/k3s/registries.yaml
+  docker restart <container>
   ```
 
 ### DNS resolution and Route 53 private hosted zones
@@ -755,7 +791,7 @@ services:
 ```
 
 ## Instance Metadata Service (IMDS)
-The cluster container is registered as a synthesized EC2 instance node (image `ami-eks-k3s`) regardless of whether IMDS is enabled, making it visible to the EC2 service (`DescribeInstances`, `DescribeInstanceStatus`, volume attachments, tagging). Its instance type is the same type used for the container limits.
+The cluster container is registered as a synthesized EC2 instance node (image `ami-eks-k3s`) regardless of whether IMDS is enabled, making it visible to the EC2 service (`DescribeInstances`, `DescribeInstanceStatus`, volume attachments, tagging). Its instance type is the node group's type, which also sizes the container unless `floci.services.eks.node-instance-type` is set.
 
 When IMDS is enabled (`FLOCI_SERVICES_EKS_IMDS=true`), each k3s cluster container exposes the AWS Instance Metadata Service on the link-local address `169.254.169.254:80`. Inside the container, Floci adds `169.254.169.254/32` to the loopback interface (`lo`) and runs a lightweight `socat` TCP relay forwarding metadata requests to Floci's IMDS server.
 
@@ -878,6 +914,8 @@ curl -sX POST http://localhost:4566/_floci/eks/clusters/my-cluster/oidc-token \
 
 `audience` (default `sts.amazonaws.com`) and `expirySeconds` (default 24h, max 7d) are optional. This is Floci plumbing under `_floci/…`, not an AWS API.
 
+Cluster names are unique only within a Region of an account. When clusters with the same name exist in more than one Region, add `?region=<region>` to choose one, for example `…/clusters/my-cluster/oidc-token?region=eu-west-1`. Without it, the request's Region is used, and then the account's only cluster of that name. The discovery and key routes below take the same parameter.
+
 ### Trust policy
 
 Note that the OIDC provider ARN and the condition keys use the issuer with the scheme stripped `oidc.eks.<region>.amazonaws.com/id/<id>`, which is how the AWS console, `eksctl`, and Terraform all render it.
@@ -925,6 +963,8 @@ Served for fidelity and debugging, nothing in the IRSA flow dereferences them:
 | `GET /_floci/eks/clusters/<name>/oidc/keys` | JWKS containing the cluster's public key |
 
 These live under `_floci/…` rather than at the AWS-shaped issuer path, which Floci's embedded DNS does not resolve and which would collide with S3's path-style routing.
+
+Both take an optional `?region=<region>` query parameter. Cluster names are unique only within a Region of an account, so without it the request's Region is used, and then the account's only cluster of that name. The discovery document's `jwks_uri` always names the cluster's Region.
 
 ## ARN Format
 

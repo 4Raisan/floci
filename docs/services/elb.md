@@ -47,6 +47,22 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
+Listener responses carry the listener's default certificate in `Certificates`, and omit the
+member when the listener has none. The certificate list `AddListenerCertificates` builds is
+read through `DescribeListenerCertificates` rather than through a listener response, as the
+reference describes.
+
+Creating an HTTPS or TLS listener without `SslPolicy` selects `ELBSecurityPolicy-2016-08`,
+matching AWS's default for API, CLI and CloudFormation creation. An explicit policy
+is preserved, and omitting the policy on subsequent modifications retains its current
+value. These policies remain present in create, describe and modify responses;
+listeners with no policy, such as HTTP listeners, omit `SslPolicy`.
+
+Changing HTTPS to HTTP or TLS to TCP removes the SSL policy and certificate configuration.
+Changing HTTP to HTTPS or TCP to TLS requires an explicit SSL policy and default certificate;
+missing either rejects the modification without changing the listener. Changing other
+properties without changing protocol retains the existing security settings.
+
 Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on both create and modify requests. Their portless control-plane configuration does not provide GENEVE packet forwarding.
 
 | Action | Description |
@@ -88,8 +104,35 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 
 ## Behavior Notes
 
+- `DescribeLoadBalancers`, `DescribeTargetGroups`, `DescribeListeners`, `DescribeRules`,
+  `DescribeAccountLimits` and `DescribeListenerCertificates` return their complete matching
+  results without a `NextMarker`. These handlers do not yet split results using `PageSize`
+  or resume from `Marker`.
+- HTTP and HTTPS target groups use their configured protocol for both application requests
+  and WebSocket upgrades. An HTTPS target requires a TLS handshake; a failed handshake
+  never falls back to plaintext. Backend certificates may be self-signed or expired, as on
+  AWS ALB. This trust setting applies only to the target clients and health checks.
+- Backend connection and TLS handshake errors return 502 for HTTP requests and WebSocket
+  upgrades. Connection and handshake timeouts use ten-second deadlines and return 504.
+- HTTP and HTTPS health checks use their own configured protocol and port, independently
+  of the target's application protocol. HTTPS health checks require a TLS handshake,
+  preserve the configured success-code matcher, and do not follow redirects.
+- One health-check deadline covers connection, TLS handshake and response headers.
+  Partial bytes do not renew it. Expiry closes the probe and counts toward `Target.Timeout`.
+- Health probes connect directly without JVM proxy settings. A timed-out lookup keeps
+  its target and shared worker slot until the underlying work actually exits. This bounds
+  background work even when name resolution ignores interruption.
+- Backend TLS uses the runtime's supported protocols and ciphers. Floci does not reproduce
+  AWS ALB's backend security-policy selection from the frontend listener policy.
+- ALB listeners share the emulator's network address. Stored subnet and security-group
+  associations do not create a load-balancer VPC network boundary or enforce frontend
+  ingress and backend egress rules. These listeners cannot yet reproduce NAT allowlisting failures.
 - TCP listeners relay bytes bidirectionally without parsing HTTP or terminating TLS. TLS passthrough requires a TCP listener, with certificates configured at the target, not at the listener. Targets are selected per connection using round-robin among healthy targets, falling back to registered targets when none are healthy. The default TCP idle timeout is 350 seconds, configurable via the `tcp.idle_timeout.seconds` listener attribute (60 to 6000 seconds).
 - TCP listeners require a dedicated local port. Floci still shares its address across load balancers, so a second listener on an in-use TCP port registers successfully and logs a warning, but serves no traffic until the listener holding the port is deleted or moved, and ports reserved by Floci remain unavailable. Address isolation and TLS-terminating NLB listeners are not provided by the TCP proxy.
+- An asynchronous socket-bind failure retains the admitted listeners and retries while they
+  remain configured. Retry delays grow from 100 milliseconds to five seconds; a successful
+  bind resets the delay. Deleting the last listener or stopping Floci cancels its retry.
+  An external process holding the port must still release it before Floci can serve traffic.
 - HTTPS listeners terminate TLS using the configured ACM or IAM server certificates, with SNI certificate selection. When several load balancers share one local HTTPS port, clients must send SNI to identify the certificate they need; a connection without SNI cannot identify a particular load balancer before the TLS handshake.
 - ACM certificates must be issued before attaching them. Reimporting an attached ACM certificate refreshes subsequent full TLS handshakes; existing connections keep their negotiated certificate. Reload does not invalidate TLS session caches: a resumed session can retain its previously authenticated certificate after replacement or removal until the session expires or is invalidated. ACM deletion and revocation are refused while a listener still references the certificate.
 - Certificate replacement keeps the previous key material available to new handshakes while the replacement loads. A failed reload leaves the previous certificate active.
@@ -110,7 +153,11 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - Rule priorities are unique per listener: `CreateRule` and `SetRulePriorities` only reject a priority held by another rule on the same listener. `SetRulePriorities` is atomic: all priority assignments are validated before any change is committed.
 - `DeleteTargetGroup` is rejected with `ResourceInUse` while the target group is referenced by any listener or rule.
 - HTTPS and TLS certificate ARNs must refer to existing IAM server certificates or ACM certificates. `CreateListener`, `ModifyListener` and `AddListenerCertificates` reject a blank or unknown ARN with `CertificateNotFound`. When `ModifyListener` changes the protocol to HTTPS or TLS, it checks any inherited certificate ARNs too. An HTTPS listener also needs a default certificate: `CreateListener` and `ModifyListener` reject an absent or empty effective certificate list with `InvalidConfigurationRequest`. A referenced IAM server certificate cannot be deleted: `DeleteServerCertificate` returns `DeleteConflict` until the certificate is removed from the listener. Writes recording a new IAM certificate reference hold IAM's certificate lock, so the certificate cannot be deleted between the check and the write. A refused change preserves the listener's previous port, protocol, policy and certificates.
-- `RemoveListenerCertificates` refuses removal of an HTTPS or TLS listener's default certificate with `OperationNotPermitted` (400) and preserves the certificate list. Use `ModifyListener` to replace the default certificate. Additional certificates can still be removed.
+- `RemoveListenerCertificates` refuses removal of an HTTPS or TLS listener's default certificate with `OperationNotPermitted` (400) and preserves the certificate list. Use `ModifyListener` to replace the default certificate. Additional certificates can still be removed. A default certificate the certificate list holds as well is refused too: the published sentence, that you cannot remove the default certificate for a listener, names no exception for that case, so the refusal is Floci's reading.
+- A listener's default certificate is one certificate. `CreateListener` and `ModifyListener` refuse a `Certificates` list naming more than one with `ValidationError` (400), the reference saying of that member on both operations that you must provide exactly one certificate. No published sentence gives the code a longer list is answered with, so the code is Floci's reading.
+- The certificate list is kept apart from the default certificate. A listener created through the API starts with an empty certificate list, and `AddListenerCertificates` adds to it, taking more than one certificate in a call: the API member reads as one certificate per call, while the Application Load Balancers guide adds three in one call of its own, and the guide's example is what Floci takes. `ModifyListener` replaces the default certificate and leaves the certificate list standing, so a default that was added to the list keeps serving SNI after it is replaced. `AddListenerCertificates` answers with the certificate list the add leaves behind rather than with the certificates the call named.
+- `DescribeListenerCertificates` names the default certificate with `IsDefault` true and each certificate in the certificate list with `IsDefault` false, so a certificate that is both appears twice. A listener's own `Certificates` member is its default certificate alone and carries no `IsDefault`, which is where the reference puts that member.
+- A load balancer's listeners share a certificate quota of 25, counting the certificates in their certificate lists and not their default certificates, which is the published Application Load Balancer quota and the number `DescribeAccountLimits` reports. `AddListenerCertificates` refuses the certificate that would pass it with `TooManyCertificates` (400). A TLS listener on a Network Load Balancer is held to the same ceiling, which is Floci's reading rather than a published number of its own.
 - `DeleteRule` is rejected with `OperationNotPermitted` for the default rule.
 - `DescribeSSLPolicies` returns a pre-seeded list of standard AWS SSL policies (`ELBSecurityPolicy-*`).
 - `DescribeAccountLimits` returns standard default limits (e.g., 50 load balancers per region, 100 target groups, etc.).
@@ -150,8 +197,8 @@ types remain control-plane only.
 
 | Declared listener protocol | Local forwarding behavior | Target types and transport |
 |---|---|---|
-| `HTTP` | Parses and forwards HTTP requests; supports WebSocket upgrades. | `instance` resolves an EC2 private address; `ip` uses the registered address. Backend requests use plain HTTP. `lambda` invokes the registered function with an ALB event. |
-| `HTTPS` | Terminates TLS with an ACM or IAM certificate, then handles HTTP as above. | Same targets as HTTP; an HTTPS target-group setting does not enable TLS to the backend. |
+| `HTTP` | Parses and forwards HTTP requests; supports WebSocket upgrades. | `instance` resolves an EC2 private address; `ip` uses the registered address. The target-group protocol selects HTTP or HTTPS to the backend. `lambda` invokes the registered function with an ALB event. |
+| `HTTPS` | Terminates TLS with an ACM or IAM certificate, then handles HTTP as above. | Same targets and backend protocol selection as HTTP. |
 | `TCP` | Relays bytes bidirectionally without HTTP parsing or TLS termination (enabling TLS pass-through to the target). Requires a dedicated local port. | `instance` resolves an EC2 private address; `ip` uses the registered address. Selected round-robin per connection. |
 | `TLS` | Stored; certificate references are checked, but only `HTTPS` enables TLS on the local socket. TLS termination for NLB `TLS` listeners is unsupported (use a `TCP` listener for TLS pass-through). | No NLB TLS backend transport is implemented. |
 | `UDP`, `TCP_UDP` | Stored declarations do not create UDP sockets or UDP forwarding. | Datagram targets are unsupported. |
@@ -165,11 +212,12 @@ on the listener socket.
 
 ### Health checks
 
-For non-Lambda targets, the checker sends a **plain HTTP GET** to `HealthCheckPath`
+For non-Lambda targets, the checker sends an HTTP or HTTPS GET to `HealthCheckPath`
 on `HealthCheckPort`, or the target's traffic port when configured as `traffic-port`.
+`HealthCheckProtocol` selects TLS independently of the target's application protocol.
 The response-code matcher and healthy/unhealthy thresholds affect target health.
-`HealthCheckProtocol=TCP` does not perform a TCP-only probe, and `HTTPS` does not enable
-TLS for the probe. Lambda targets are not actively probed. In ELBv2 mock mode, sockets
+`HealthCheckProtocol=TCP` does not perform a TCP-only probe.
+Lambda targets are not actively probed. In ELBv2 mock mode, sockets
 and active monitoring are disabled. The proxy can route to initial targets and fails
 open to registered targets when none are healthy, so a successful request alone does
 not prove that a health check passed.
@@ -267,6 +315,35 @@ aws elbv2 delete-target-group \
 | Environment variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ELBV2_ENABLED` | `true` | Enable or disable the ELBv2 service |
+| `FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE` | `true` | Reuse backend connections for ordinary HTTP forwarding. Set to `false` to open a fresh connection per request. |
+| `FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE_TIMEOUT_SECONDS` | `60` | Default timeout for unused backend HTTP/1.x connections in the pool, in seconds. Non-negative; `0` disables expiry. A target's `Keep-Alive: timeout=...` overrides this value. |
+
+### Backend connection reuse
+
+Ordinary HTTP forwarding reuses backend HTTP/1.x connections by default. For local
+targets that cannot reliably serve multiple requests on one connection, set
+`FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE=false` before starting Floci. This applies
+to ordinary requests to HTTP and HTTPS targets, independently of client-to-listener
+keep-alive. WebSocket upgrades keep their dedicated connection, and TCP forwarding
+is unaffected.
+
+To expire unused pooled connections sooner, set
+`FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE_TIMEOUT_SECONDS` below the target's idle
+deadline. The default remains 60 seconds, matching the existing Vert.x client
+default. This is the [Vert.x HTTP/1.x keep-alive timeout](https://vertx.io/docs/4.5.35/apidocs/io/vertx/core/http/HttpClientOptions.html#setKeepAliveTimeout-int-),
+not a request timeout or a maximum connection age: it does not interrupt an active
+response. Vert.x honors a target's advertised `Keep-Alive` timeout in preference to
+this default. Choose consistent target settings, or disable reuse if a fresh
+connection is required for every request. The pool's periodic cleanup can delay
+physical closure of an unused connection. This setting is unused when reuse is off
+and is separate from the ALB `idle_timeout.timeout_seconds` attribute.
+
+These are local transport controls, not AWS load-balancer attributes. Disabling
+reuse is a mitigation, not evidence of an AWS compatibility defect. A target that
+closes its connection while a request is outstanding can still produce a 502,
+as described in [AWS's ALB troubleshooting guide](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-502-issues).
+Floci does not retry forwarded requests when the target's outcome is uncertain,
+including a POST whose body the target consumed before closing.
 
 ## Listener Ports
 

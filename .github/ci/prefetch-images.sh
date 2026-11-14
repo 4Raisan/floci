@@ -65,12 +65,27 @@ test_image() {
 # than for the second it saves. ContainerPlatformDockerIntegrationTest is not listed: it pulls the
 # other architecture, which a prefetch of the host image cannot serve.
 BUSYBOX_IMAGE="$(test_image BUSYBOX)"
-starts ContainerHostNetworkDockerIntegrationTest EcsServiceDiscoveryDockerIntegrationTest \
+starts ContainerHostNetworkDockerIntegrationTest ContainerBindDirectoryDockerIntegrationTest EcsServiceDiscoveryDockerIntegrationTest \
        EcsContainerManagerEfsIsolationDockerIntegrationTest EcsContainerManagerFirelensDockerIntegrationTest \
        EcsContainerManagerStatsDockerIntegrationTest EcsContainerManagerVolumesFromDockerIntegrationTest \
        EcsExecChannelDockerIntegrationTest EcsImagePullDockerIntegrationTest EcsLeftoverContainersDockerIntegrationTest \
        BatchDockerRunnerDockerIntegrationTest SageMakerDockerIntegrationTest \
     && [ -n "$BUSYBOX_IMAGE" ] && pull "$BUSYBOX_IMAGE"
+# Bind-directory ownership uses the default OpenSearch image, whose cold pull can outlast a test.
+OPENSEARCH_VERSIONS="$(find src/main/java -name OpenSearchVersions.java -print -quit)"
+opensearch_default_image() {
+    file="${OPENSEARCH_VERSIONS:-/dev/null}"
+    default_version="$(grep -oE 'DEFAULT_VERSION = "[^"]+"' "$file" | cut -d '"' -f 2)"
+    image=""
+    if [ -n "$default_version" ]; then
+        image="$(grep -F "VERSION_TO_IMAGE.put(\"$default_version\"" "$file" \
+            | grep -oE 'opensearchproject/opensearch:[^"]+')"
+    fi
+    [ -n "$image" ] || echo "$(date -u +%H:%M:%S) prefetch skipped: OpenSearch default image not readable" >> "$PREFETCH_LOG"
+    echo "$image"
+}
+OPENSEARCH_IMAGE="$(opensearch_default_image)"
+starts ContainerBindDirectoryDockerIntegrationTest && [ -n "$OPENSEARCH_IMAGE" ] && pull "$OPENSEARCH_IMAGE"
 # EcsImagePullDockerIntegrationTest runs its own registry to move a tag in; the /ecr/ line below
 # covers the shards that run the ECR tests.
 REGISTRY_IMAGE="$(test_image REGISTRY)"
@@ -95,13 +110,31 @@ grep -qE '/lambdaweb/' "$SHARD_FILE" && ecr public.ecr.aws/lambda/nodejs:24
 starts SwfLambdaIntegrationTest && ecr public.ecr.aws/lambda/python:3.12
 starts ElbV2LambdaTargetDataPlaneIntegrationTest && ecr public.ecr.aws/lambda/python:3.14
 # EmrDockerRunnerDockerIntegrationTest runs EMR steps and EMR Serverless job runs in the emr-7.5.0 image the runner's
-# default template names (EmrServerlessSparkRunner), 3.5 GB, so it is queued last, behind the Lambda runtimes.
-starts EmrDockerRunnerDockerIntegrationTest && ecr public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest
+# default template names (EmrServerlessSparkRunner), 3.5 GB, so it is queued last, behind the Lambda runtimes;
+# EmrHiveStepsDockerIntegrationTest runs a cluster's other steps in it.
+starts EmrDockerRunnerDockerIntegrationTest EmrHiveStepsDockerIntegrationTest \
+    && ecr public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest
+# EmrServerlessHiveDockerIntegrationTest runs EMR Serverless Hive job runs, and EmrHiveStepsDockerIntegrationTest EMR
+# Hive steps, in the emr-7.5.0 Hive image the runner's default Hive template names, 2.7 GB; every EMR cluster runs its
+# HDFS in it, EmrDockerRunnerDockerIntegrationTest's included.
+starts EmrServerlessHiveDockerIntegrationTest EmrHiveStepsDockerIntegrationTest EmrDockerRunnerDockerIntegrationTest \
+    && ecr public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest
 
 # package token in shard.txt -> images its tests are known to launch
 # (measured inline pulls; update alongside image-catalog changes)
 grep -q '/docdb/'       "$SHARD_FILE" && pull mongo:7.0
-grep -q '/neptune/'     "$SHARD_FILE" && { pull neo4j:5-community; pull tinkerpop/gremlin-server:3.7.3; }
+configured_image() {
+    image="$(bash .github/ci/service-image.sh "$1" "$2")"
+    if [ -n "$image" ]; then
+        pull "$image"
+    else
+        echo "$(date -u +%H:%M:%S) prefetch skipped: $1.$2 not readable" >> "$PREFETCH_LOG"
+    fi
+}
+if grep -q '/neptune/' "$SHARD_FILE"; then
+    configured_image neptune default-neo4j-image
+    configured_image neptune default-image
+fi
 grep -q '/elasticache/' "$SHARD_FILE" && { pull valkey/valkey:8; pull memcached:1.6; }
 grep -q '/memorydb/'    "$SHARD_FILE" && pull valkey/valkey:8
 grep -q '/ecr/'         "$SHARD_FILE" && pull registry:2
@@ -128,6 +161,38 @@ grep -q 'RdsAwsIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_IMAGE" ] && pu
 REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resources/application.yml | awk '{print $2}')"
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
 grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
+# The template-database restore fixture selects its own PostgreSQL image.
+# Read that override so its first CreateDBInstance does not also have to pull PostGIS.
+POSTGIS_TEST="$(find src/test/java -name RdsTemplateDatabaseRestoreIntegrationTest.java -print -quit)"
+POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4 }' "${POSTGIS_TEST:-/dev/null}")"
+[ -n "$POSTGIS_IMAGE" ] \
+    || echo "$(date -u +%H:%M:%S) prefetch skipped: RdsTemplateDatabaseRestoreIntegrationTest default-postgres-image not readable" >> "$PREFETCH_LOG"
+starts RdsTemplateDatabaseRestoreIntegrationTest \
+    && [ -n "$POSTGIS_IMAGE" ] && pull "$POSTGIS_IMAGE"
+# These DSQL fixtures start the configured PostgreSQL sidecar; unit-only shards do not.
+DSQL_IMAGE="$(awk '/^    dsql:/ { in_dsql=1; next } in_dsql && /^    [a-z]/ { exit } in_dsql && /^      image:/ { gsub(/"/, "", $2); print $2; exit }' src/main/resources/application.yml)"
+starts DsqlDataPlaneIntegrationTest DsqlClusterPolicyIntegrationTest DsqlTransactionAgeIntegrationTest \
+    && [ -n "$DSQL_IMAGE" ] && pull "$DSQL_IMAGE"
+# CodeArtifact's real registry fixtures each use one configured sidecar image.
+# Keep unrelated unit-test shards from pulling all four registries.
+starts CodeArtifactMavenDockerIntegrationTest CodeArtifactMavenExternalConnectionDockerIntegrationTest \
+    && configured_image codeartifact maven-image
+starts CodeArtifactNpmDockerIntegrationTest CodeArtifactNpmExternalConnectionDockerIntegrationTest \
+    && configured_image codeartifact npm-image
+starts CodeArtifactNuGetDockerIntegrationTest CodeArtifactNuGetExternalConnectionDockerIntegrationTest \
+    && configured_image codeartifact nuget-image
+starts CodeArtifactPypiDockerIntegrationTest && configured_image codeartifact pypi-image
+# RDS's engine fixture starts MySQL at the default and explicitly requested versions.
+# Read both sources rather than duplicating their version pins here.
+if starts RdsParameterGroupEngineIntegrationTest; then
+    MYSQL_DEFAULT="$(grep -oE 'DEFAULT_MYSQL_IMAGE *= *"[^"]+"' src/main/java/io/floci/aws/config/EmulatorConfig.java | grep -oE '"[^"]+"' | tr -d '"')"
+    [ -n "$MYSQL_DEFAULT" ] && pull "$MYSQL_DEFAULT"
+    MYSQL_TEST="$(find src/test/java -name RdsParameterGroupEngineIntegrationTest.java -print -quit)"
+    MYSQL_VERSIONS="$(awk -F'"' '$2 == "EngineVersion" { print $4 }' "${MYSQL_TEST:-/dev/null}" | sort -u)"
+    for version in $MYSQL_VERSIONS; do
+        [ -n "$MYSQL_DEFAULT" ] && pull "${MYSQL_DEFAULT%:*}:$version"
+    done
+fi
 # The InfluxDB and k3s pins live in application.yml like the sidecars above.
 INFLUX_IMAGE="$(grep -oE 'default-image: *"influxdb:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q '/timestreaminfluxdb/' "$SHARD_FILE" && [ -n "$INFLUX_IMAGE" ] && pull "$INFLUX_IMAGE"

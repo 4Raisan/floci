@@ -10,6 +10,12 @@ Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duc
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
+| `CreateNamedQuery` | Saves SQL text in a workgroup and returns its ID |
+| `GetNamedQuery` | Returns a saved query's name, database, SQL text, description and workgroup |
+| `BatchGetNamedQuery` | Returns up to 50 saved queries and per-ID errors for missing queries |
+| `ListNamedQueries` | Lists saved query IDs in a workgroup with pagination |
+| `UpdateNamedQuery` | Updates a saved query's name, SQL text and description |
+| `DeleteNamedQuery` | Deletes a saved query |
 | `StartQueryExecution` | Submits a SQL query; executed asynchronously via DuckDB |
 | `GetQueryExecution` | Returns query status (`QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`) |
 | `GetQueryResults` | Returns the result set for a completed query |
@@ -33,11 +39,50 @@ Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duc
 | `DeleteWorkGroup` | Deletes a workgroup |
 <!-- floci:actions:end -->
 
+Named queries store SQL text without executing it or requiring the database to
+exist. `CreateNamedQuery` defaults to the `primary` workgroup; a named workgroup
+must already exist. `ClientRequestToken` is optional; requests without a token
+create a new query each time. The AWS SDK and CLI supply a token automatically.
+When supplied, it must contain 32 to 128 characters. Retrying the same token returns
+the original ID, while changing its creation parameters returns
+`InvalidRequestException`. Saved queries and retry requests use Athena's configured
+storage mode and are isolated by account and region.
+
+Every request is checked by `RequestConstraintCheck` against the types, required
+members, bounds, patterns and enums generated from botocore's Athena service model.
+`tools/aws/regen_athena_shapes.py` vendors every operation's input constraints;
+`make aws-data-sync` regenerates them and `make aws-data-check` checks for drift.
+
+`UpdateNamedQuery` changes the name, SQL text, and optionally the description;
+the database and workgroup stay fixed. Omitting the description preserves it,
+and an empty description clears it. A missing query returns
+`InvalidRequestException` from get or update; batch get reports it under
+`UnprocessedNamedQueryIds`. Deleting an absent query succeeds.
+
+`DeleteWorkGroup` rejects a workgroup containing saved queries unless
+`RecursiveDeleteOption` is `true`. Recursive deletion removes the group's saved
+queries and creation retry records in the caller's account and region before
+removing the workgroup. Recreating the same workgroup name starts with no saved
+queries. The `primary` workgroup cannot be deleted.
+
+`ListNamedQueries` defaults to `primary` and returns IDs in deterministic order.
+`MaxResults` accepts 0 to 50; Floci uses 50 when it is omitted, null, or zero,
+matching its `ListQueryExecutions` convention because AWS documents neither a
+default nor the behavior of zero. Pass the opaque `NextToken` to continue; final
+pages omit it. Tokens are scoped to the action, account, region, and workgroup,
+and remain resumable after a cursor query is deleted. Invalid sizes or tokens
+return `InvalidRequestException`.
+
 `ListDataCatalogs` accepts `MaxResults` from 2 to 50. Floci uses 50 when it is
 omitted, since the API reference does not document a default. The built-in
 `AwsDataCatalog` stays first, followed by registered catalogs in name order.
-`GetDataCatalog`, `ListDatabases`, `ListTableMetadata` and `GetTableMetadata`
-read `AwsDataCatalog` when the request names no catalog or a JSON null.
+`GetDataCatalog` requires `Name`; `ListDatabases`, `ListTableMetadata` and
+`GetTableMetadata` require `CatalogName`. Name `AwsDataCatalog` explicitly to
+read the built-in catalog. Floci reads databases and tables from the account's
+Glue Data Catalog alone, so these three refuse a catalog whose metadata lives
+elsewhere, a `LAMBDA`, `HIVE` or `FEDERATED` one or a `GLUE` one registered for
+another account's `catalog-id`, with `MetadataException`, and a catalog that is
+not registered with `InvalidRequestException`.
 Pass the opaque `NextToken` to continue; final pages omit it. Tokens are scoped
 to the action, caller account, and request region and remain resumable after a
 cursor catalog is deleted. Malformed tokens, tokens outside the 1-to-1024
@@ -52,12 +97,24 @@ Continuation tokens are scoped to the action, account, region, and workgroup;
 invalid sizes, malformed tokens, and tokens outside 1 to 1024 characters return
 `InvalidRequestException`.
 
+A workgroup reports what its request gave and AWS's defaults for the rest. With
+no `ResultConfiguration`, it reports none (`primary` reports an empty one, as on
+AWS); a query then names its own output location, and Floci writes results to
+`s3://floci-athena-results/results/` when neither does. With no `EngineVersion`,
+it selects `AUTO`, reported with the effective version `Athena engine version 3`.
+`ManagedQueryResultsConfiguration` (`Enabled` and an optional
+`EncryptionConfiguration.KmsKey`) and `EnableMinimumEncryptionConfiguration`
+round-trip through `CreateWorkGroup`, `UpdateWorkGroup`
+(`ManagedQueryResultsConfigurationUpdates`, with `RemoveEncryptionConfiguration`)
+and `GetWorkGroup`; Floci records the setting and keeps no separate managed
+results storage.
+
 ## How it works
 
 1. **Lazy sidecar start**: On the first `StartQueryExecution` call, Floci checks for a local `floci/floci-duck:latest` image and starts the container. Subsequent queries reuse the running container.
-2. **Glue DDL injection**: Floci registers every Glue database as a DuckDB schema (`CREATE SCHEMA IF NOT EXISTS "<schema>"`) and creates qualified views (`CREATE OR REPLACE VIEW "<db>"."<table>"`) mapping each table to its S3 location via DuckDB's `read_parquet`, `read_json_auto`, or `read_csv_auto` functions, chosen based on the table's `InputFormat` or SerDe serialization library. In addition, tables in the query context database receive unqualified view aliases (`CREATE OR REPLACE VIEW "<table>"` in DuckDB's default `main` schema), so queries can reference tables as both `FROM db.table` and `FROM table`.
+2. **Glue DDL injection**: Floci registers every Glue database as a DuckDB schema (`CREATE SCHEMA IF NOT EXISTS "<schema>"`) and creates qualified views (`CREATE OR REPLACE VIEW "<db>"."<table>"`) mapping each table to its S3 location via DuckDB's `read_parquet`, `read_json_auto`, or `read_csv_auto` functions, chosen based on the table's `InputFormat` or SerDe serialization library (a table with partition projection reads only its partition folders; see [Partition projection](#partition-projection)). In addition, tables in the query context database receive unqualified view aliases (`CREATE OR REPLACE VIEW "<table>"` in DuckDB's default `main` schema), so queries can reference tables as both `FROM db.table` and `FROM table`.
 3. **Query execution**: The user's SQL is wrapped in `COPY (...) TO 's3://...' (FORMAT CSV, HEADER)` and executed. Results are written directly to the output S3 path.
-4. **Results retrieval**: `GetQueryResults` reads the CSV back from S3 and returns it in the standard Athena `ResultSet` shape.
+4. **Results retrieval**: `GetQueryResults` reads the CSV back from S3 and returns it in the standard Athena `ResultSet` shape. Each column's `Type` comes from DuckDB describing the query, mapped to the Athena name (`bigint`, `integer`, `double`, `boolean`, `date`, `time`, `timestamp`, `decimal` and so on), with `Precision` and `Scale` for a decimal; a column whose type has no Athena name, such as an interval, and every column of a query DuckDB cannot describe are reported as `varchar`. DuckDB widens `sum` and `count_if` over integers to `HUGEINT`, which is reported as `bigint`, Trino's type for them; a sum past `bigint`'s range, which Athena fails with `NUMERIC_VALUE_OUT_OF_RANGE`, is returned instead.
 
 ## Format inference
 
@@ -71,6 +128,20 @@ For every other table, the DuckDB read function is chosen from the Glue table's 
 | `InputFormat` or `SerializationLibrary` contains `json` | `read_json_auto` |
 | `InputFormat` contains `hive` | `read_json_auto` |
 | Anything else | `read_csv_auto` |
+
+## Partition projection
+
+A Glue table with `projection.enabled` set to `true` is read the way Athena reads it, from its partition layout rather than from its whole location:
+
+- **Read path**: only the partition folders are read, `<location>/<key>=*/...` in the default `column=value` layout, or the `storage.location.template` with each `${key}` placeholder as a wildcard (one per folder, for a `date` format that holds slashes). Anything else stored under the location, such as query results, is not read as table data.
+- **Partition values**: in the default layout, DuckDB's Hive partitioning supplies each key's value. With a template, the view takes each value from the object's S3 path by matching it against the template, and casts it to the key's declared type. A `date` projection whose `format` holds slashes (`yyyy/MM/dd/HH`, the Firehose layout) spans that many folders behind one placeholder. A repeated placeholder must hold the same value at each occurrence, and an object whose path value does not parse as its key's type is not read.
+- **Validation**: as on Athena, a query fails when it leaves an `injected` key without a static equality condition in its `WHERE` clause (`CONSTRAINT_VIOLATION`), or when it reads a table whose template has no placeholder for one of its keys (`INVALID_TABLE_PROPERTY`). Such a table gets no view, so the other tables stay queryable.
+
+Not yet supported:
+
+- Values outside the projection (a date before the range or after `NOW`, an unlisted `enum` value) are read; Athena returns zero rows for them.
+- A `date` or `timestamp` key with a `format` other than ISO is not parsed, so its objects are not read.
+- The object path backs the template's values but is not exposed: Athena's `"$path"` pseudo-column cannot be selected.
 
 ## Configuration
 

@@ -105,6 +105,8 @@ aws sqs set-queue-attributes \
 
 `DelaySeconds` must be 0 to 900, both on a message and as a queue attribute: `SendMessage` rejects other values with `InvalidParameterValue` (in `SendMessageBatch` only that entry fails), and `CreateQueue` and `SetQueueAttributes` reject them with `InvalidAttributeValue`.
 
+A message attribute with no `DataType`, with a `DataType` whose base type (the part before the first `.`) is not `String`, `Number` or `Binary`, with no value, with an empty `StringValue` or `BinaryValue`, or with a `BinaryValue` that is not base64 is rejected by `SendMessage` with `InvalidParameterValue` on both the JSON and query protocols. The base type match is case-sensitive, so `Number.int` is accepted while `number` is not, and a `DataType` such as `.` that starts with a period is rejected because its base type is empty. In `SendMessageBatch` only the entry carrying that attribute fails; the other entries are sent. The entry still counts toward the batch payload total, so a batch over the batch payload limit fails whole with `BatchRequestTooLong` even when the excess comes from that entry.
+
 `SqsManagedSseEnabled` is `true` for a queue with no `KmsMasterKeyId`, matching AWS, and `false` once a KMS key is set. It is derived on read rather than stored, so clearing `KmsMasterKeyId` returns the queue to `true`, unless you set `SqsManagedSseEnabled` yourself, in which case your value stands. AWS does not document the cleared-key case crisply, so that behaviour is Floci's choice rather than a copied one. `CreateQueue` on an existing name compares requested attributes against these reported values, so asking for `SqsManagedSseEnabled=false` on a queue that reports `true` fails with `QueueAlreadyExists` (`QueueNameExists` over JSON).
 
 ## Message Retention
@@ -211,6 +213,14 @@ https://sqs.<region>.amazonaws.com/000000000000/<queue-name>
 The region is the one the request was signed for, and the host carries that region's partition DNS suffix, so a queue in `cn-north-1` is reported as `https://sqs.cn-north-1.amazonaws.com.cn/...`. Use it for tooling that parses or compares queue URLs against the AWS form. Most SDKs send requests to the endpoint you configured and take only the path from the URL. Clients that send requests to the host in the returned URL, such as the AWS SDK for Java 1.x, need the default `floci` setting or DNS that points the `sqs.<region>` host at Floci.
 
 Under either setting every form is accepted as input. That covers the AWS URL, the Floci URL, any other host whose path ends in `/<account>/<queue-name>`, and the bare queue name. A queue is stored by account and name, so a base URL with a path of its own, such as `http://localhost:4566/sqs`, keeps the same queues under either setting. Existing queues, persisted ones included, are reported in the form the current setting and base URL give.
+
+## Queue policies under IAM enforcement
+
+With `floci.services.iam.enforcement-enabled` on, a queue's `Policy` attribute, written by
+`SetQueueAttributes` or `AddPermission`, takes part in the decision as IAM's policy evaluation logic
+describes. Within one account either the policy or the caller's identity policies can allow a call,
+and an explicit `Deny` in either refuses it. A `QueueUrl` whose path names another account is a
+cross-account call: the queue's policy and the caller's identity policies both have to allow it.
 
 ## Storage write failures
 

@@ -8,7 +8,7 @@
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
-| `CreateEventBus` | Create a custom event bus |
+| `CreateEventBus` | Create a custom event bus, with its description, KMS key, dead-letter config and log config |
 | `DeleteEventBus` | Delete an event bus |
 | `DescribeEventBus` | Get event bus details |
 | `UpdateEventBus` | Update event bus description, KMS key, dead-letter config, or log config |
@@ -53,6 +53,29 @@
 `ListRules` and `ListConnections` accept `NextToken` values of 1 to 2048
 characters. Empty or overlong tokens return `ValidationException`; unrecognized
 cursors within those bounds return `InvalidToken`.
+
+## Numeric event patterns
+
+`TestEventPattern` and `PutEvents` rule routing support `numeric` comparisons on
+JSON number fields using `=`, `>`, `>=`, `<`, and `<=`. Both bounds of a range
+must match. For example,
+`{"detail":{"severity":[{"numeric":[">=",7,"<",9]}]}}` matches severity `7` or `8`,
+but excludes `6`, `9`, the string `"7"`, and missing or null values.
+
+For array-valued fields, a numeric filter matches when at least one number in the
+array satisfies all comparisons. The range above matches `[3,8]` but excludes
+`[3,9]`; separate elements cannot satisfy separate bounds of the same range.
+
+`PutRule` and `TestEventPattern` reject malformed numeric filters with
+`InvalidEventPatternException` (HTTP 400), independently of the supplied event.
+The comparison array must contain either one operator/number pair or a lower bound
+(`>` or `>=`) followed by an upper bound (`<` or `<=`). Equality (`=`) must stand
+alone. Range endpoints must be strictly increasing, even when both bounds are
+inclusive. Repeated bounds, reversed bounds, and extra comparisons are rejected.
+Nested patterns and every `$or` branch are validated before a rule is saved;
+rejected updates preserve the existing rule.
+
+See [AWS numeric matching](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-create-pattern-operators.html#filtering-numeric-matching).
 
 ## Configuration
 
@@ -129,6 +152,43 @@ aws events put-events \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
 
+## Partner Event Buses
+
+`CreateEventBus` with `EventSourceName` creates a partner event bus. As in AWS, the bus takes the
+source's name, so `Name` must equal `EventSourceName`, and the name must match
+`aws.partner/<partner>/<source>`. Floci does not model partner event sources, so any well-formed
+source name is accepted without one being created or activated first. Once created, the bus works
+like a custom bus: rules, targets, tags and `PutEvents` address it by name or ARN. A rule name
+can't contain a slash on any bus: `PutRule` rejects a name outside `[\.\-_A-Za-z0-9]+` or longer
+than 64 characters with `ValidationException`, as AWS does.
+
+Two calls differ from a custom bus. `PutPermission` and `RemovePermission` reject a partner bus
+with `ValidationException`, since the API types their `EventBusName` as a non-partner bus name.
+`PutEvents` to a partner bus is accepted and fans out to its rules, where AWS reserves that bus for
+the partner's own events; this lets a test publish an event a partner would send.
+
+When upgrading, a rule persisted by an earlier Floci version under a name `PutRule` now rejects,
+such as one with a slash or a space or longer than 64 characters, is still reachable by its exact
+name on its own bus, and it keeps `DeleteEventBus` from deleting that bus. One with a slash in its
+name is also no longer listed by `ListRules` or matched by `PutEvents`. On a custom bus it can still
+be tagged by its ARN, but on the default bus it cannot: an ARN such as `rule/team/rule-1` reads as
+rule `rule-1` on bus `team`, so that rule is reachable by its exact name for the rule and target
+operations only. On a custom bus named `aws.partner`, a rule such as `example.com/orders/r1` shares
+its storage key and ARN with rule `r1` on partner bus `aws.partner/example.com/orders`. That partner
+bus does not list, match or manage the legacy rule, and `PutRule` of `r1` on it fails with
+`ValidationException` until the legacy rule is deleted. A CloudFormation stack holding any of these legacy rules can still be deleted, but
+an `UpdateStack` that touches the rule fails, since `PutRule` rejects its name. Remove its targets,
+delete it and recreate it under a valid name. `DescribeRule`, `DeleteRule`, `EnableRule`,
+`DisableRule`, `PutTargets`, `RemoveTargets` and `ListTargetsByRule` otherwise reject an invalid
+rule name as `PutRule` does.
+
+```bash
+aws events create-event-bus \
+  --name aws.partner/example.com/123/orders \
+  --event-source-name aws.partner/example.com/123/orders \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
 ## Event Bus Targets
 
 A rule can target another event bus by ARN: the event is republished there, and that bus's own rules evaluate it and fan out normally. `Source`, `DetailType`, `Resources` and the originating `account`/`region` carry over, and each hop gets a new event id.
@@ -151,6 +211,65 @@ full event as the default input, plus `Input`, `InputPath`, and `InputTransforme
 the state machine from the account and region in its ARN.
 
 State machine aliases and versions are not supported as EventBridge targets.
+
+## AppSync Targets
+
+A rule can invoke a mutation on a public AppSync GraphQL API configured for `AWS_IAM`,
+either as its default or an additional authorization mode. Schema authorization directives
+still apply. Set the target `Arn` to the GraphQL **endpoint ARN**,
+`arn:aws:appsync:us-east-1:000000000000:endpoints/graphql-api/<api-id>`.
+CloudFormation exposes this through `Fn::GetAtt: [Api, GraphQLEndpointArn]`.
+
+```bash
+aws events put-targets \
+  --rule order-placed-rule \
+  --targets '[{
+    "Id": "publish-order",
+    "Arn": "arn:aws:appsync:us-east-1:000000000000:endpoints/graphql-api/example",
+    "RoleArn": "arn:aws:iam::000000000000:role/EventBridgeAppSyncRole",
+    "AppSyncParameters": {
+      "GraphQLOperation": "mutation Publish($id: ID!) { publish(id: $id) { id } }"
+    },
+    "InputTransformer": {
+      "InputPathsMap": {"id": "$.detail.orderId"},
+      "InputTemplate": "{\"id\": <id>}"
+    }
+  }]' \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+The delivered input must be a JSON object containing the mutation's variables. `Input`,
+`InputPath`, and `InputTransformer` work as for other targets; with none, the full event is
+the variables object. `PutTargets`, `ListTargetsByRule`, persisted target settings, and
+`AWS::Events::Rule` preserve `AppSyncParameters.GraphQLOperation`. Endpoint targets require
+these settings and a parsed document containing exactly one mutation operation, with 1 to
+1,048,576 characters. `PutTargets` validates the whole batch before storage, so a rejected
+replacement preserves the previous targets. Validation errors omit the operation's sensitive
+contents. Parsing uses the GraphQL sidecar and requires Docker; it does not require the target
+API to exist or validate its schema fields during `PutTargets`.
+CloudFormation rollback restores previously accepted targets without requiring the GraphQL
+sidecar to be available.
+
+With IAM enforcement enabled, the target role must exist and trust `events.amazonaws.com`,
+including any trust conditions on the rule's `aws:SourceArn` and `aws:SourceAccount`. Its
+policies, permissions boundary, and SCPs must allow `appsync:GraphQL` on the selected API
+fields. The permission resources use `apis/<api-id>/...`, rather than the endpoint ARN;
+`arn:aws:appsync:us-east-1:000000000000:apis/<api-id>/*` covers all fields of one API.
+Resolvers receive the target role's identity, and their data sources retain their own
+service-role authorization.
+With IAM enforcement off, target role existence, trust and permission checks are skipped,
+matching the other service-role integrations.
+
+Only mutations are delivered. Private APIs and cross-account or cross-partition targets
+are refused. The target ARN selects the API's region; an API with the same ID in another
+region is not used. AppSync must be enabled. This target does not add realtime subscription
+support to Floci's AppSync endpoint.
+
+Pre-execution validation and authorization failures use the target's dead-letter handling;
+retryable transport failures use its retry policy. Floci treats a returned GraphQL execution
+result, including field errors and partial data, as delivered so it does not retry a mutation
+that may have already written data. A GraphQL request error with no `data` member is a failed
+delivery. This error mapping has integration coverage but has not been compared with live AWS.
 
 ## Redshift Data API Targets
 
@@ -215,11 +334,12 @@ role update replaces the stored value. Omitting the role on an existing
 cross-account event-bus target with the same ID and ARN retains its previous
 role, as documented by AWS.
 
-The value must be between 1 and 1600 characters when supplied. Floci stores
-the role as configuration; target delivery does not assume it. Only Redshift
-Data API targets check the role's trust and permissions (see
-[Redshift Data API Targets](#redshift-data-api-targets)); no other target
-enforces its role's IAM policies.
+The value must be between 1 and 1600 characters when supplied.
+With IAM enforcement on, [AppSync targets](#appsync-targets) and
+[Redshift Data API targets](#redshift-data-api-targets) check the role's existence,
+trust and permissions, including source-rule conditions. With enforcement off,
+these checks are skipped. Other target types store the role as
+configuration without assuming it or enforcing its IAM policies.
 
 ## API Destination Targets
 
@@ -300,10 +420,20 @@ aws events put-targets \
 - A retry uses the target's current definition, so `PutTargets` changes apply to pending retries, and a target removed with `RemoveTargets` stops being retried.
 - An accepted asynchronous Lambda invocation counts as delivered. A later function error is handled by Lambda's own retry and destination settings, not by the rule.
 - Pending retries are kept in memory and are dropped by an emulator reset or restart.
-- An `AWS::Events::Rule` target in a CloudFormation template keeps its `RetryPolicy`, `DeadLetterConfig`, `RoleArn` and `EcsParameters`, which reach the rule as `PutTargets` would set them. A value of another type than the resource schema declares for them fails the rule before it is created, with the message CloudFormation gives.
+- An `AWS::Events::Rule` target in a CloudFormation template keeps its `RetryPolicy`, `DeadLetterConfig`, `RoleArn`, `EcsParameters` and `AppSyncParameters`, which reach the rule as `PutTargets` would set them. A value of another type than the resource schema declares for them fails the rule before it is created, with the message CloudFormation gives.
+
+## Event Bus Policies under IAM Enforcement
+
+With `floci.services.iam.enforcement-enabled` on, a bus's policy takes part in the decision as IAM's
+policy evaluation logic describes. `PutPermission` with a `Principal` account id adds a statement
+naming that account's root, `{"AWS": "arn:aws:iam::<account>:root"}`, and `*` stays `*`. Within one
+account a statement naming the caller's role or user, or `*`, can allow a call on its own, a statement
+naming only the account leaves it to the caller's identity policies, and an explicit `Deny` in either
+refuses it. Across accounts the bus policy and the caller's identity policies both have to allow it.
 
 ## Current Behavior
 
+- `PutRule` validates schedule expressions before creating or updating a rule, including disabled rules and rules with an event pattern. Rate values must be positive integers, with singular `minute`, `hour` or `day` for 1 and plural units for larger values. Invalid expressions return `ValidationException` without changing an existing rule or its timer.
 - `PutEvents` reports success once the source bus accepts an event. Target delivery failures are retried and dead-lettered as described above, and otherwise surface only as a `WARN` in the Floci logs.
 - A `PutEvents` entry for an event bus that does not exist is answered as AWS answers it: with an event id, not counted in `FailedEntryCount`, and dropped, as no rule matches it. Floci logs the drop at `INFO`. Floci's own deliveries to a bus, for a rule, a pipe or a schedule, are unchanged: an entry for a bus that does not exist fails there.
 - A `Detail` forwarded to an event bus must be a JSON object, as in AWS; anything else is dropped, including an `InputPath` selecting a scalar such as `$.detail.orderId` or an envelope carrying `"detail": null`.
